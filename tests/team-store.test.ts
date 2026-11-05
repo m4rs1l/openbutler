@@ -169,7 +169,6 @@ describe('TeamStore', () => {
     store.confirmTicket('jr_m');
 
     store.postMessage({ msgId: 'm_1', sender: 'Murphy-OpenButler', recipient: 'group', body: 'hi', createdAt: now + 5 });
-    store.appendMemory({ topic: 'decisions', author: 'Murphy-OpenButler', body: 'x', createdAt: now + 6 });
     store.touchMember('Murphy-OpenButler', now + 7);
 
     const summaries = store.memberSummaries(now + 8, 15_000);
@@ -178,8 +177,7 @@ describe('TeamStore', () => {
     expect(murphy.online).toBe(true);
     expect(murphy.lastMessageAt).toBe(now + 5);
     expect(murphy.lastMessageTo).toBe('group');
-    expect(murphy.lastMemoryAt).toBe(now + 6);
-    // The hub is always online; it has never messaged or written memory.
+    // The hub is always online; it has never messaged.
     expect(hub.online).toBe(true);
     expect(hub.lastMessageAt).toBeNull();
     // Long after the window, a quiet member falls offline but the hub stays online.

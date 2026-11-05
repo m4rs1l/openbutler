@@ -1,5 +1,5 @@
-import type { TeamMessage, TeamMemoryEntry } from './contracts.js';
-export type { TeamMessage, TeamMemoryEntry } from './contracts.js';
+import type { TeamMessage } from './contracts.js';
+export type { TeamMessage } from './contracts.js';
 import { chmodSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { getDataPath } from '../paths.js';
@@ -64,13 +64,6 @@ CREATE TABLE IF NOT EXISTS team_dm_acks (
   msg_id TEXT PRIMARY KEY,
   reader TEXT NOT NULL,
   acked_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS team_memory (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  topic TEXT NOT NULL CHECK (topic IN ('decisions', 'shared')),
-  author TEXT NOT NULL,
-  body TEXT NOT NULL,
-  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS team_audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,8 +131,6 @@ export interface JoinRequest {
   decidedAt: number | null;
 }
 
-export type TeamMemoryTopic = 'decisions' | 'shared';
-
 export interface TeamAuditEntry {
   seq: number;
   kind: string;
@@ -155,7 +146,6 @@ export interface MemberSummary {
   lastSeen: number;
   lastMessageAt: number | null;
   lastMessageTo: string | null;
-  lastMemoryAt: number | null;
   profile: PeerProfile | null;
   capabilities: PeerCapabilities | null;
   activeWorkCount: number;
@@ -625,26 +615,6 @@ export class TeamStore {
     return !!row;
   }
 
-  /** Appends a signed team-memory entry. The hub is the single source of truth. */
-  appendMemory(input: { topic: TeamMemoryTopic; author: string; body: string; createdAt: number }): number {
-    const info = this.database
-      .prepare('INSERT INTO team_memory (topic, author, body, created_at) VALUES (?, ?, ?, ?)')
-      .run(input.topic, input.author, input.body, input.createdAt);
-    return Number(info.lastInsertRowid);
-  }
-
-  /** Signed entries strictly after `sinceSeq`, oldest first. */
-  memoryEntries(sinceSeq: number, limit: number): TeamMemoryEntry[] {
-    return this.database
-      .prepare('SELECT seq, topic, author, body, created_at AS createdAt FROM team_memory WHERE seq > ? ORDER BY seq LIMIT ?')
-      .all(sinceSeq, limit) as unknown as TeamMemoryEntry[];
-  }
-
-  memoryLatestSeq(): number {
-    const row = this.database.prepare('SELECT MAX(seq) AS seq FROM team_memory').get() as { seq: number | null } | undefined;
-    return row?.seq ?? 0;
-  }
-
   /** Append-only audit trail of protocol events. Never updated, never deleted. */
   appendAudit(input: { kind: string; actor: string; detail?: string | null; createdAt: number }): void {
     this.database
@@ -674,8 +644,8 @@ export class TeamStore {
 
   /**
    * One row per active member with presence and last activity: when they last
-   * sent a message (and where), and when they last wrote shared memory. The
-   * hub derives this so every member sees the same picture.
+   * sent a message, and where. The hub derives this so every member sees the
+   * same picture.
    */
   memberSummaries(now: number, windowMs: number): MemberSummary[] {
     const online = this.onlineMemberNames(now, windowMs);
@@ -683,8 +653,7 @@ export class TeamStore {
       .prepare(
         `SELECT m.name AS name, m.role AS role, m.last_seen AS lastSeen,
            (SELECT created_at FROM team_messages WHERE sender = m.name ORDER BY seq DESC LIMIT 1) AS lastMessageAt,
-           (SELECT recipient FROM team_messages WHERE sender = m.name ORDER BY seq DESC LIMIT 1) AS lastMessageTo,
-           (SELECT created_at FROM team_memory WHERE author = m.name ORDER BY seq DESC LIMIT 1) AS lastMemoryAt
+           (SELECT recipient FROM team_messages WHERE sender = m.name ORDER BY seq DESC LIMIT 1) AS lastMessageTo
          FROM team_members m WHERE m.removed_at IS NULL ORDER BY m.created_at`,
       )
       .all() as unknown as Array<Omit<MemberSummary, 'online'>>;

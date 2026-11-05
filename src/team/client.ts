@@ -4,8 +4,8 @@ import { makeFileId } from './service.js';
 import type { JoinTarget } from './tailnet.js';
 import type { PeerProfile, PeerCapabilities } from './coordination.js';
 import { TeamTransportError, TEAM_PROTOCOL_VERSION } from './contracts.js';
-import type { TeamMessage, TeamMemoryEntry } from './contracts.js';
-export type { TeamMessage, TeamMemoryEntry } from './contracts.js';
+import type { TeamMessage } from './contracts.js';
+export type { TeamMessage } from './contracts.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -33,7 +33,6 @@ export interface HubMember {
   lastSeen?: number;
   lastMessageAt?: number | null;
   lastMessageTo?: string | null;
-  lastMemoryAt?: number | null;
   profile?: PeerProfile | null;
   capabilities?: PeerCapabilities | null;
   activeWorkCount?: number;
@@ -360,33 +359,4 @@ export async function ackInbox(
   });
   if (status !== 200) throw hubError(status, body, 'Ack failed.');
   return body as unknown as { acknowledged: number; remaining: number };
-}
-
-/** Authenticated: shared team-memory entries after `since`, oldest first. */
-export async function fetchTeamMemory(
-  target: JoinTarget,
-  ticket: string,
-  since: number,
-): Promise<{ latestSeq: number; entries: TeamMemoryEntry[] }> {
-  const { status, body } = await requestJson(`${baseUrl(target)}/v1/memory?since=${since}`, {
-    headers: { authorization: `Bearer ${ticket}` },
-  });
-  if (status !== 200 || !Array.isArray(body.entries)) throw hubError(status, body, 'Memory read failed.');
-  return body as unknown as { latestSeq: number; entries: TeamMemoryEntry[] };
-}
-
-/** Authenticated: append a signed entry to shared team memory. */
-export async function postTeamMemory(
-  target: JoinTarget,
-  ticket: string,
-  topic: 'decisions' | 'shared',
-  body: string,
-): Promise<{ seq: number }> {
-  const { status, body: response } = await requestJson(`${baseUrl(target)}/v1/memory`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${ticket}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ topic, body }),
-  });
-  if (status !== 200 || typeof response.seq !== 'number') throw hubError(status, response, 'Memory write failed.');
-  return response as unknown as { seq: number };
 }

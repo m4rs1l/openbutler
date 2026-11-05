@@ -1,7 +1,7 @@
 import { TEAM_PRESENCE_WINDOW_MS } from './contracts.js';
 import * as client from './client.js';
-import type { TeamMessage, TeamMemoryEntry, TeamMemberView } from './contracts.js';
-export type { TeamMessage, TeamMemoryEntry, TeamMemberView } from './contracts.js';
+import type { TeamMessage, TeamMemberView } from './contracts.js';
+export type { TeamMessage, TeamMemberView } from './contracts.js';
 import { makeFileId } from './service.js';
 import { TeamOperations } from './operations.js';
 import { statSync } from 'node:fs';
@@ -18,8 +18,6 @@ export interface SendResult {
   createdAt?: number;
   duplicate?: boolean;
 }
-
-export type TeamMemoryTopic = 'decisions' | 'shared';
 
 export interface TeamStatusView {
   team: string;
@@ -40,25 +38,6 @@ export interface TeamConnection {
 }
 
 /** A member counts as online when it has polled within this window (poll is 1s). */
-
-/**
- * Reads the whole shared-memory log, paging until caught up. A single call is
- * capped, so a team with more than one page of entries must loop or the mirror
- * silently loses the tail; this is the one place that loops.
- */
-export async function readAllTeamMemory(channel: TeamChannel, sinceSeq = 0): Promise<{ entries: TeamMemoryEntry[]; latestSeq: number }> {
-  const entries: TeamMemoryEntry[] = [];
-  let since = sinceSeq;
-  let latestSeq = 0;
-  for (;;) {
-    const page = await channel.memory(since);
-    latestSeq = page.latestSeq;
-    entries.push(...page.entries);
-    const last = page.entries.at(-1);
-    if (!last || last.seq >= page.latestSeq) return { entries, latestSeq };
-    since = last.seq;
-  }
-}
 
 /**
  * One way to talk to a team, whether this machine is the hub or a member.
@@ -94,8 +73,6 @@ export interface TeamChannel {
   /** Read pending DMs without acknowledging them. */
   readInbox(limit: number): Promise<{ count: number; messages: TeamMessage[]; remaining: number }>;
   ack(msgIds: readonly string[]): Promise<{ acknowledged: number; remaining: number }>;
-  memory(since: number): Promise<{ latestSeq: number; entries: TeamMemoryEntry[] }>;
-  remember(topic: TeamMemoryTopic, body: string): Promise<{ seq: number }>;
 }
 
 /** The hub's own view: straight through the same operation owner as the HTTP path. */
@@ -193,13 +170,6 @@ export function localChannel(store: TeamStore, memberName: string): TeamChannel 
       const acknowledged = store.ackDms(memberName, msgIds, Date.now());
       return { acknowledged, remaining: store.unreadDmCount(memberName) };
     },
-    async memory(since) {
-      return { latestSeq: store.memoryLatestSeq(), entries: store.memoryEntries(since, 500) };
-    },
-    async remember(topic, body) {
-      const seq = operations.appendMemory(memberName, topic, body);
-      return { seq };
-    },
   };
 }
 
@@ -270,7 +240,6 @@ export function remoteChannel(target: JoinTarget, ticket: string, memberName: st
           lastSeen: member.lastSeen ?? 0,
           lastMessageAt: member.lastMessageAt ?? null,
           lastMessageTo: member.lastMessageTo ?? null,
-          lastMemoryAt: member.lastMemoryAt ?? null,
           profile: member.profile ?? null,
           capabilities: member.capabilities ?? null,
           activeWorkCount: member.activeWorkCount ?? 0,
@@ -285,12 +254,6 @@ export function remoteChannel(target: JoinTarget, ticket: string, memberName: st
     },
     ack(msgIds) {
       return client.ackInbox(target, ticket, msgIds);
-    },
-    memory(since) {
-      return client.fetchTeamMemory(target, ticket, since);
-    },
-    remember(topic, body) {
-      return client.postTeamMemory(target, ticket, topic, body);
     },
   };
 }

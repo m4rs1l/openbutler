@@ -19,8 +19,6 @@ export interface MemoryPaths {
   /** Legacy path retained for locating old data; no longer an active identity or memory document. */
   identityFile: string;
   peersDirectory: string;
-  /** Shared team scope root; each team materializes under its own slug. */
-  teamRoot: string;
 }
 
 /** Sanitizes a team name into a stable folder key. */
@@ -32,23 +30,6 @@ export function teamSlug(teamName: string): string {
     .replace(/^-|-$/g, '')
     .slice(0, 64);
   return slug || 'team';
-}
-
-export interface TeamMemoryPaths {
-  directory: string;
-  decisionsFile: string;
-  sharedFile: string;
-}
-
-/**
- * Where one team's shared, hub-synced memory materializes on this machine. The
- * key is the team's stable id (falling back to a slug of its name), so two
- * different teams never collide on one folder.
- */
-export function getTeamMemoryPaths(teamKey: string, workspaceRoot = process.cwd()): TeamMemoryPaths {
-  const root = getMemoryPaths(workspaceRoot).teamRoot;
-  const directory = resolve(root, teamKey);
-  return { directory, decisionsFile: resolve(directory, 'decisions.md'), sharedFile: resolve(directory, 'shared.md') };
 }
 
 /** Shared path contract for the agent prompt and the session runtime. */
@@ -78,7 +59,6 @@ export function getMemoryPaths(workspaceRoot = process.cwd()): MemoryPaths {
     selfDirectory: resolve(root, 'self'),
     identityFile: resolve(root, 'self', 'identity.md'),
     peersDirectory: resolve(root, 'self', 'peers'),
-    teamRoot: resolve(root, 'team'),
   };
 }
 
@@ -92,7 +72,7 @@ export function isMemoryIndexPath(source: string, workspaceRoot = process.cwd())
 export interface MemoryDocumentPath {
   path: string;
   kind: 'profile' | 'note';
-  scope: 'user' | 'self' | `team:${string}` | `workspace:${string}`;
+  scope: 'user' | 'self' | `workspace:${string}`;
   notePath: string | null;
 }
 
@@ -115,13 +95,6 @@ export function getMemoryDocumentPath(source: string, workspaceRoot = process.cw
   // Self scope holds local peer observations. Identity is the single team profile.
   if (isWithin(target, paths.peersDirectory))
     return { path: target, kind: 'note', scope: 'self', notePath: relative(paths.peersDirectory, target) };
-  // Shared team scope: <root>/team/<team-key>/<file>.md. The key is structural.
-  if (isWithin(target, paths.teamRoot)) {
-    const parts = relative(paths.teamRoot, target).split(sep);
-    const slug = parts[0]?.toLowerCase() ?? '';
-    if (parts.length === 2 && /^[a-z0-9_-]+$/.test(slug)) return { path: target, kind: 'note', scope: `team:${slug}`, notePath: parts[1]! };
-    return null;
-  }
   const parts = relative(paths.root, target).split(sep);
   const workspaceKey = parts[1]?.toLowerCase() ?? '';
   if (parts[0]?.toLowerCase() !== 'workspaces' || !/^[a-f0-9]{24}$/.test(workspaceKey)) return null;

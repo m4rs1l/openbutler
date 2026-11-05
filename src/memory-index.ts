@@ -4,9 +4,8 @@ import { lstat, readdir, readFile } from 'node:fs/promises';
 import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { AllTasks, PretrainedModelOptions, ProgressCallback } from '@huggingface/transformers';
-import { getMemoryPaths, teamSlug } from './memory-paths.js';
+import { getMemoryPaths } from './memory-paths.js';
 import { getDataPath } from './paths.js';
-import { loadSettings } from './settings.js';
 import { migrateMemoryLayout } from './memory-layout.js';
 import { tokenizeTerms } from './relevance-gate.js';
 import { MEMORY_DOCUMENT_REVISION, parseMemoryDocument, type MemoryScope, type MemoryType } from './memory-document.js';
@@ -273,12 +272,10 @@ export class MemoryIndex {
 
   /**
    * Scopes the agent may search: the shared user scope, its own self scope,
-   * the active workspace, and every team scope. Other workspaces stay out.
+   * and the active workspace. Other workspaces stay out.
    */
   private searchScopeFilter(alias: string): { clause: string; params: string[] } {
     const params = ['user', 'self', this.workspaceScope];
-    const teamKey = activeTeamKey();
-    if (teamKey) params.push(`team:${teamKey}`);
     return { clause: `${alias}.scope IN (${params.map(() => '?').join(', ')})`, params };
   }
 
@@ -491,11 +488,8 @@ export class MemoryIndex {
     if (owned(this.paths.userFile)) await addMarkdownFile(userFiles, this.paths.userFile, 'user');
     if (owned(this.paths.topicsDirectory)) await addMarkdownTree(userFiles, this.paths.topicsDirectory, 'user');
     if (owned(this.paths.areasDirectory)) await addMarkdownTree(userFiles, this.paths.areasDirectory, 'user');
-    // Per-agent self scope and the ACTIVE team scope are searchable; other
-    // teams' folders (from a left team) are never indexed or searched.
+    // Per-agent self scope is searchable; peer notes stay local to this machine.
     if (owned(this.paths.peersDirectory)) await addMarkdownTree(userFiles, this.paths.peersDirectory, 'self');
-    const teamKey = activeTeamKey();
-    if (teamKey && owned(this.paths.teamRoot)) await addMarkdownTree(userFiles, join(this.paths.teamRoot, teamKey), `team:${teamKey}`);
     if (owned(this.paths.workspaceFile)) await addMarkdownFile(workspaceFiles, this.paths.workspaceFile, this.workspaceScope);
     return [...userFiles, ...workspaceFiles].sort((left, right) => left.path.localeCompare(right.path));
   }
@@ -784,21 +778,6 @@ async function addMarkdownTree(output: MemorySourceFile[], directory: string, sc
 
 function isMissingPath(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
-}
-
-/**
- * The folder key of the team this machine is currently in, or null. Only that
- * team's shared memory is indexed and searched; a left team's folder stays on
- * disk but never leaks into later work.
- */
-function activeTeamKey(): string | null {
-  try {
-    const team = loadSettings().team;
-    if (!team) return null;
-    return team.teamId || teamSlug(team.teamName);
-  } catch {
-    return null;
-  }
 }
 
 export function encodeEmbedding(embedding: Float32Array): Buffer {

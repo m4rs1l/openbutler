@@ -19,14 +19,6 @@ export interface TeamMessage {
   replyTo: string | null;
 }
 
-export interface TeamMemoryEntry {
-  seq: number;
-  topic: 'decisions' | 'shared';
-  author: string;
-  body: string;
-  createdAt: number;
-}
-
 export interface TeamMemberView {
   name: string;
   role: string;
@@ -34,7 +26,6 @@ export interface TeamMemberView {
   lastSeen: number;
   lastMessageAt: number | null;
   lastMessageTo: string | null;
-  lastMemoryAt: number | null;
   profile?: PeerProfile | null;
   capabilities?: PeerCapabilities | null;
   activeWorkCount?: number;

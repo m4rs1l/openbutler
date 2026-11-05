@@ -8,7 +8,6 @@ type TeamHistory = (query: { scope: 'group' | 'dm'; peer?: string; before?: numb
 type TeamSendFile = (input: { path: string; to: string }) => Promise<unknown>;
 type TeamReceiveFile = (input: { id: string; to?: string }) => Promise<unknown>;
 type TeamFiles = () => Promise<unknown>;
-type TeamRemember = (input: { topic: 'decisions' | 'shared'; text: string }) => Promise<unknown>;
 
 export function createTeamDeliveryTool(delivery: (input: Record<string, unknown>) => Promise<unknown>): ToolDefinition {
   return {
@@ -248,39 +247,5 @@ export function createTeamFilesTool(files: TeamFiles): ToolDefinition {
     autoApprove: () => true,
     toModelOutput: (output) => ({ type: 'json', value: output as JSONValue }),
     execute: () => files(),
-  };
-}
-
-/**
- * Shared team memory: durable decisions and facts every member reads. Writes
- * are signed with the author and never deleted; a changed decision gets a new
- * entry. This is the team's own memory, separate from the owner's memory.
- */
-export function createTeamRememberTool(remember: TeamRemember): ToolDefinition {
-  return {
-    providerId: 'host',
-    name: 'team_remember',
-    maxInputChars: MAX_TOOL_INPUT_CHARS,
-    description:
-      'Record a durable entry in shared team memory, which every member reads and searches. Use topic "decisions" for agreements the team settled (who proposed it, what was decided) and "shared" for durable facts the whole team should know. One fact per call; the entry is signed with your name and the hub time, and nothing is ever deleted. Do not store secrets, credentials, or anything the owner would not want the team to see.',
-    inputSchema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        topic: { type: 'string', enum: ['decisions', 'shared'], description: 'Which shared note to append to.' },
-        text: { type: 'string', maxLength: 8000, description: 'One durable fact or decision, stated plainly.' },
-      },
-      required: ['topic', 'text'],
-    },
-    effect: { change: 'none', data: 'sensitive', network: 'used', reversible: 'none', outbound: 'model-and-tool-server' },
-    autoApprove: () => true,
-    execute: (input) => {
-      const topic = input.topic;
-      if (topic !== 'decisions' && topic !== 'shared')
-        return Promise.resolve({ status: 'invalid', error: 'topic must be "decisions" or "shared".' });
-      const text = typeof input.text === 'string' ? input.text : '';
-      if (!text.trim()) return Promise.resolve({ status: 'invalid', error: 'text is required.' });
-      return remember({ topic, text });
-    },
   };
 }

@@ -2,7 +2,7 @@ import { TEAM_PRESENCE_WINDOW_MS, TEAM_PROTOCOL_VERSION } from './contracts.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { pipeline } from 'node:stream/promises';
 import { isTailnetAddress } from './tailnet.js';
-import { fingerprintOf, hashTicket, makeFileId, makeRequestId, validateMemberName } from './service.js';
+import { fingerprintOf, hashTicket, makeFileId, validateMemberName } from './service.js';
 import { TeamOperations, TeamError } from './operations.js';
 import { TeamStore, type JoinRequest } from './store.js';
 import { TeamCoordination } from './coordination.js';
@@ -12,7 +12,6 @@ import { TeamTransportError } from './contracts.js';
 const MAX_BODY_BYTES = 65_536;
 const MAX_GROUP_PAGE = 200;
 const MAX_INBOX_PAGE = 200;
-const MAX_MEMORY_PAGE = 500;
 const MAX_HISTORY_PAGE = 200;
 /** How long an approved ticket may be re-fetched before it is forgotten. */
 const JOIN_TICKET_TTL_MS = 60 * 60_000;
@@ -151,29 +150,19 @@ export function startTeamServer(options: TeamServerOptions): Promise<StartedTeam
         return;
       }
       // One message for missing/used/expired: no reason is leaked (SPEC §7).
-      const invite = store.getInvite(body.code.trim(), now);
-      if (!invite) {
-        recordFailure(source, now);
-        sendJson(response, 404, { error: 'Invite code is invalid.' });
-        return;
+      try {
+        const created = operations.requestJoin(body.code.trim(), name, now);
+        joinFailures.delete(source);
+        options.onJoinRequest?.(created);
+        sendJson(response, 202, { requestId: created.id, status: 'pending' });
+      } catch (error) {
+        if (error instanceof TeamError) {
+          if (error.status === 404 || error.status === 409) recordFailure(source, now);
+          sendJson(response, error.status, { error: error.message });
+          return;
+        }
+        throw error;
       }
-      if (store.nameTaken(name)) {
-        recordFailure(source, now);
-        sendJson(response, 409, { error: `"${name}" is already taken in this team. Pick another name.` });
-        return;
-      }
-      if (!store.consumeInvite(invite.code, name, now)) {
-        recordFailure(source, now);
-        sendJson(response, 404, { error: 'Invite code is invalid.' });
-        return;
-      }
-      joinFailures.delete(source);
-      const id = makeRequestId();
-      store.createJoinRequest(id, name, invite.code, now);
-      store.appendAudit({ kind: 'join.requested', actor: name, detail: invite.code, createdAt: now });
-      const created = store.getJoinRequest(id)!;
-      options.onJoinRequest?.(created);
-      sendJson(response, 202, { requestId: id, status: 'pending' });
       return;
     }
     const joinStatus = /^\/v1\/join\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -410,26 +399,10 @@ export function startTeamServer(options: TeamServerOptions): Promise<StartedTeam
       sendJson(response, 200, { acknowledged, remaining: store.unreadDmCount(member.name) });
       return;
     }
-    if (request.method === 'GET' && url.pathname === '/v1/memory') {
-      const sinceRaw = url.searchParams.get('since');
-      const since = sinceRaw === null ? 0 : Number(sinceRaw);
-      if (!Number.isInteger(since) || since < 0) {
-        sendJson(response, 400, { error: 'since must be a non-negative integer.' });
-        return;
-      }
-      sendJson(response, 200, { latestSeq: store.memoryLatestSeq(), entries: store.memoryEntries(since, MAX_MEMORY_PAGE) });
-      return;
-    }
-    if (request.method === 'POST' && url.pathname === '/v1/memory') {
-      const body = (await readJson(request)) as { topic?: unknown; body?: unknown };
-      if ((body?.topic !== 'decisions' && body?.topic !== 'shared') || typeof body?.body !== 'string') {
-        sendJson(response, 400, { error: 'Remembering needs { topic: "decisions"|"shared", body }.' });
-        return;
-      }
+    if (request.method === 'POST' && url.pathname === '/v1/leave') {
       try {
-        const seq = operations.appendMemory(member.name, body.topic, body.body);
-        store.appendAudit({ kind: 'memory.appended', actor: member.name, detail: body.topic, createdAt: now });
-        sendJson(response, 200, { seq, latestSeq: store.memoryLatestSeq() });
+        operations.leave(member.name, now);
+        sendJson(response, 200, { left: true });
       } catch (error) {
         if (error instanceof TeamError) {
           sendJson(response, error.status, { error: error.message });
@@ -437,16 +410,6 @@ export function startTeamServer(options: TeamServerOptions): Promise<StartedTeam
         }
         throw error;
       }
-      return;
-    }
-    if (request.method === 'POST' && url.pathname === '/v1/leave') {
-      if (member.role === 'hub') {
-        sendJson(response, 403, { error: 'The hub cannot leave its own team. Shut the team down instead.' });
-        return;
-      }
-      store.removeMember(member.name, now);
-      store.appendAudit({ kind: 'member.left', actor: member.name, detail: null, createdAt: now });
-      sendJson(response, 200, { left: true });
       return;
     }
     sendJson(response, 404, { error: 'Unknown team endpoint.' });
