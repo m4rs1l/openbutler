@@ -25,6 +25,17 @@ function stubBrowser() {
 }
 
 describe('scroll follower', () => {
+  it('snaps to the tail when the backlog exceeds one viewport instead of chasing it forever', () => {
+    const frames = stubBrowser();
+    const { node, followerNode } = fakeScroller(100_000, 800);
+    const follower = createScrollFollower(followerNode);
+    follower.follow();
+    node.scrollTop = 39_200;
+    follower.follow();
+    expect(node.scrollTop).toBe(99_200);
+    expect(frames.length).toBe(0);
+  });
+
   it('eases towards the bottom on a normal follow and snaps when told to', () => {
     const frames = stubBrowser();
     const { node, followerNode } = fakeScroller(1_000, 400);

@@ -1,7 +1,8 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { bindReaderGestures, createScrollFollower, type ScrollFollower } from './scroll-follow.js';
 import { shouldLoadOlderFitted } from './load-older.js';
+import { buildLayoutWindow } from './layout.js';
 
 interface VirtualListProps<T> {
   items: T[];
@@ -33,9 +34,10 @@ function MeasuredRow({
   useLayoutEffect(() => {
     const node = row.current;
     if (!node) return;
-    // ResizeObserver runs before paint. Commit the spacer and subsequent row
-    // offsets in that same frame instead of displaying yesterday's geometry.
-    const observer = new ResizeObserver(() => flushSync(() => measure(index, node)));
+    // A measurement only queues a layout pass; the pass commits once per frame.
+    // Committing inside every observer callback turned a resize into a render
+    // storm where each height change moved the offsets the next one measured.
+    const observer = new ResizeObserver(() => measure(index, node));
     observer.observe(node);
     measure(index, node);
     return () => observer.disconnect();
@@ -68,6 +70,9 @@ export function VirtualList<T>({
 }: VirtualListProps<T>) {
   const scroller = useRef<HTMLDivElement | null>(null);
   const heights = useRef(new Map<string, number>());
+  // A never-measured row keeps the average it first saw: one row's measurement
+  // must never restretch every other unmeasured row's modeled position.
+  const fallback = useRef(new Map<string, number>());
   const measurementRevision = useRef(0);
   const initializing = useRef(true);
   const [revision, setTick] = useState(0);
@@ -101,20 +106,54 @@ export function VirtualList<T>({
     anchor.current = index < 0 ? null : { key: previous.keys[index], offset: localTop - previous.offsets[index] };
   }, []);
 
+  const pendingHeights = useRef(new Map<string, number>());
+  const flushHandle = useRef<number | null>(null);
+  /**
+   * One layout pass per frame. Every measurement lands in `pendingHeights`;
+   * this pass captures the reader's anchor once, applies the whole batch in a
+   * single commit, and lets the layout effect below make the one follow or
+   * anchor correction. Committing per measurement let each height change move
+   * the scroll geometry while the rest of the batch was still arriving.
+   */
+  const applyPending = useCallback(() => {
+    flushHandle.current = null;
+    const pending = pendingHeights.current;
+    if (pending.size === 0) return;
+    // The anchor describes the geometry that is still on screen, so it must be
+    // read before the batch changes any offset.
+    captureAnchor();
+    for (const [key, height] of pending) {
+      heights.current.set(key, height);
+      fallback.current.delete(key);
+    }
+    pending.clear();
+    measurementRevision.current += 1;
+    flushSync(() => setTick(measurementRevision.current));
+  }, [captureAnchor]);
+
   const measure = useCallback(
     (index: string, node: HTMLDivElement | null) => {
       if (!node) return;
       const height = node.getBoundingClientRect().height;
-      if (height > 0 && heights.current.get(index) !== height) {
-        // Read the current native scroll position before changing spacer geometry.
-        // Keyboard/wheel scrolling may have moved it before its scroll event fires.
-        captureAnchor();
-        heights.current.set(index, height);
-        measurementRevision.current += 1;
-        setTick(measurementRevision.current);
+      if (height <= 0) return;
+      if (heights.current.get(index) === height) {
+        // The row returned to its settled height before the pass ran.
+        pendingHeights.current.delete(index);
+        return;
       }
+      if (pendingHeights.current.get(index) === height) return;
+      pendingHeights.current.set(index, height);
+      if (flushHandle.current === null) flushHandle.current = requestAnimationFrame(applyPending);
     },
-    [captureAnchor],
+    [applyPending],
+  );
+
+  useEffect(
+    () => () => {
+      if (flushHandle.current !== null) cancelAnimationFrame(flushHandle.current);
+      flushHandle.current = null;
+    },
+    [],
   );
 
   useLayoutEffect(() => {
@@ -143,23 +182,20 @@ export function VirtualList<T>({
     }
   }, [revision, viewport, hasOlder, loadingOlder, onLoadOlder]);
 
-  const offsets: number[] = new Array(items.length + 1);
-  offsets[0] = 0;
-  for (let index = 0; index < items.length; index += 1) {
-    offsets[index + 1] = offsets[index] + (heights.current.get(getKey(items[index])) ?? estimate);
-  }
-  const total = offsets[items.length];
-  const firstKey = items.length ? getKey(items[0]) : null;
-  // Mount the tail immediately. Walking from the first estimated rows to the
-  // last ones would expose the entire history while measurements catch up.
-  const windowTop = initializing.current ? Math.max(0, total - viewport) : scrollTop;
-
-  let start = 0;
-  while (start < items.length && offsets[start + 1] < windowTop - viewport) start += 1;
-  start = Math.max(0, start - overscan);
-  let end = start;
-  while (end < items.length && offsets[end] < windowTop + viewport * 2) end += 1;
-  end = Math.min(items.length, end + overscan);
+  const keys = items.map(getKey);
+  const { offsets, total, start, end } = buildLayoutWindow({
+    keys,
+    heights: heights.current,
+    fallback: fallback.current,
+    estimate,
+    overscan,
+    // An initializing list mounts the tail immediately; walking from the first
+    // estimated rows to the last would expose the entire history while
+    // measurements catch up.
+    windowTop: initializing.current ? null : scrollTop,
+    viewport,
+  });
+  const firstKey = keys.length ? keys[0]! : null;
 
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -173,12 +209,15 @@ export function VirtualList<T>({
       follower.current?.resume({ immediate: true });
     }
     if (initializing.current) {
-      // Initial history placement is not live growth. Keep it immediate until
-      // the rendered rows and viewport have committed their real dimensions.
       follower.current?.follow({ immediate: true });
       setScrollTop(element.scrollTop);
-      if (items.length > 0 && revision === measurementRevision.current && viewport === element.clientHeight) {
+      // The flip waits until a pass has applied real measurements and nothing is
+      // queued, so a transcript that is still settling is never placed and then
+      // re-placed.
+      if (items.length > 0 && revision > 0 && pendingHeights.current.size === 0 && viewport === element.clientHeight) {
         initializing.current = false;
+        measurementRevision.current += 1;
+        setTick(measurementRevision.current);
       }
     } else if (follower.current?.pinned !== false) {
       const previous = layout.current;
@@ -196,7 +235,7 @@ export function VirtualList<T>({
         if (index >= 0 && rows) element.scrollTop = rows.offsetTop - element.offsetTop + offsets[index] + anchor.current.offset;
       }
     }
-    layout.current = { keys: items.map(getKey), offsets, footer };
+    layout.current = { keys, offsets, footer };
     anchor.current = null;
   }, [total, viewport, firstKey, items.length, followRequest, revision, footer]);
 
@@ -224,7 +263,7 @@ export function VirtualList<T>({
       <div className="rows" style={{ height: total }}>
         {items.slice(start, end).map((item, offset) => {
           const index = start + offset;
-          const key = getKey(item);
+          const key = keys[index]!;
           return (
             <MeasuredRow key={key} index={key} top={offsets[index]} measure={measure}>
               {render(item, index)}

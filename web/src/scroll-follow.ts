@@ -61,6 +61,13 @@ export function createScrollFollower(node: HTMLElement): ScrollFollower {
       return;
     }
     if (Math.abs(target - node.scrollTop) <= 1) return;
+    if (target - node.scrollTop > node.clientHeight) {
+      // A backlog bigger than one viewport can never close at the catch-up
+      // speed; snap to the tail instead of chasing it frame by frame.
+      cancel();
+      write(target);
+      return;
+    }
     if (frame === null) {
       lastTime = performance.now();
       frame = requestAnimationFrame(step);

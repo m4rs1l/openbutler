@@ -26,7 +26,7 @@
   --ui-section-heading-size: 16px;
   --ui-emphasis-size: 20px;
   --ui-heading-size: 22px;
-  --ui-control-height: 32px;
+  --ui-control-height: 30px;
   --ui-control-radius: 8px;
   --ui-sidebar-width: 252px;
   --ui-surface: #fff;
@@ -44,6 +44,8 @@
   --ui-space-4: 16px;
   --ui-space-5: 24px;
   --ui-space-6: 32px;
+  --mb-overlay-text-fade-edge: 0.75rem;
+  --mb-overlay-marquee-duration: 8s;
   font-family: var(--font-body);
   font-optical-sizing: auto;
   color: #292a2e;
@@ -74,8 +76,8 @@ body,
   overflow: hidden;
 }
 body {
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: var(--ui-body-size);
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 button,
@@ -222,6 +224,7 @@ select:focus-visible,
 /* Shell: conversations and one continuous workspace surface. */
 .app {
   --sidebar-width: 0px;
+  position: relative;
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   /* One viewport-sized row, floored at zero: an overlaid view (settings) may
@@ -231,6 +234,11 @@ select:focus-visible,
   padding: 8px 4px 4px 8px;
   overflow: hidden;
   transition: grid-template-columns 240ms var(--ease);
+}
+/* While the user drags the sidebar handle, kill the grid transition so the
+   column follows the pointer instantly instead of lagging behind by 240ms. */
+.app.sidebar-resizing {
+  transition: none;
 }
 .app.sidebar-visible {
   --sidebar-width: var(--ui-sidebar-width);
@@ -313,63 +321,6 @@ select:focus-visible,
   transform: none;
 }
 
-.new-chat {
-  width: 100%;
-  justify-content: flex-start;
-  padding: 8px 9px;
-  margin-bottom: 4px;
-  font-size: 14px;
-}
-.new-chat .icon {
-  width: 16px;
-  height: 16px;
-  flex-basis: 16px;
-}
-
-.session-running {
-  flex: 0 0 6px;
-  width: 6px;
-  height: 6px;
-  margin-left: 8px;
-  border-radius: 50%;
-  background: #8ba8d1;
-}
-.project-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 31px;
-  border: 0;
-  border-radius: 7px;
-  padding: 5px 8px;
-  background: transparent;
-  text-align: left;
-  font-size: 14px;
-  color: #5b6069;
-}
-.project-row:hover {
-  background: #eef0f2;
-}
-.project-row .icon {
-  width: 15px;
-  height: 15px;
-  flex-basis: 15px;
-}
-.project-row span {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.project-children .session-item {
-  padding-left: 31px;
-  font-size: 13px;
-}
-.show-more {
-  margin-left: 23px;
-  font-size: 12px;
-  color: #999da5;
-}
 .search-overlay {
   position: fixed;
   inset: 0;
@@ -482,19 +433,19 @@ select:focus-visible,
 }
 .rows {
   position: relative;
-  max-width: 800px;
-  padding: 0 28px;
+  max-width: 760px;
+  padding: 0 24px;
   margin: 0 auto;
 }
 .row {
   position: absolute;
   top: 0;
-  left: 28px;
-  right: 28px;
+  left: 24px;
+  right: 24px;
 }
 .transcript-head {
-  max-width: 800px;
-  padding: 12px 28px 0;
+  max-width: 760px;
+  padding: 10px 24px 0;
   margin: 0 auto;
 }
 .transcript-head .button {
@@ -502,15 +453,15 @@ select:focus-visible,
   color: #9297a0;
 }
 .turn {
-  padding: 18px 0 22px;
+  padding: 14px 0 16px;
 }
 .ask {
   width: fit-content;
-  max-width: 88%;
-  margin: 0 0 22px auto;
-  padding: 11px 17px;
+  max-width: 86%;
+  margin: 0 0 16px auto;
+  padding: 9px 15px;
   background: #e8f3ff;
-  border-radius: 20px;
+  border-radius: 18px;
 }
 .ask-label {
   display: none;
@@ -520,14 +471,21 @@ select:focus-visible,
   overflow-wrap: anywhere;
 }
 .ask .prose {
-  font-size: 14px;
-  line-height: 1.75;
+  font-size: 13.5px;
+  line-height: 1.55;
 }
 .answer {
   margin: 12px 0 0;
 }
 .answer + .answer {
   margin-top: 6px;
+}
+/* A follow-up steered into a live turn renders inside the work details right
+   after the assistant's text. These siblings carry no facing margins (none
+   below `.answer`, none above `.ask`), so the bubble used to touch the last
+   line of the reply with zero space. */
+.answer + .ask {
+  margin-top: 16px;
 }
 .answer-label {
   display: none;
@@ -752,6 +710,19 @@ select:focus-visible,
   margin: 4px 0 4px;
   color: #2f3338;
 }
+button.tool-output-command.expandable {
+  display: block;
+  width: 100%;
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  font: 11.5px/1.6 var(--mono);
+  color: #2f3338;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
 .tool-output .tool-output-result {
   padding-bottom: 6px;
 }
@@ -813,8 +784,8 @@ select:focus-visible,
 /* Message box: one toolbar baseline, SVG controls, independent send and stop. */
 .action-dock {
   flex: none;
-  width: min(100%, 794px);
-  padding: 16px 28px 14px;
+  width: min(100%, 760px);
+  padding: 8px 24px 12px;
   margin: 0 auto;
 }
 .composer-dock {
@@ -824,9 +795,9 @@ select:focus-visible,
 .composer {
   position: relative;
   z-index: 2;
-  padding: 12px 12px 8px;
+  padding: 10px 12px 6px;
   border: 1px solid #e5e8ed;
-  border-radius: 24px;
+  border-radius: 20px;
   background: white;
   box-shadow:
     0 2px 5px #20314c03,
@@ -842,7 +813,7 @@ select:focus-visible,
 .composer textarea {
   display: block;
   width: 100%;
-  min-height: 42px;
+  min-height: 36px;
   max-height: 200px;
   border: 0;
   outline: none;
@@ -850,7 +821,7 @@ select:focus-visible,
   resize: none;
   background: transparent;
   font-size: 13px;
-  line-height: 1.7;
+  line-height: 1.5;
 }
 .composer textarea::placeholder {
   color: #c5c6c9;
@@ -865,8 +836,8 @@ select:focus-visible,
      send button pushed onto its own line is what a narrow phone got before. */
   flex-wrap: nowrap;
   gap: 5px;
-  margin-top: 6px;
-  min-height: 28px;
+  margin-top: 4px;
+  min-height: 26px;
 }
 /* Fixed controls keep their size; a shrinkable one collapses its own hit area. */
 .composer-toolbar > * {
@@ -956,18 +927,18 @@ select:focus-visible,
   animation: popover-in 180ms var(--ease);
 }
 .composer-toolbar .icon-button {
-  width: 28px;
-  height: 28px;
-  min-height: 28px;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
 }
 .composer-toolbar .icon-button .icon {
-  width: 16px;
-  height: 16px;
-  flex-basis: 16px;
+  width: 15px;
+  height: 15px;
+  flex-basis: 15px;
 }
 .permission-button {
-  height: 28px;
-  min-height: 28px;
+  height: 26px;
+  min-height: 26px;
   padding: 0 5px;
   font-size: 12px;
   gap: 4px;
@@ -1294,4 +1265,11 @@ select:focus-visible,
   height: 1px;
   background: currentColor;
   opacity: 0.45;
+}
+
+/* The checkpoint the compaction model wrote, read under its boundary rows. */
+.compaction-summary {
+  margin: 0.4rem 0 0.75rem;
+  color: var(--muted);
+  font-size: 13px;
 }

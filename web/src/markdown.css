@@ -1,37 +1,37 @@
 .markdown {
   min-width: 0;
   color: var(--text);
-  font-size: 14px;
-  line-height: 1.7;
+  font-size: 13.5px;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 .markdown p {
-  margin: 0 0 18px;
+  margin: 0 0 14px;
 }
 .markdown :is(h1, h2, h3, h4, h5, h6) {
-  margin: 30px 0 12px;
+  margin: 22px 0 10px;
   font-weight: 600;
   line-height: 1.35;
   letter-spacing: -0.018em;
   text-wrap: pretty;
 }
 .markdown h1 {
-  font-size: 28px;
-}
-.markdown h2 {
   font-size: 24px;
 }
-.markdown h3 {
-  font-size: 20px;
+.markdown h2 {
+  font-size: 21px;
 }
-.markdown h4 {
+.markdown h3 {
   font-size: 18px;
 }
-.markdown h5 {
+.markdown h4 {
   font-size: 16px;
 }
+.markdown h5 {
+  font-size: 14.5px;
+}
 .markdown h6 {
-  font-size: 14px;
+  font-size: 13.5px;
 }
 .markdown :is(h1, h2, h3, h4, h5, h6) + :is(h1, h2, h3, h4, h5, h6) {
   margin-top: 16px;
@@ -167,7 +167,9 @@
   border: 0;
   border-top: 1px solid #ececee;
 }
-.markdown img {
+/* A file citation renders its badge as an img as well: block layout and image
+   margins there would push the glyph off the link's line and stack the text. */
+.markdown img:not(.file-icon) {
   display: block;
   max-width: 100%;
   height: auto;
@@ -286,8 +288,8 @@
 }
 .markdown-code pre {
   margin: 0;
-  padding: 14px 20px 21px;
-  font: 12px/1.8 var(--mono);
+  padding: 12px 18px 16px;
+  font: 12px/1.65 var(--mono);
   white-space: pre;
   overflow-wrap: normal;
   tab-size: 2;
