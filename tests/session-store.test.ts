@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -176,6 +176,72 @@ it('persists full tool input once and still loads legacy command entries', async
     const saved = saveSession({ ...createSession('fixture', 'fixture', 262_144, root), entries }, { allowEmpty: true });
     expect(loadSavedSession(saved.id)!.entries).toEqual(entries);
     expect(loadSavedSession(saved.id)!.entries[0]).not.toHaveProperty('command');
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('keeps a session-owned reasoning choice across save and load', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'openbutler-session-reasoning-'));
+  if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith('openbutler-session-reasoning-'))
+    throw new Error('Unsafe fixture path.');
+  vi.stubEnv('OPENBUTLER_DATA_DIR', root);
+  vi.resetModules();
+  try {
+    const { createSession, saveSession, loadSavedSession } = await import('../src/session-store.js');
+    const entries = [{ kind: 'user' as const, text: 'first message' }];
+    const saved = saveSession({
+      ...createSession('fixture', 'fixture', 262_144, root),
+      reasoning: 'high',
+      showReasoning: false,
+      entries,
+    });
+    expect(saved.reasoning).toBe('high');
+    expect(loadSavedSession(saved.id)!.reasoning).toBe('high');
+    expect(loadSavedSession(saved.id)!.showReasoning).toBe(false);
+
+    // A session that never chose carries no field at all, so it keeps
+    // following the machine default after a reload.
+    const untouched = saveSession({ ...createSession('fixture', 'fixture', 262_144, root), entries }, { allowEmpty: true });
+    expect(loadSavedSession(untouched.id)!.reasoning).toBeUndefined();
+
+    // A malformed effort id is refused instead of silently stored.
+    expect(() =>
+      saveSession({ ...createSession('fixture', 'fixture', 262_144, root), reasoning: 'not a valid id!', entries }, { allowEmpty: true }),
+    ).toThrow();
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('loads a record that still carries the removed growth-pressure field, and does not write it back', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'openbutler-session-legacy-growth-'));
+  if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith('openbutler-session-legacy-growth-'))
+    throw new Error('Unsafe fixture path.');
+  vi.stubEnv('OPENBUTLER_DATA_DIR', root);
+  vi.resetModules();
+  try {
+    const { createSession, saveSession, loadSavedSession } = await import('../src/session-store.js');
+    const saved = saveSession({
+      ...createSession('fixture', 'fixture', 262_144, root),
+      entries: [{ kind: 'user', text: 'legacy record' }],
+      contextTokens: 191_000,
+      contextEstimateTokens: 140_000,
+    });
+    const path = join(root, 'sessions', saved.id, saved.id + '.json');
+    // Written by a build whose compaction trigger read a growth-pressure ramp off the record.
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), contextGrowthTokens: 42 }));
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveProperty('contextGrowthTokens', 42);
+
+    const restored = loadSavedSession(saved.id)!;
+    // The record still loads, and the measured provider usage it carries survives.
+    expect(restored.contextTokens).toBe(191_000);
+
+    // Nothing reads the field, so it is dropped the next time the session is saved.
+    saveSession(restored);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).not.toHaveProperty('contextGrowthTokens');
   } finally {
     vi.unstubAllEnvs();
     await rm(root, { recursive: true, force: true });

@@ -18,6 +18,8 @@ import {
 import { isAbsolute, resolve } from 'node:path';
 import type { ModelMessage } from 'ai';
 import {
+  CUSTODIAN_CONTEXT_LIMIT_TOKENS,
+  CUSTODIAN_SESSION_ID,
   SESSION_ID,
   sessionsDirectory,
   sessionDirectory,
@@ -68,7 +70,18 @@ type SessionEntryBody =
       eventId?: string;
     }
   | { kind: 'assistant'; text: string }
-  | { kind: 'notice'; text: string; detail?: string; tone?: NoticeTone }
+  | {
+      kind: 'notice';
+      text: string;
+      detail?: string;
+      tone?: NoticeTone;
+      /**
+       * Machine-readable reason this notice exists (e.g. `compaction:exceeds-window`),
+       * set when an owner needs the kind of refusal without parsing prose. Absent on
+       * every other notice: they are statements, not classified failures.
+       */
+      cause?: string;
+    }
   | { kind: 'divider'; text?: string }
   | { kind: 'reasoning'; text: string; durationMs?: number }
   | {
@@ -118,19 +131,21 @@ export interface SavedSession {
   lastActivityAt?: string;
   providerId: string;
   modelId: string;
+  /**
+   * This session's own reasoning effort, written when the owner picks one in
+   * this chat. Absent means the session follows the machine default
+   * (settings.reasoning), so a recorded choice survives restarts and never
+   * leaks into another session.
+   */
+  reasoning?: string;
+  /** This session's reasoning-visibility toggle; absent means the machine default. */
+  showReasoning?: boolean;
   /** Canonical workspace that supplied this session's tool and memory scope. */
   workspaceRoot?: string;
   contextTokens?: number;
   /** Byte estimate of the last provider-measured input, used only for subsequent growth. */
   contextEstimateTokens?: number;
   contextWindowTokens?: number;
-  /**
-   * Active-context budget stamped on custodian-line chats: compaction triggers
-   * against this instead of the model window, so the chat stays inside the
-   * owner's chosen cap. Absent on every other session.
-   */
-  contextLimitTokens?: number;
-  contextGrowthTokens?: number;
   /** Opaque provider/key-pool ids mapped to the last selected key position. */
   keyPositions?: Record<string, number>;
   /**
@@ -170,9 +185,10 @@ export interface SessionSummary {
 }
 
 /**
- * The context window compaction budgets against for one session. A custodian-line
- * chat carries an owner-chosen cap; any other session keeps the model window.
- * Once measured context has passed the cap the full window returns: compaction
+ * The context window compaction budgets against for one session. A caller passes
+ * the cap it owns - see `compactionContextWindowTokens` for the custodian's, taken
+ * from its identity - and a session without one keeps the model window. Once
+ * measured context has passed the cap the full window returns: compaction
  * cannot summarise down through a limit its own request would already exceed,
  * so an oversized chat keeps normal behaviour instead of failing at every step
  * boundary.
@@ -185,6 +201,23 @@ export function effectiveContextWindowTokens(
   if (window === null || cap === undefined) return window;
   if (measuredContextTokens !== undefined && measuredContextTokens >= cap) return window;
   return Math.min(window, cap);
+}
+
+/**
+ * The same decision for a real session, with the cap taken from identity (and the
+ * owner's setting) rather than from the record. The custodian's budget is a function
+ * of `CUSTODIAN_SESSION_ID` and the configured limit, and every chat compacts against
+ * its own model window, so a stale or accidental field on a saved record cannot
+ * re-tune a conversation.
+ */
+export function compactionContextWindowTokens(
+  sessionId: string,
+  window: number | null,
+  measuredContextTokens: number | undefined,
+  configuredLimit?: number,
+): number | null {
+  const cap = sessionId === CUSTODIAN_SESSION_ID ? (configuredLimit ?? CUSTODIAN_CONTEXT_LIMIT_TOKENS) : undefined;
+  return effectiveContextWindowTokens(window, cap, measuredContextTokens);
 }
 
 export function createSession(providerId: string, modelId: string, contextWindowTokens?: number, workspaceRoot?: string): SavedSession {
@@ -258,6 +291,7 @@ export function listSessionFiles(): SessionFileInfo[] {
 
 /** Called only by explicit session pruning; the transcript and its files share one lifetime. */
 export function removeSavedSession(id: string): void {
+  if (id === CUSTODIAN_SESSION_ID) throw new Error('Refusing to remove the machine custodian.');
   const directory = sessionDirectory(id);
   if (existsSync(directory)) {
     if (lstatSync(directory).isSymbolicLink() || !isWithinPhysicalDirectory(directory, sessionsDirectory()))
@@ -267,10 +301,15 @@ export function removeSavedSession(id: string): void {
   rmSync(legacySessionFilePath(id), { force: true });
 }
 
+/**
+ * Chats the owner can open. The machine custodian is an internal session, not a
+ * chat: it is recognized by its reserved id and never appears here.
+ */
 export function listSavedSessions(workspaceRoot?: string | null): SessionSummary[] {
   const sessions: SessionSummary[] = [];
   for (const file of listSessionFiles()) {
     const id = file.id;
+    if (id === CUSTODIAN_SESSION_ID) continue;
     try {
       const session = readSessionHeader(file.path, id);
       if (!session || session.id !== id || !session.hasUserMessage) continue;
@@ -454,6 +493,18 @@ function tryParseHeader(text: string, id: string): StoredSessionHeader | null {
   };
 }
 
+/**
+ * A saved session a chat may open in this workspace. Identity is the id: a chat belongs to the
+ * machine and carries no workspace stamp, while an isolated run carries the workspace it was
+ * recorded in. Either way the record is addressable here when it belongs to this workspace or
+ * to no single one.
+ */
+export function loadSessionForChat(id: string, workspaceRoot: string): SavedSession | null {
+  const session = loadSavedSession(id);
+  if (!session) return null;
+  return !session.workspaceRoot || samePath(session.workspaceRoot, workspaceRoot) ? session : null;
+}
+
 export function loadSavedSession(id: string, workspaceRoot?: string | null): SavedSession | null {
   if (!SESSION_ID.test(id)) throw new Error('Invalid session id.');
   let text: string;
@@ -494,7 +545,6 @@ export function loadSavedSession(id: string, workspaceRoot?: string | null): Sav
     }
     delete restored.contextTokens;
     delete restored.contextEstimateTokens;
-    delete restored.contextGrowthTokens;
   }
   return restored;
 }
@@ -517,13 +567,13 @@ export function saveSession(session: SavedSession, options: { allowEmpty?: boole
     ...(session.lastActivityAt === undefined ? {} : { lastActivityAt: session.lastActivityAt }),
     providerId: session.providerId,
     modelId: session.modelId,
+    ...(session.reasoning === undefined ? {} : { reasoning: session.reasoning }),
+    ...(session.showReasoning === undefined ? {} : { showReasoning: session.showReasoning }),
     ...(session.workspaceRoot === undefined ? {} : { workspaceRoot: session.workspaceRoot }),
     ...(session.project === undefined ? {} : { project: session.project }),
     ...(session.contextTokens === undefined ? {} : { contextTokens: session.contextTokens }),
     ...(session.contextEstimateTokens === undefined ? {} : { contextEstimateTokens: session.contextEstimateTokens }),
     ...(session.contextWindowTokens === undefined ? {} : { contextWindowTokens: session.contextWindowTokens }),
-    ...(session.contextLimitTokens === undefined ? {} : { contextLimitTokens: session.contextLimitTokens }),
-    ...(session.contextGrowthTokens === undefined ? {} : { contextGrowthTokens: session.contextGrowthTokens }),
     hasUserMessage,
     ...(session.automaticWakeHeld === undefined ? {} : { automaticWakeHeld: session.automaticWakeHeld }),
     preview: sessionPreview(session.entries),
@@ -586,6 +636,8 @@ function isSavedSession(value: unknown): value is SavedSession {
     (value.lastActivityAt === undefined || typeof value.lastActivityAt === 'string') &&
     typeof value.providerId === 'string' &&
     typeof value.modelId === 'string' &&
+    (value.reasoning === undefined || (typeof value.reasoning === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(value.reasoning))) &&
+    (value.showReasoning === undefined || typeof value.showReasoning === 'boolean') &&
     (value.keyPositions === undefined ||
       (isRecord(value.keyPositions) &&
         Object.entries(value.keyPositions).every(
@@ -604,12 +656,6 @@ function isSavedSession(value: unknown): value is SavedSession {
       (typeof value.contextWindowTokens === 'number' &&
         Number.isSafeInteger(value.contextWindowTokens) &&
         value.contextWindowTokens > 0)) &&
-    (value.contextLimitTokens === undefined ||
-      (typeof value.contextLimitTokens === 'number' && Number.isSafeInteger(value.contextLimitTokens) && value.contextLimitTokens > 0)) &&
-    (value.contextGrowthTokens === undefined ||
-      (typeof value.contextGrowthTokens === 'number' &&
-        Number.isSafeInteger(value.contextGrowthTokens) &&
-        value.contextGrowthTokens >= 0)) &&
     Array.isArray(value.entries) &&
     value.entries.every(isSessionEntry) &&
     Array.isArray(value.conversation) &&

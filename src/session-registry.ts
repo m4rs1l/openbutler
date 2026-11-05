@@ -1,4 +1,5 @@
 import { listSessionFiles, readSessionHeader, samePath, type StoredSessionHeader } from './session-store.js';
+import { CUSTODIAN_SESSION_ID } from './session-paths.js';
 import { redactSensitiveText } from './sensitive-data.js';
 
 /**
@@ -54,6 +55,8 @@ export function listSessionRegistry(query: SessionRegistryQuery = {}): SessionRe
   const entries: SessionRegistryEntry[] = [];
   for (const file of files) {
     if (file.id === query.excludeSessionId) continue;
+    // The machine custodian is an internal session, never a peer chat in the "Recent sessions" block.
+    if (file.id === CUSTODIAN_SESSION_ID) continue;
     const header = readSessionHeader(file.path, file.id);
     if (header === null || !header.hasUserMessage) continue;
     if (query.workspaceRoot && header.workspaceRoot && !samePath(header.workspaceRoot, query.workspaceRoot)) continue;

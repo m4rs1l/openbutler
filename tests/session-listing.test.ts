@@ -1,9 +1,10 @@
-﻿import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SavedSession } from '../src/session-store.js';
+import { CUSTODIAN_SESSION_ID } from '../src/session-paths.js';
 
 // Records every `readFileSync` the module under test performs, so the tests can prove that listing
 // never touches the transcript. Correctness alone cannot catch a regression here: a full parse would
@@ -173,5 +174,24 @@ describe('session listing reads a header instead of the whole file', () => {
     expect(loaded?.conversation).toHaveLength(1);
     expect(loaded?.entries).toHaveLength(3);
     expect(readdirSync(sessionsDir)).toHaveLength(1);
+  });
+
+  it('keeps the machine custodian out of every chat listing', () => {
+    const chat = store.saveSession(bigSession('Ordinary chat', 500));
+    const custodian = store.saveSession({
+      ...bigSession('Machine custodian', 500),
+      id: CUSTODIAN_SESSION_ID,
+    });
+
+    // A chat list is chats. The custodian is an internal session, recognized by its
+    // reserved id, so no listing shows it and no chat can stand in for it.
+    expect(store.listSavedSessions().map((entry) => entry.id)).toEqual([chat.id]);
+    expect(store.listSavedSessions(root).map((entry) => entry.id)).toEqual([chat.id]);
+
+    // The record itself still loads, which is how the host restores it.
+    expect(store.loadSavedSession(custodian.id)?.id).toBe(CUSTODIAN_SESSION_ID);
+
+    // Retention is the one other path that could have taken it away.
+    expect(() => store.removeSavedSession(custodian.id)).toThrow('Refusing to remove the machine custodian.');
   });
 });
