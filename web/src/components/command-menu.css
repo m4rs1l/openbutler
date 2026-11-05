@@ -1,0 +1,64 @@
+/* The dock is the panel's anchor: it has to carry the containing block for an
+   absolutely positioned child, since nothing between it and the surface is
+   positioned. */
+.composer-dock {
+  position: relative;
+}
+
+/* Sits above the composer box at its own width, over the transcript: the
+   transcript is not positioned, so any stacking level clears it, and 1 keeps
+   the composer's own popovers (z-index 2 and above) on top when both are open. */
+.command-menu {
+  position: absolute;
+  z-index: 1;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  max-height: 280px;
+  margin-bottom: 8px;
+  padding: 4px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  background: var(--ui-surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px #233b5d18;
+  /* The scrollbar comes from the global rules: --scrollbar-size and
+     --scrollbar-thumb in styles.css. Setting scrollbar-width here as well would
+     swap that pixel-sized, arrow-free bar for the native one in Chromium. */
+}
+
+.command-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  /* The reference panel packs its rows: one 16px glyph and one 13px line,   no taller than 28px. */
+  line-height: 1.2;
+  border-radius: 8px;
+  cursor: default;
+  outline: none;
+}
+.command-menu-item .icon {
+  color: var(--muted);
+}
+.command-menu-item.active {
+  background: var(--ui-hover-bg);
+}
+.command-menu-name {
+  flex: none;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+}
+.command-menu-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  color: var(--muted);
+}

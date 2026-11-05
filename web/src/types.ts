@@ -120,6 +120,8 @@ export interface SessionInfo {
   updatedAt?: number | string;
   preview?: string | null;
   workspaceRoot?: string;
+  /** Host-owned project binding; the sidebar groups by it and never derives it. */
+  project?: SessionProject;
 }
 
 export type { ModelPresentation as ModelChoice } from '../../src/provider/model-types.js';
@@ -241,6 +243,8 @@ export interface AboutInfo {
   providerId: string;
   modelId: string;
   contextWindowTokens: number | null;
+  /** Resolved shell label; null when the configured shell cannot resolve. */
+  shell: string | null;
 }
 
 export interface TelegramInfo {
@@ -248,6 +252,17 @@ export interface TelegramInfo {
   state: 'disabled' | 'connecting' | 'polling' | 'error' | 'stopped';
   paired: boolean;
   username: string | null;
+  error: string | null;
+}
+
+export interface CommandShellInfo {
+  /** Stored value: a preset name or an executable path. */
+  value: string;
+  /** How the value resolves right now; null when it fails. */
+  resolved: string | null;
+  /** Selectable presets for this platform. */
+  options: string[];
+  /** Resolution problem to surface to the reader, if any. */
   error: string | null;
 }
 

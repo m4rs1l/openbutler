@@ -1,6 +1,7 @@
 import type {
   AboutInfo,
   ApprovalsInfo,
+  CommandShellInfo,
   LogRecord,
   ApprovalMode,
   DraftImage,
@@ -66,11 +67,15 @@ export const sendMessage = (text: string, sessionId: string, images: DraftImage[
   });
 export const fetchProjects = () => request<ProjectCatalog>('/api/projects');
 export const createProject = (name: string, folders: string[]) => request<Project>('/api/projects', { name, folders });
+export const updateProject = (id: string, name: string, folders: string[]) =>
+  request<Project>('/api/projects/update', { id, name, folders });
 export const validateProjectFolder = (path: string) => request<{ path: string }>('/api/project-folders', { path });
 export const pickProjectFolder = () => request<{ path: string | null }>('/api/project-folder-picker', {});
 export const changeSessionProject = (sessionId: string, projectId: string | null) =>
   request<SessionPayload>('/api/session-project', { sessionId, projectId });
 export const stopRun = (sessionId: string) => request('/api/stop', { holdQueue: true, sessionId });
+export const runCommand = (name: string, sessionId: string, options: Record<string, unknown> = {}) =>
+  request('/api/command', { name, sessionId, ...options });
 export const manageQueuedMessage = (sessionId: string, messageId: string, action: 'steer' | 'remove') =>
   request('/api/queue', { sessionId, messageId, action });
 export const decideApproval = (decision: 'allow' | 'deny' | 'always', sessionId: string, requestId?: string) =>
@@ -222,3 +227,6 @@ export const fetchApprovals = () => request<ApprovalsInfo>('/api/approvals');
 export const setAutoReview = (value: { providerId: string | null; modelId: string | null; timeoutSeconds?: number | null }) =>
   request<{ ok: true }>('/api/approvals/auto-review', value);
 export const forgetPermission = (id: string) => request<{ removed: boolean }>('/api/approvals/forget', { id });
+/** Which shell the execute-command tool uses, and the runnable preset list for this platform. */
+export const fetchCommandShell = () => request<CommandShellInfo>('/api/command-shell');
+export const saveCommandShell = (value: string) => request<CommandShellInfo>('/api/command-shell', { value });

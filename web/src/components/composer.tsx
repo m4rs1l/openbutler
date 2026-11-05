@@ -1,4 +1,4 @@
-import { forwardRef, useLayoutEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ApprovalMode, DraftImage, ModelChoice, RuntimeInfo } from '../types.js';
 import type { ReactNode } from 'react';
 import { readImage } from '../image-input.js';
@@ -12,6 +12,9 @@ import { ContextMeter } from './context-meter.js';
 import { MessageQueue } from './message-queue.js';
 import { Feedback } from './feedback.js';
 import { moveHistory, type ComposerHistory } from '../composer-state.js';
+import { commandMenu, matchCommand, suggestCommands, type CommandSpec } from '../../../src/commands/registry.js';
+import { moveCommandIndex } from '../commands/command-menu.js';
+import { CommandMenu } from './command-menu.js';
 interface ComposerProps {
   context?: ReactNode;
   queuedMessages?: import('../types.js').SessionPayload['queuedMessages'];
@@ -31,6 +34,7 @@ interface ComposerProps {
   onDraft: (text: string) => void;
   onSend: (text: string, images?: DraftImage[], reasoningVariantId?: string) => Promise<void>;
   onStop: () => void;
+  onCommand: (name: string) => Promise<void> | void;
   onModel: (model: ModelChoice) => Promise<boolean>;
   onReasoning: (value: string) => Promise<boolean>;
   onApprovalMode: (mode: ApprovalMode) => Promise<void>;
@@ -49,7 +53,15 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
   const [pending, setPending] = useState(false);
   const [readingImages, setReadingImages] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const modelSelection = useModelSelection(props.runtime, props.models, props.onModel, props.onReasoning);
+  // The row the arrow keys are on in the slash menu; reset on every keystroke,
+  // because a shorter list must not leave the selection on a row that left it.
+  const [commandIndex, setCommandIndex] = useState(0);
+  // Surface commands whose controls live in this composer: the approval picker,
+  // the page the model picker opens on, and the /help notice.
+  const [approvalOpen, setApprovalOpen] = useState(false);
+  const [modelPage, setModelPage] = useState<'reasoning' | 'models' | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const modelSelection = useModelSelection(props.runtime, props.models, props.pendingModel, props.onModel, props.onReasoning);
   const dictation = useDictation((text) => props.onDraft([props.draft, text].filter(Boolean).join(' ')), setError);
   useLayoutEffect(() => {
     const node = input.current;
@@ -67,9 +79,66 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
       historyCaret.current = null;
     }
   }, [props.draft]);
+  // Images close the menu: a slash typed beside a picture is part of a message.
+  const commands = props.images.length > 0 ? [] : suggestCommands(props.draft, 'web');
+  const activeIndex = commands.length ? Math.min(commandIndex, commands.length - 1) : 0;
+  const activeCommand = commands[activeIndex];
+  useEffect(() => {
+    setCommandIndex(0);
+  }, [props.draft]);
+  /**
+   * Runs a command the owner picked from the menu.
+   *
+   * The words are an instruction to the interface, so they are dropped here
+   * instead of being handed to `onSend`: this is the one gate that keeps
+   * `/compact` out of the model's context, and it fires on both the Enter that
+   * picks a row and the send button.
+   */
+  const runCommand = async (spec: CommandSpec) => {
+    if (sending.current || props.disabled) return;
+    sending.current = true;
+    setPending(true);
+    setError(null);
+    if (dictation.listening) dictation.toggle();
+    history.current = null;
+    props.onDraft('');
+    props.onImages([]);
+    try {
+      // A surface command moves this interface; only a host command is
+      // forwarded to the daemon-backed route.
+      if (spec.name === '/permissions') {
+        setApprovalOpen(true);
+      } else if (spec.name === '/models' || spec.name === '/reasoning') {
+        setModelPage(spec.name === '/models' ? 'models' : 'reasoning');
+        modelSelection.onOpenChange(true);
+      } else if (spec.name === '/help') {
+        setNotice(
+          'Commands: ' +
+            commandMenu('web')
+              .map((item) => item.command)
+              .join(', ') +
+            '.',
+        );
+      } else {
+        await props.onCommand(spec.name);
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      sending.current = false;
+      setPending(false);
+      input.current?.focus();
+    }
+  };
   const submit = async () => {
     const text = props.draft.trim();
     if ((!text && !props.images.length) || sending.current || props.disabled || props.modelChanging || readingImages) return;
+    // A command only counts when it stands alone; `/compact later` is a message.
+    const command = matchCommand(text, 'web');
+    if (command) {
+      await runCommand(command);
+      return;
+    }
     sending.current = true;
     setPending(true);
     setError(null);
@@ -118,8 +187,16 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
           {error}
         </Feedback>
       ) : null}
+      {notice ? (
+        <Feedback tone="neutral" onDismiss={() => setNotice(null)}>
+          {notice}
+        </Feedback>
+      ) : null}
       {props.context}
       <MessageQueue messages={props.queuedMessages} busy={props.busy} disabled={props.disabled} onAction={props.onQueueAction} />
+      {commands.length ? (
+        <CommandMenu items={commands} activeIndex={activeIndex} onSelect={(spec) => void runCommand(spec)} onHover={setCommandIndex} />
+      ) : null}
       <form
         className="composer"
         onDragOver={(event) => {
@@ -158,6 +235,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
             else if (forwardedRef) forwardedRef.current = node;
           }}
           aria-label="Message OpenButler"
+          aria-activedescendant={activeCommand ? `command-${activeCommand.name.slice(1)}` : undefined}
           placeholder="Tell me what to do"
           value={props.draft}
           disabled={props.disabled}
@@ -176,6 +254,26 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
           }}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
+            if (commands.length) {
+              const moved = moveCommandIndex(event.key, activeIndex, commands.length);
+              if (moved !== null) {
+                event.preventDefault();
+                setCommandIndex(moved);
+                return;
+              }
+              if (event.key === 'Enter' && !event.shiftKey && activeCommand) {
+                event.preventDefault();
+                void runCommand(activeCommand);
+                return;
+              }
+              // Escape is swallowed here so the global handler below cannot read
+              // it as "stop the run"; the menu closes because the draft empties.
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                props.onDraft('');
+                return;
+              }
+            }
             if (
               (event.key === 'ArrowUp' || event.key === 'ArrowDown') &&
               !event.shiftKey &&
@@ -246,7 +344,13 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
               </>
             )}
           </Popover>
-          <ApprovalSelector value={props.runtime?.approvalMode} disabled={props.disabled} onChange={props.onApprovalMode} />
+          <ApprovalSelector
+            value={props.runtime?.approvalMode}
+            disabled={props.disabled}
+            onChange={props.onApprovalMode}
+            open={approvalOpen}
+            onOpenChange={setApprovalOpen}
+          />
           <span className="spacer" />
           {readingImages ? (
             <span className="upload-status" role="status">
@@ -256,6 +360,11 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
           <ContextMeter tokens={props.contextTokens} limit={props.runtime?.contextWindowTokens} />
           <ModelSelector
             {...modelSelection}
+            requestedPage={modelPage}
+            onOpenChange={(next) => {
+              if (!next) setModelPage(null);
+              modelSelection.onOpenChange(next);
+            }}
             disabled={props.disabled || pending || modelSelection.pending}
             pendingModel={props.pendingModel}
           />
