@@ -177,6 +177,38 @@ describe('owner replies and safe steering', () => {
     expect(session.getSnapshot().session.title).toBe(next.title);
   });
 
+  it('starts the custodian at its reserved id with an identity-bound budget and refuses to replace it', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { compactionContextWindowTokens, loadSavedSession } = await import('../src/session-store.js');
+    const { CUSTODIAN_SESSION_ID } = await import('../src/session-paths.js');
+    session = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doStream: async () => fixtureText('Done') })));
+    const previousId = session.getSnapshot().session.id;
+
+    session.startCustodianSession();
+    expect(session.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
+    expect(session.getSnapshot().session.id).not.toBe(previousId);
+    const stored = loadSavedSession(CUSTODIAN_SESSION_ID);
+    expect(stored?.id).toBe(CUSTODIAN_SESSION_ID);
+    expect(stored?.entries).toEqual([]);
+    // The budget follows the reserved id rather than the record, so an ordinary
+    // chat cannot inherit a cap and no saved field can re-tune compaction.
+    expect(compactionContextWindowTokens(CUSTODIAN_SESSION_ID, 1_048_576, 100_000)).toBe(200_000);
+    expect(compactionContextWindowTokens(previousId, 1_048_576, 100_000)).toBe(1_048_576);
+    expect(() => session!.createNewSession()).toThrow('The custodian session is fixed; new chats open in the chat layer.');
+
+    // The identity is the reserved id, so a restart restores the same record with the
+    // same budget and cannot quietly turn the custodian back into an ordinary chat.
+    const reloaded = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doStream: async () => fixtureText('Done') })));
+    try {
+      reloaded.loadSession(CUSTODIAN_SESSION_ID);
+      expect(reloaded.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
+      expect(() => reloaded.createNewSession()).toThrow('The custodian session is fixed; new chats open in the chat layer.');
+    } finally {
+      await reloaded.close();
+    }
+    expect(session.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
+  });
+
   it('closes without waiting for a stalled title request', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const generate = vi.fn<MockLanguageModelV3['doGenerate']>(async () => new Promise<ReturnType<typeof titleResponse>>(() => {}));
@@ -190,7 +222,7 @@ describe('owner replies and safe steering', () => {
     expect(generate.mock.calls[0]![0]?.abortSignal?.aborted).toBe(true);
   });
 
-  it('queues owner messages by default and promotes only the selected message into the active turn', async () => {
+  it('queues web messages by default and promotes only the selected message into the active turn', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -222,7 +254,8 @@ describe('owner replies and safe steering', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    const communication = { source: 'terminal' as const, replyTo: { channel: 'terminal' as const } };
+    // Web keeps the explicit steer button: queued until promoted.
+    const communication = { source: 'web' as const, replyTo: { channel: 'terminal' as const } };
     const first = session.sendMessage({ text: 'Original task.', images: [], communication }, preferences);
     await vi.waitFor(() => expect(started).toBe(true));
     const waiting = session.sendMessage({ text: 'Later independent task.', images: [], communication }, preferences);
@@ -435,7 +468,9 @@ describe('owner replies and safe steering', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    const communication = { source: 'terminal' as const, replyTo: { channel: 'terminal' as const } };
+    // Web: messages queue until the steer button, so both the promotion path
+    // and the foreign-project refusal stay exercisable here.
+    const communication = { source: 'web' as const, replyTo: { channel: 'terminal' as const } };
     const first = session.sendMessage({ text: 'Initial task', images: [], communication }, preferences);
     await vi.waitFor(() => expect(started).toBe(true));
 
@@ -958,6 +993,68 @@ describe('session streaming message boundaries', () => {
     expect(entries[0]).toMatchObject({ kind: 'reasoning', text: 'Hidden but stored.' });
   });
 
+  it('stamps the thinking time the moment the reasoning block ends, while the tool input is still streaming', async () => {
+    // A provider emits reasoning-end, then starts a tool call whose input streams
+    // in chunks. The reasoning block is over at reasoning-end, but the thought
+    // entry kept no duration until the call actually executed - for a gated or
+    // very large call that can be minutes of an open "Thought" row.
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'A local fixture tool',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      autoApprove: () => true,
+      execute: async () => ({ status: 'completed', detail: 'Fixture result' }),
+    });
+    let releaseInputStream!: () => void;
+    const inputGate = new Promise<void>((resolve) => {
+      releaseInputStream = resolve;
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi
+        .fn()
+        .mockImplementationOnce(async () => ({
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({ type: 'reasoning-start', id: 'reasoning' });
+              controller.enqueue({ type: 'reasoning-delta', id: 'reasoning', delta: 'Check the file first.' });
+              await delay(30);
+              controller.enqueue({ type: 'reasoning-end', id: 'reasoning' });
+              controller.enqueue({ type: 'tool-input-start', id: 'inspect-1', toolName: 'inspect' });
+              controller.enqueue({ type: 'tool-input-delta', id: 'inspect-1', delta: '{"path":' });
+              // The tool input is still streaming; the reasoning block ended long before this.
+              await inputGate;
+              controller.enqueue({ type: 'tool-input-end', id: 'inspect-1' });
+              controller.enqueue({ type: 'tool-call', toolCallId: 'inspect-1', toolName: 'inspect', input: '{"path":"notes.md"}' });
+              controller.enqueue({ type: 'finish', finishReason: { unified: 'tool-calls', raw: 'tool-calls' }, usage });
+              controller.close();
+            },
+          }),
+        }))
+        .mockImplementationOnce(async () => fixtureText('Done.')),
+    });
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    session = new AgentSessionController(runtimeFor(model, registry));
+    const run = session.sendMessage({ text: 'inspect', images: [] }, preferences);
+    try {
+      await vi.waitFor(() =>
+        expect(session!.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.preparing === true)).toBe(true),
+      );
+      // While the input is still streaming, the reasoning block that produced it
+      // must already report its duration.
+      const reasoning = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
+      expect(reasoning).toHaveLength(1);
+      expect((reasoning[0] as { durationMs?: number }).durationMs).toEqual(expect.any(Number));
+    } finally {
+      releaseInputStream();
+    }
+    await run;
+  });
+
   it('stamps the thinking time when a tool call ends the block instead of assistant text', async () => {
     // A reasoning block is usually followed by a tool call, not by prose. The
     // tool boundary used to drop the pointer without stamping a duration, so
@@ -1339,7 +1436,7 @@ describe('session compaction persistence and continuation', () => {
     expect(JSON.stringify(saved.conversationArchive)).toContain('Original tool result 3.');
   });
 
-  it('preserves completed steps and stops the run if required automatic compaction fails, allowing a later retry', async () => {
+  it('keeps the run alive when automatic compaction fails and retries it on a later turn', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const { createSession, loadSavedSession } = await import('../src/session-store.js');
     const { COMPACTION_PROMPT } = await import('../src/compaction.js');
@@ -1361,7 +1458,7 @@ describe('session compaction persistence and continuation', () => {
               'tool-calls',
               90_000,
             )
-          : fixtureText('The task can continue.', 'stop', 20_000);
+          : fixtureText('The task can continue.', 'stop', 90_000);
       },
     });
     const registry = new ToolRegistry();
@@ -1370,7 +1467,7 @@ describe('session compaction persistence and continuation', () => {
       name: 'inspect',
       description: 'A local fixture tool',
       inputSchema: { type: 'object', properties: {} },
-      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'none' },
       autoApprove: () => true,
       execute: async () => ({ evidence: 'Original completed evidence. '.repeat(800) }),
     });
@@ -1386,19 +1483,65 @@ describe('session compaction persistence and continuation', () => {
     const id = session.getSnapshot().session.id;
     await session.sendMessage({ text: 'Inspect the evidence.', images: [] }, preferences);
     session.flushSave();
-    expect(normalCalls).toBe(1);
-    expect(summaryCalls).toBe(1);
-    expect(session.getLastRunError()).toMatch(/Compaction failed:.*cut off/);
+    // A summarization failure must never cost the owner their message: the run
+    // finished, the transcript explains the failure, and no partial checkpoint
+    // was applied (2026-11-03 incident contract).
+    expect(session.getLastRunError()).toBeNull();
     expect(session.isBusy).toBe(false);
+    expect(summaryCalls).toBeGreaterThanOrEqual(1);
+    expect(normalCalls).toBe(2);
+    const entries = session.getSnapshot().session.entries;
+    expect(entries.some((entry) => entry.kind === 'notice' && /Compaction failed:.*cut off/.test(entry.text))).toBe(true);
+    expect(entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('The task can continue.'))).toBe(true);
     const failed = loadSavedSession(id)!;
     expect(JSON.stringify(failed.conversation)).toContain('completed-before-failure');
     expect(JSON.stringify(failed.conversation)).toContain('Original completed evidence.');
     expect(JSON.stringify(failed.conversation)).not.toContain('Incomplete checkpoint.');
     expect(failed.conversationArchive).toBeUndefined();
     await session.sendMessage({ text: 'Retry compaction and continue.', images: [] }, preferences);
-    expect(summaryCalls).toBe(2);
-    expect(normalCalls).toBe(2);
+    expect(summaryCalls).toBeGreaterThan(1);
     expect(session.getLastRunError()).toBeNull();
+  });
+
+  it('classifies a refused compaction with a machine-readable cause on the notice', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession, loadSavedSession } = await import('../src/session-store.js');
+    const model = new MockLanguageModelV3({
+      // The provider's own input measurement is what makes the budget arithmetic
+      // real: without a previousContextTokens measurement the refusal path stays
+      // unreachable by design (the provider gets to validate the actual request).
+      doStream: async () => fixtureText('The turn continues despite the refusal.', 'stop', 30_000),
+    });
+    const runtime = runtimeFor(model);
+    // A measured context of 30k against a 10k window, plus one conversation
+    // message far larger than the window: neither the full summarization request
+    // nor the sliced fallback can fit, so compactConversation reports a refusal
+    // as data and the turn must survive it.
+    runtime.contextWindowTokens = 10_000;
+    const oversized = 'context '.repeat(50_000);
+    session = new AgentSessionController(runtime);
+    session.openSession({
+      ...createSession('fixture', 'fixture'),
+      entries: [{ kind: 'user', text: oversized }],
+      conversation: [{ role: 'user', content: oversized }],
+    });
+    await session.sendMessage({ text: 'Keep going.', images: [] }, preferences);
+    await session.waitUntilIdle(1000);
+    await session.compact(preferences);
+    session.flushSave();
+    expect(session.getLastRunError()).toBeNull();
+    const notices = session
+      .getSnapshot()
+      .session.entries.filter(
+        (entry): entry is Extract<SessionEntry, { kind: 'notice' }> =>
+          entry.kind === 'notice' && entry.text.startsWith('Compaction does not fit the budget'),
+      );
+    expect(notices.length).toBeGreaterThan(0);
+    // The prose stays owner-facing; the cause band is the stable key for tooling,
+    // and it survives the save so a later reader can classify without parsing.
+    expect(notices[0]).toMatchObject({ kind: 'notice', tone: 'warn', cause: 'compaction:exceeds-window' });
+    const saved = loadSavedSession(session.getSnapshot().session.id);
+    expect(saved?.entries.some((entry) => entry.kind === 'notice' && entry.cause === 'compaction:exceeds-window')).toBe(true);
   });
 
   it('serves a compaction requested mid-run at the next step boundary instead of after the whole run', async () => {
@@ -1553,8 +1696,11 @@ describe('session compaction persistence and continuation', () => {
           const snapshot = session!.getSnapshot();
           expect(snapshot.busy).toBe(true);
           expect(snapshot.streamingAssistantEntry).toMatchObject({ kind: 'assistant', text: 'Summary in progress.' });
+          // The stamp that ends the thinking block rewrites the row, so its
+          // provenance has to survive that rewrite or the transcript loses track
+          // of whose reasoning it is.
           expect(snapshot.session.entries).toContainEqual(
-            expect.objectContaining({ kind: 'reasoning', text: 'Preserving the current task.' }),
+            expect.objectContaining({ kind: 'reasoning', text: 'Preserving the current task.', internal: 'compaction' }),
           );
         },
         { timeout: 1_000, interval: 25 },
@@ -1571,7 +1717,14 @@ describe('session compaction persistence and continuation', () => {
     expect(saved.conversationArchive).toEqual(source);
     expect(JSON.stringify(saved.conversation)).toContain('Summary in progress. The checkpoint is complete.');
     expect(saved.entries).toContainEqual(
-      expect.objectContaining({ kind: 'assistant', text: 'Summary in progress. The checkpoint is complete.' }),
+      expect.objectContaining({
+        kind: 'assistant',
+        text: 'Summary in progress. The checkpoint is complete.',
+        internal: 'compaction',
+      }),
+    );
+    expect(saved.entries).toContainEqual(
+      expect.objectContaining({ kind: 'reasoning', text: 'Preserving the current task.', internal: 'compaction' }),
     );
     expect(session.getSnapshot().streamingAssistantEntry).toBeNull();
     expect(model.doStreamCalls).toHaveLength(1);
@@ -1695,7 +1848,6 @@ describe('session compaction persistence and continuation', () => {
       conversation: raw,
       contextTokens: 239_000,
       contextEstimateTokens: estimate,
-      contextGrowthTokens: 0,
     });
     await session.selectModel('another-endpoint', 'fixture');
     expect(session.getSnapshot().session.contextTokens).toBe(239_000);
@@ -2161,6 +2313,153 @@ describe('session activity reporting', () => {
     await session.close();
     session = undefined;
   });
+
+  it('delivers a send that lands in the stop race window without restarting the run', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    let calls = 0;
+    const endless = () => {
+      let timer: NodeJS.Timeout | undefined;
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({ type: 'text-start', id: 'endless' });
+            controller.enqueue({ type: 'text-delta', id: 'endless', delta: 'Still working' });
+            timer = setInterval(() => {
+              try {
+                controller.enqueue({ type: 'text-delta', id: 'endless', delta: '.' });
+              } catch {
+                if (timer) clearInterval(timer);
+              }
+            }, 25);
+          },
+          cancel() {
+            if (timer) clearInterval(timer);
+          },
+        }),
+      };
+    };
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi.fn().mockImplementation(async () => {
+        calls++;
+        if (calls === 1) return endless();
+        return delayedStream([
+          { type: 'text-start', id: `answer-${calls}` },
+          { type: 'text-delta', id: `answer-${calls}`, delta: `Answer ${calls}.` },
+          { type: 'text-end', id: `answer-${calls}` },
+        ]);
+      }),
+    });
+    session = new AgentSessionController(runtimeFor(model));
+    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    await vi.waitFor(() =>
+      expect(
+        session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
+      ).toBe(true),
+    );
+    const users = () => session!.getSnapshot().session.entries.filter((entry) => entry.kind === 'user');
+
+    // The send lands synchronously inside the abort window: the run is still busy.
+    session.stop({ keepQueue: true, holdQueue: true });
+    void session.sendMessage({ text: 'After stop.', images: [] }, preferences);
+
+    await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
+    // The Esc contract in the race window: delivered to the chat, no restart, nothing stuck.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(calls).toBe(1);
+    const after = users().filter((entry) => entry.text === 'After stop.');
+    expect(after).toHaveLength(1);
+    expect(session.getSnapshot().queuedMessageCount).toBe(0);
+    expect(after[0]!.turnOutcome).toBeUndefined();
+    // The dying run keeps its own turn while the held message mints a fresh one.
+    const firstUser = users().find((entry) => entry.text === 'First request.')!;
+    expect(firstUser.turnOutcome).toBe('cancelled');
+    expect(after[0]!.turnId).toBeTruthy();
+    expect(after[0]!.turnId).not.toBe(firstUser.turnId);
+    const assistants = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'assistant');
+    expect(assistants.length).toBeGreaterThan(0);
+    for (const entry of assistants) expect(entry.turnId).toBe(firstUser.turnId);
+
+    // The next explicit send releases the hold: held and new messages run in order,
+    // and the already-materialised entry is delivered exactly once.
+    void session.sendMessage({ text: 'Third request.', images: [] }, preferences);
+    await vi.waitFor(() => expect(users().find((entry) => entry.text === 'After stop.')?.turnOutcome).toBe('completed'));
+    expect(users().filter((entry) => entry.text === 'After stop.')).toHaveLength(1);
+    await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
+    await session.close();
+    session = undefined;
+  });
+
+  it('keeps a flushed answer under the run turn when a held message follows', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    let calls = 0;
+    const endless = () => {
+      let timer: NodeJS.Timeout | undefined;
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({ type: 'text-start', id: 'endless' });
+            controller.enqueue({ type: 'text-delta', id: 'endless', delta: 'Still working' });
+            timer = setInterval(() => {
+              try {
+                controller.enqueue({ type: 'text-delta', id: 'endless', delta: '.' });
+              } catch {
+                if (timer) clearInterval(timer);
+              }
+            }, 25);
+          },
+          cancel() {
+            if (timer) clearInterval(timer);
+          },
+        }),
+      };
+    };
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi.fn().mockImplementation(async () => {
+        calls++;
+        if (calls === 1) return endless();
+        return delayedStream([
+          { type: 'text-start', id: `answer-${calls}` },
+          { type: 'text-delta', id: `answer-${calls}`, delta: `Answer ${calls}.` },
+          { type: 'text-end', id: `answer-${calls}` },
+        ]);
+      }),
+    });
+    session = new AgentSessionController(runtimeFor(model));
+    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    await vi.waitFor(() =>
+      expect(
+        session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
+      ).toBe(true),
+    );
+    void session.sendMessage({ text: 'Queued before stop.', images: [] }, preferences).catch(() => {});
+    await vi.waitFor(() => expect(session!.getSnapshot().queuedMessageCount).toBe(1));
+
+    session.stop({ keepQueue: true, holdQueue: true });
+    await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(calls).toBe(1);
+
+    const entries = session.getSnapshot().session.entries;
+    const firstUser = entries.find((entry) => entry.kind === 'user' && entry.text === 'First request.')!;
+    const held = entries.find((entry) => entry.kind === 'user' && entry.text === 'Queued before stop.')!;
+    expect(held).toBeDefined();
+    expect(held.turnOutcome).toBeUndefined();
+    expect(firstUser.turnOutcome).toBe('cancelled');
+    // Flush-first: the answer is finalised under the run's turn before the held
+    // message mints a new one, so the held turn holds exactly one entry.
+    expect(held.turnId).toBeTruthy();
+    expect(held.turnId).not.toBe(firstUser.turnId);
+    expect(entries.filter((entry) => entry.turnId === held.turnId)).toHaveLength(1);
+    const answer = entries.find((entry) => entry.kind === 'assistant' && entry.text.includes('Still working'))!;
+    expect(answer.turnId).toBe(firstUser.turnId);
+
+    await session.close();
+    session = undefined;
+  });
 });
 
 describe('run turn identity at send time', () => {
@@ -2239,14 +2538,47 @@ describe('run turn identity at send time', () => {
     expect(userEntry.turnId).toBeDefined();
     const compaction = session.compact(preferences);
     // compact() marks the run busy synchronously; the compaction row lands in
-    // the turn the transcript already ends in, and the snapshot says so.
+    // the turn the transcript already ends in, but a standalone compaction is
+    // a boundary, never a running turn: reporting one here re-opened the
+    // finished turn in the client and started its timer again.
     const started = session.getSnapshot();
     expect(started.busy).toBe(true);
-    expect(started.runningTurnId).toBe(userEntry.turnId);
+    expect(started.runningTurnId).toBeNull();
     await compaction;
     const settled = session.getSnapshot();
     expect(settled.busy).toBe(false);
     expect(settled.runningTurnId).toBeNull();
+    // The rows and the checkpoint name that turn as well: placement by array
+    // position alone is what let a message sent during the compaction claim them.
+    const rows = settled.session.entries.filter((entry) => entry.kind === 'compaction');
+    expect(rows.map((entry) => entry.turnId)).toEqual([userEntry.turnId]);
+    const checkpoint = settled.session.entries.filter((entry) => entry.kind === 'assistant').at(-1);
+    expect(checkpoint?.text).toContain('Checkpoint');
+    expect(checkpoint?.turnId).toBe(userEntry.turnId);
+  });
+});
+
+describe('stored transcript migration', () => {
+  it('restores the compaction marker the old restore path dropped, once, on load', async () => {
+    const { createSession, saveSession } = await import('../src/session-store.js');
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const saved = saveSession({
+      ...createSession('fixture', 'fixture', undefined, process.cwd()),
+      entries: [
+        { kind: 'user', text: 'Task' },
+        { kind: 'compaction', status: 'done' },
+        // The duration rebuild dropped the marker: exactly what old files hold.
+        { kind: 'reasoning', text: 'Checkpoint thinking', durationMs: 1_000 },
+        { kind: 'assistant', text: '## Objective and current request', internal: 'compaction' },
+        { kind: 'reasoning', text: 'Run thinking', durationMs: 500 },
+      ],
+    });
+    const model = new MockLanguageModelV3({ doGenerate: async () => titleResponse(), doStream: async () => fixtureText('ok') });
+    session = new AgentSessionController(runtimeFor(model));
+    session.loadSession(saved.id);
+    const reasoning = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
+    expect(reasoning.map((entry) => entry.internal)).toEqual(['compaction', undefined]);
+    expect(reasoning.map((entry) => entry.text)).toEqual(['Checkpoint thinking', 'Run thinking']);
   });
 });
 
@@ -2344,5 +2676,129 @@ describe('stored transcript dividers', () => {
 
     await session.selectModel('other', 'other-model');
     expect(dividersOf(session, 'Model changed')).toHaveLength(1);
+  });
+});
+
+describe('session-owned reasoning', () => {
+  it('records the owner effort on this session and makes it the turn authority', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const runtime = runtimeFor(
+      new MockLanguageModelV3({
+        doGenerate: async () => titleResponse(),
+        doStream: async () => fixtureText('Runs on the session choice'),
+      }),
+    );
+    const seen: string[] = [];
+    runtime.getReasoningProviderOptions = (variantId: string) => {
+      seen.push(variantId);
+      return {};
+    };
+    session = new AgentSessionController(runtime);
+    session.setReasoningPreference('high');
+    expect(session.getSnapshot().session.reasoning).toBe('high');
+
+    // The message carries another effort: the session still wins, and the
+    // machine default in the runtime is never written.
+    await session.sendMessage({ text: 'Uses the session choice', images: [] }, preferences);
+    await session.waitUntilIdle(1000);
+    expect(seen[0]).toBe('high');
+    expect(runtime.reasoningDefault).toBe('default');
+
+    // The choice survives a save and reload of the chat.
+    const { loadSavedSession } = await import('../src/session-store.js');
+    session.flushSave();
+    const saved = loadSavedSession(session.getSnapshot().session.id);
+    expect(saved?.reasoning).toBe('high');
+  });
+
+  it('keeps following the machine default while the session never chose', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const runtime = runtimeFor(
+      new MockLanguageModelV3({
+        doGenerate: async () => titleResponse(),
+        doStream: async () => fixtureText('Runs on the default'),
+      }),
+    );
+    const seen: string[] = [];
+    runtime.getReasoningProviderOptions = (variantId: string) => {
+      seen.push(variantId);
+      return {};
+    };
+    session = new AgentSessionController(runtime);
+    await session.sendMessage({ text: 'No choice made', images: [] }, { reasoningVariantId: 'default', showReasoning: false });
+    await session.waitUntilIdle(1000);
+    expect(seen[0]).toBe('default');
+    expect(session.getSnapshot().session.reasoning).toBeUndefined();
+    expect(session.getSnapshot().session.showReasoning).toBeUndefined();
+  });
+
+  it('opens a new chat on the effort the current chat is using', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    session = new AgentSessionController(
+      runtimeFor(
+        new MockLanguageModelV3({
+          doGenerate: async () => titleResponse(),
+          doStream: async () => fixtureText('New chat'),
+        }),
+      ),
+    );
+    session.setReasoningPreference('high');
+    session.setShowReasoningPreference(false);
+    const previousId = session.getSnapshot().session.id;
+    session.createNewSession();
+    expect(session.getSnapshot().session.id).not.toBe(previousId);
+    expect(session.getSnapshot().session.reasoning).toBe('high');
+    expect(session.getSnapshot().session.showReasoning).toBe(false);
+  });
+
+  it('shows a running turn one bounded report line, as a projection and not as a message', async () => {
+    let pendingLine: string | null = null;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'Fixture',
+      inputSchema: { type: 'object', properties: {} },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      autoApprove: () => true,
+      execute: async () => {
+        started = true;
+        await gate;
+        return { message: 'Evidence' };
+      },
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi
+        .fn()
+        .mockImplementationOnce(async () =>
+          delayedStream([{ type: 'tool-call', toolCallId: 'one', toolName: 'inspect', input: '{}' }], 'tool-calls'),
+        )
+        .mockImplementationOnce(async () => fixtureText('Finished with the report in view.')),
+    });
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    session = new AgentSessionController(runtimeFor(model, registry), undefined, {
+      sessionWorkspaceRoot: null,
+      pendingReports: () => pendingLine,
+    });
+    const turn = session.sendMessage({ text: 'Owner task.', images: [] }, preferences);
+    await vi.waitFor(() => expect(started).toBe(true));
+    // The report lands while the turn is waiting on a tool, so only the next step can see it.
+    pendingLine = '[Host context: 1 report waiting from below - a1b2c3d4 "Refactor": 1 result. Read them with inbox.]';
+    release();
+    await turn;
+    expect(model.doStreamCalls).toHaveLength(2);
+    expect(JSON.stringify(model.doStreamCalls[0]!.prompt)).not.toContain('waiting from below');
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('waiting from below');
+    // A projection: the line never becomes a chat entry the owner would read.
+    const entries = session.getSnapshot().session.entries;
+    expect(entries.some((entry) => 'text' in entry && typeof entry.text === 'string' && entry.text.includes('waiting from below'))).toBe(
+      false,
+    );
   });
 });
