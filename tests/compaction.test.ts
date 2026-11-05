@@ -13,8 +13,16 @@ import {
   COMPACTION_SUMMARY_MARKER,
   TOOL_REFERENCE_MARKER,
   compactConversation,
+  splitIntoSlices,
   estimateContextTokens,
+  autoCompactionTriggerTokens,
+  type CompactionResult,
 } from '../src/compaction.js';
+
+/** Narrow a successful attempt to the historical shape; refusal tests call compactConversation directly. */
+function compactResult(options: Parameters<typeof compactConversation>[0]): Promise<CompactionResult | null> {
+  return compactConversation(options).then((outcome) => (outcome.kind === 'compacted' ? outcome.result : null));
+}
 
 let dataDir: string;
 beforeEach(() => {
@@ -86,7 +94,7 @@ describe('full-context LLM compaction', () => {
       tools: { inspect: tool({ inputSchema: schema, execute: async () => 'Complete tool result' }) },
       takeQueuedMessages: () => queued.shift() ?? [],
       compactBeforeStep: async (context) =>
-        ++step === 3 ? compactConversation({ ...context, model: summaryModel, contextWindowTokens: null, force: true }) : null,
+        ++step === 3 ? compactResult({ ...context, model: summaryModel, contextWindowTokens: null, force: true }) : null,
     });
     expect(summaryModel.doStreamCalls).toHaveLength(1);
     const messages = result.response.messages;
@@ -141,7 +149,7 @@ describe('full-context LLM compaction', () => {
     ];
     const source = structuredClone(messages);
     const model = new MockLanguageModelV3({ doStream: async () => textStream('New checkpoint covering all historical facts.') });
-    const result = await compactConversation({ system: 'Permanent policy', messages, model, contextWindowTokens: null, force: true });
+    const result = await compactResult({ system: 'Permanent policy', messages, model, contextWindowTokens: null, force: true });
     const previews = result!.messages.filter(
       (message) => message.role === 'assistant' && typeof message.content === 'string' && message.content.startsWith(TOOL_REFERENCE_MARKER),
     );
@@ -174,7 +182,7 @@ describe('full-context LLM compaction', () => {
       },
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('A complete checkpoint of all eight results.') });
-    const result = await compactConversation({ system: 'Policy', messages, model, contextWindowTokens: null, force: true });
+    const result = await compactResult({ system: 'Policy', messages, model, contextWindowTokens: null, force: true });
     const previews = result!.messages.flatMap((message) =>
       message.role === 'assistant' && typeof message.content === 'string' && message.content.startsWith(TOOL_REFERENCE_MARKER)
         ? [JSON.parse(message.content.slice(TOOL_REFERENCE_MARKER.length))]
@@ -241,7 +249,7 @@ describe('full-context LLM compaction', () => {
       compactBeforeStep: async (context) => {
         if (checked) return null;
         checked = true;
-        return compactConversation({ ...context, model, contextWindowTokens: null, force: true });
+        return compactResult({ ...context, model, contextWindowTokens: null, force: true });
       },
     });
     expect(bodies).toHaveLength(3);
@@ -257,7 +265,7 @@ describe('full-context LLM compaction', () => {
   it('adds the archive location to the completed checkpoint without changing the summary request', async () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Complete checkpoint.') });
     const archivePath = 'C:/data/openbutler/sessions/fixture.json';
-    const result = await compactConversation({
+    const result = await compactResult({
       system: 'Permanent policy',
       messages: [{ role: 'user', content: 'Original task' }],
       model,
@@ -277,7 +285,7 @@ describe('full-context LLM compaction', () => {
       doStream: async () => stream([{ type: 'tool-call', toolCallId: 'unexpected', toolName: 'inspect', input: '{}' }], 'tool-calls'),
     });
     await expect(
-      compactConversation({
+      compactResult({
         system: 'Original system',
         messages,
         model,
@@ -324,7 +332,7 @@ describe('full-context LLM compaction', () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('The LLM continuation checkpoint') });
     const deltas: string[] = [];
     const onStart = vi.fn();
-    const result = await compactConversation({
+    const result = await compactResult({
       ...getAgentContext(original, undefined, dataDir, undefined, true, undefined, '11111111-1111-4111-8111-111111111111'),
       model,
       tools: { inspect: tool({ description: 'Inspect context', inputSchema: schema, execute }) },
@@ -373,7 +381,7 @@ describe('full-context LLM compaction', () => {
 
   it('allows manual compaction of plain conversation without any tool results', async () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Plain conversation checkpoint') });
-    const result = await compactConversation({
+    const result = await compactResult({
       system: 'Normal agent system context',
       messages: [
         { role: 'user', content: 'Remember this preference' },
@@ -413,8 +421,8 @@ describe('full-context LLM compaction', () => {
       { role: 'assistant', content: COMPACTION_SUMMARY_MARKER + 'This is ordinary quoted text.' },
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('A checkpoint of the quoted text.') });
-    const first = await compactConversation({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true });
-    const second = await compactConversation({
+    const first = await compactResult({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true });
+    const second = await compactResult({
       system: 'Normal system',
       messages: first!.messages,
       model,
@@ -468,7 +476,7 @@ describe('full-context LLM compaction', () => {
       doStream: async () =>
         textStream('src/runtime.ts implements the runtime; its changes are unverified. No emojis. Do not restart the daemon.'),
     });
-    const result = await compactConversation({
+    const result = await compactResult({
       system: 'Permanent policy',
       messages,
       model,
@@ -509,7 +517,7 @@ describe('full-context LLM compaction', () => {
     expect(messages).toEqual(snapshot);
 
     // A subsequent checkpoint reads the current context, never the raw archive.
-    const repeated = await compactConversation({
+    const repeated = await compactResult({
       system: 'Permanent policy',
       messages: projected,
       model,
@@ -541,7 +549,7 @@ describe('full-context LLM compaction', () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Folded checkpoint.') });
     const system = 'Permanent policy';
     const before = estimateContextTokens({ system, messages });
-    const result = await compactConversation({ system, messages, model, contextWindowTokens: 100_000, force: true });
+    const result = await compactResult({ system, messages, model, contextWindowTokens: 100_000, force: true });
     expect(result).not.toBeNull();
     const projected = result!.messages;
     expect(typeof projected[0]!.content === 'string' && (projected[0]!.content as string).startsWith(COMPACTION_SUMMARY_MARKER)).toBe(true);
@@ -566,7 +574,7 @@ describe('full-context LLM compaction', () => {
       { role: 'user', content: 'Latest request' },
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Folded checkpoint.') });
-    const result = await compactConversation({ system: 'Permanent policy', messages, model, contextWindowTokens: 10_000, force: true });
+    const result = await compactResult({ system: 'Permanent policy', messages, model, contextWindowTokens: 10_000, force: true });
     expect(result).not.toBeNull();
     expect(result!.messages).toContainEqual({ role: 'user', content: 'Latest request' });
     expect(JSON.stringify(result!.messages)).not.toContain('Old user request');
@@ -586,7 +594,7 @@ describe('full-context LLM compaction', () => {
     const inputEstimate = estimateContextTokens({ system, messages });
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Detailed continuation checkpoint') });
     expect(inputEstimate).toBeGreaterThan(262_144);
-    const result = await compactConversation({
+    const result = await compactResult({
       system,
       messages,
       model,
@@ -594,7 +602,7 @@ describe('full-context LLM compaction', () => {
       outputLimitTokens: 32_768,
       previousContextTokens: 220_000,
       previousContextEstimateTokens: inputEstimate,
-      recentContextGrowthTokens: 30_000,
+      force: true,
     });
     expect(result).not.toBeNull();
     expect(model.doStreamCalls).toHaveLength(1);
@@ -614,20 +622,19 @@ describe('full-context LLM compaction', () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('A complete continuation checkpoint.') });
     const system = 'Permanent policy';
     const providerOptions = { fixture: { reasoningEffort: 'xhigh', cache_salt: 'unchanged' } };
-    const result = await compactConversation({
+    const result = await compactResult({
       system,
       messages,
       model,
       providerOptions,
       contextWindowTokens: 262_144,
       outputLimitTokens: 32_768,
-      previousContextTokens: 228_500,
+      previousContextTokens: autoCompactionTriggerTokens(262_144, 32_768),
       previousContextEstimateTokens: estimateContextTokens({ system, messages }),
-      recentContextGrowthTokens: 0,
     });
     expect(result).not.toBeNull();
     expect(model.doStreamCalls).toHaveLength(1);
-    expect(model.doStreamCalls[0]!.maxOutputTokens).toBeGreaterThan(32_000);
+    expect(model.doStreamCalls[0]!.maxOutputTokens).toBe(32_768);
     expect(model.doStreamCalls[0]!.providerOptions).toEqual(providerOptions);
   });
 
@@ -658,7 +665,7 @@ describe('full-context LLM compaction', () => {
     const original = structuredClone(messages);
     const model = new MockLanguageModelV3({ doStream: async () => textStream('A complete recovered checkpoint.') });
     const providerOptions = { fixture: { reasoningEffort: 'xhigh', cache_salt: 'unchanged' } };
-    const result = await compactConversation({
+    const result = await compactResult({
       system: 'Permanent policy',
       messages,
       transcriptMessages: messages,
@@ -705,7 +712,7 @@ describe('full-context LLM compaction', () => {
       { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'new-image', toolName: 'file_read', output: newImage }] },
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Both image findings are summarized here.') });
-    const compacted = await compactConversation({ ...getAgentContext(messages, false), model, contextWindowTokens: null, force: true });
+    const compacted = await compactResult({ ...getAgentContext(messages, false), model, contextWindowTokens: null, force: true });
     expect(JSON.stringify(model.doStreamCalls[0]!.prompt)).toContain('old.png');
     const media = compacted!.messages.filter(
       (message) => message.role === 'user' && Array.isArray(message.content) && message.content.some((part) => part.type === 'image'),
@@ -725,7 +732,7 @@ describe('full-context LLM compaction', () => {
         ],
       },
     ];
-    const repeated = await compactConversation({ ...getAgentContext(next, false), model, contextWindowTokens: null, force: true });
+    const repeated = await compactResult({ ...getAgentContext(next, false), model, contextWindowTokens: null, force: true });
     expect(
       repeated!.messages.some(
         (message) => message.role === 'user' && Array.isArray(message.content) && message.content.some((part) => part.type === 'image'),
@@ -740,7 +747,7 @@ describe('full-context LLM compaction', () => {
       doStream: async () => stream([{ type: 'tool-call', toolCallId: 'unexpected', toolName: 'inspect', input: '{}' }], 'tool-calls'),
     });
     await expect(
-      compactConversation({
+      compactResult({
         system: 'Normal system',
         messages: [{ role: 'user', content: 'Current task' }],
         tools: { inspect: tool({ inputSchema: schema, execute }) },
@@ -760,14 +767,14 @@ describe('full-context LLM compaction', () => {
     });
     const onTextDelta = vi.fn();
     await expect(
-      compactConversation({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true, onTextDelta }),
+      compactResult({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true, onTextDelta }),
     ).rejects.toThrow(/empty|cut off|No output/i);
     if (failure === 'length') expect(onTextDelta).toHaveBeenCalledWith('Incomplete checkpoint');
     else expect(onTextDelta).not.toHaveBeenCalled();
     expect(messages).toEqual(snapshot);
   });
 
-  it('moves the automatic trigger between 75% and 90% according to context growth', async () => {
+  it('compacts at the window minus the declared output reserve and not one token earlier', async () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Checkpoint') });
     const base = {
       system: 'Normal system',
@@ -785,12 +792,28 @@ describe('full-context LLM compaction', () => {
       contextWindowTokens: 100_000,
       outputLimitTokens: 20_000,
     };
-    expect(await compactConversation({ ...base, previousContextTokens: 74_999, recentContextGrowthTokens: 10_000 })).toBeNull();
-    expect(await compactConversation({ ...base, previousContextTokens: 77_000, recentContextGrowthTokens: 0 })).toBeNull();
+    // Literal on purpose: the gate must land on this number, not on whatever the helper returns.
+    const trigger = 78_421;
+    expect(await compactConversation({ ...base, previousContextTokens: trigger - 1 })).toMatchObject({
+      kind: 'skipped',
+      reason: 'below-threshold',
+    });
     expect(model.doStreamCalls).toHaveLength(0);
-    expect(await compactConversation({ ...base, previousContextTokens: 77_000, recentContextGrowthTokens: 10_000 })).not.toBeNull();
-    expect(await compactConversation({ ...base, previousContextTokens: 91_000, recentContextGrowthTokens: 0 })).not.toBeNull();
-    expect(model.doStreamCalls).toHaveLength(2);
+    expect(await compactConversation({ ...base, previousContextTokens: trigger })).toMatchObject({ kind: 'compacted' });
+    expect(model.doStreamCalls).toHaveLength(1);
+  });
+
+  it('scales the trigger with the window and the declared output instead of a fixed share', () => {
+    // window - (declared output + estimateTokens(COMPACTION_PROMPT)), the prompt being 6_315 ASCII characters, 1_579 tokens.
+    expect(autoCompactionTriggerTokens(100_000, 20_000)).toBe(78_421);
+    expect(autoCompactionTriggerTokens(307_200, 32_768)).toBe(272_853);
+    expect(autoCompactionTriggerTokens(1_000_000, 20_000)).toBe(898_421);
+  });
+
+  it('bounds the reserve when no output limit is declared or the declared one exceeds a quarter of the window', () => {
+    expect(autoCompactionTriggerTokens(100_000)).toBe(88_421);
+    expect(autoCompactionTriggerTokens(100_000, null)).toBe(88_421);
+    expect(autoCompactionTriggerTokens(100_000, 40_000)).toBe(75_000);
   });
 
   it('accounts for a large tool result added after the last provider measurement', async () => {
@@ -814,7 +837,7 @@ describe('full-context LLM compaction', () => {
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Checkpoint of the large report.') });
     expect(
-      await compactConversation({
+      await compactResult({
         system: 'Normal system',
         messages,
         model,
@@ -822,7 +845,6 @@ describe('full-context LLM compaction', () => {
         outputLimitTokens: 20_000,
         previousContextTokens: 72_000,
         previousContextEstimateTokens: estimateContextTokens({ system: 'Normal system', messages: prefix }),
-        recentContextGrowthTokens: 0,
       }),
     ).not.toBeNull();
     expect(model.doStreamCalls).toHaveLength(1);
@@ -839,17 +861,15 @@ describe('full-context LLM compaction', () => {
     const model = new MockLanguageModelV3({
       doStream: async () => textStream('A checkpoint larger than the original dialogue. '.repeat(100)),
     });
-    await expect(
-      compactConversation({
-        system: 'Normal system',
-        messages,
-        model,
-        contextWindowTokens: 100_000,
-        previousContextTokens: 91_000,
-        recentContextGrowthTokens: 0,
-        onTextDelta,
-      }),
-    ).rejects.toThrow(/would not reduce/);
+    const outcome = await compactConversation({
+      system: 'Normal system',
+      messages,
+      model,
+      contextWindowTokens: 100_000,
+      previousContextTokens: 91_000,
+      onTextDelta,
+    });
+    expect(outcome).toMatchObject({ kind: 'impossible', reason: 'no-reduction', window: 100_000 });
     expect(messages).toEqual(snapshot);
     expect(onTextDelta).toHaveBeenCalledWith('A checkpoint larger than the original dialogue. '.repeat(100));
     expect(model.doStreamCalls).toHaveLength(1);
@@ -863,7 +883,7 @@ describe('full-context LLM compaction', () => {
     const messages: ModelMessage[] = [{ role: 'user', content: 'Original request' }];
     const onTextDelta = vi.fn();
     await expect(
-      compactConversation({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true, onTextDelta }),
+      compactResult({ system: 'Normal system', messages, model, contextWindowTokens: null, force: true, onTextDelta }),
     ).rejects.toThrow(/Provider rejected/);
     expect(doStream).toHaveBeenCalledOnce();
     expect(messages).toEqual([{ role: 'user', content: 'Original request' }]);
@@ -897,7 +917,7 @@ describe('full-context LLM compaction', () => {
       messages: [{ role: 'user', content: 'Inspect the workspace without deleting anything.' }],
       tools: { inspect: tool({ inputSchema: schema, execute }) },
       compactBeforeStep: async (context) =>
-        ++step === 2 ? compactConversation({ ...context, model: summaryModel, contextWindowTokens: null, force: true }) : null,
+        ++step === 2 ? compactResult({ ...context, model: summaryModel, contextWindowTokens: null, force: true }) : null,
     });
     expect(summaryModel.doStreamCalls).toHaveLength(1);
     expect(model.doStreamCalls).toHaveLength(3);
@@ -933,7 +953,7 @@ describe('full-context LLM compaction', () => {
         },
       ];
       const summaryModel = new MockLanguageModelV3({ doStream: async () => textStream('Checkpoint of the original task.') });
-      const compacted = await compactConversation({
+      const compacted = await compactResult({
         system: 'Original system policy',
         messages,
         model: summaryModel,
@@ -1063,5 +1083,139 @@ describe('full-context LLM compaction', () => {
     expect(onCompactionComplete).toHaveBeenCalledOnce();
     expect(JSON.stringify(onCompactionComplete.mock.calls[0]![1])).toContain('first raw tool result');
     expect(original).toEqual([{ role: 'user', content: 'Original unfinished task' }]);
+  });
+});
+
+describe('budget refusal as data', () => {
+  function modelThatNeverStreams() {
+    return new MockLanguageModelV3({ doStream: async () => stream([]) });
+  }
+
+  // The 2026-11-03 incident: `context: 262144` was written while the same
+  // session already measured 395,741 input tokens, and every message died
+  // before it reached the provider. The refusal is data now, not an error.
+  it('reports exceeds-window instead of throwing when the conversation is larger than the window', async () => {
+    const model = modelThatNeverStreams();
+    const outcome = await compactConversation({
+      system: 'Permanent system',
+      messages: [{ role: 'user', content: 'A long task.' }],
+      model,
+      contextWindowTokens: 262_144,
+      outputLimitTokens: 32_768,
+      previousContextTokens: 395_741,
+      previousContextEstimateTokens: 346_673,
+    });
+    expect(outcome).toMatchObject({ kind: 'impossible', reason: 'exceeds-window', window: 262_144 });
+    if (outcome.kind === 'impossible') expect(outcome.shortfallTokens).toBeGreaterThan(0);
+    expect(model.doStreamCalls).toHaveLength(0);
+  });
+
+  it('applies the same arithmetic under recovery instead of throwing', async () => {
+    const model = modelThatNeverStreams();
+    const outcome = await compactConversation({
+      system: 'Permanent system',
+      messages: [{ role: 'user', content: 'A long task.' }],
+      model,
+      contextWindowTokens: 262_144,
+      previousContextTokens: 395_741,
+      recovery: true,
+      force: true,
+    });
+    expect(outcome).toMatchObject({ kind: 'impossible', reason: 'exceeds-window' });
+    expect(model.doStreamCalls).toHaveLength(0);
+  });
+
+  it('summarizes an oversized conversation slice by slice instead of refusing it', async () => {
+    const messages: ModelMessage[] = [];
+    for (let index = 0; index < 10; index++) messages.push({ role: index % 2 === 0 ? 'user' : 'assistant', content: 'x'.repeat(12_000) });
+    const model = new MockLanguageModelV3({ doStream: async () => textStream('Bounded slice notes with concrete facts.') });
+    const outcome = await compactConversation({
+      system: 'Small system',
+      messages,
+      model,
+      contextWindowTokens: 10_000,
+      previousContextTokens: 30_000,
+    });
+    expect(outcome).toMatchObject({ kind: 'compacted' });
+    if (outcome.kind !== 'compacted') return;
+    // Several bounded slice requests plus the final checkpoint request.
+    expect(model.doStreamCalls.length).toBeGreaterThanOrEqual(3);
+    expect(outcome.result.beforeTokens).toBeGreaterThanOrEqual(30_000);
+    expect(outcome.result.summary).toContain('Bounded slice notes with concrete facts.');
+    // Every request in the chain stays inside the window by construction: the
+    // estimator is what bounded slicing guarantees, so assert on it.
+    for (const call of model.doStreamCalls) {
+      expect(JSON.stringify(call.prompt).length / 4).toBeLessThan(10_000);
+    }
+  });
+
+  it('never splits a tool call from its result across slices', () => {
+    const messages: ModelMessage[] = [{ role: 'user', content: 'Run the inspection.' }];
+    for (let index = 0; index < 4; index++) {
+      messages.push({
+        role: 'assistant',
+        content: [
+          { type: 'text', text: `Doing work ${index}. `.repeat(80) },
+          { type: 'tool-call', toolCallId: `call-${index}`, toolName: 'inspect', input: { index } },
+        ],
+      });
+      messages.push({
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: `call-${index}`,
+            toolName: 'inspect',
+            output: { type: 'text', value: `result ${index} `.repeat(80) },
+          },
+        ],
+      });
+    }
+    // The budget ends exactly after the FIRST assistant message: the naive greedy
+    // cut landed between call-0 and its result, which the SDK rejects with
+    // AI_MissingToolResultsError before the request leaves the machine.
+    const sliceBudget = estimateContextTokens({ system: '', messages: messages.slice(0, 2), tools: {} });
+    const slices = splitIntoSlices(messages, sliceBudget, 1_000_000);
+    expect(slices).not.toBeNull();
+    expect(slices!.length).toBeGreaterThan(1);
+    expect(slices!.flat()).toEqual(messages);
+    for (const slice of slices!) {
+      const calls = new Set(
+        slice.flatMap((message) =>
+          Array.isArray(message.content) ? message.content.flatMap((part) => (part.type === 'tool-call' ? [part.toolCallId] : [])) : [],
+        ),
+      );
+      const results = new Set(
+        slice.flatMap((message) =>
+          message.role === 'tool' && Array.isArray(message.content)
+            ? message.content.flatMap((part) => (part.type === 'tool-result' ? [part.toolCallId] : []))
+            : [],
+        ),
+      );
+      for (const id of calls) expect(results.has(id)).toBe(true);
+    }
+  });
+
+  it('carries the reason a sliced chain stopped into the refusal instead of losing it', async () => {
+    const messages: ModelMessage[] = [];
+    for (let index = 0; index < 10; index++) messages.push({ role: index % 2 === 0 ? 'user' : 'assistant', content: 'x'.repeat(12_000) });
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        throw new Error('gateway exploded');
+      },
+    });
+    const outcome = await compactConversation({
+      system: 'Small system',
+      messages,
+      model,
+      contextWindowTokens: 10_000,
+      previousContextTokens: 30_000,
+    });
+    expect(outcome).toMatchObject({ kind: 'impossible', reason: 'exceeds-window' });
+    if (outcome.kind === 'impossible') {
+      expect(outcome.cause).toBeTruthy();
+    }
+    // Still data, never an exception: the turn would continue with this outcome.
+    expect(model.doStreamCalls.length).toBeGreaterThan(0);
   });
 });
