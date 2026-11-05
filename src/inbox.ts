@@ -1,23 +1,53 @@
-/** Pending unread notifications. Sources retain history and own durable read receipts. */
+import { createHash } from 'node:crypto';
+
+/**
+ * One pending notification. The metadata exists so a reader can choose which
+ * notification to open without opening any: who sent it, from where, and when.
+ * No content ever travels here - that is what `read` is for.
+ */
 export interface InboxItem {
   reference: string;
   receivedAt: string;
   state: 'unread' | 'read';
+  /** Who the notification is from: an agent, a peer, the owner. */
+  from?: string;
+  /** One short line about what it is, never the body. */
+  subject?: string;
 }
 
 export interface InboxSource {
   name: string;
   list: (sessionId: string) => Promise<{ items: InboxItem[]; remaining?: number }>;
+  /** Opens the notification: the content comes back and the item leaves the box. */
   read: (references: readonly string[], sessionId: string) => Promise<Array<{ reference: string; content: unknown }>>;
-  acknowledge: (references: readonly string[], sessionId: string) => Promise<unknown>;
 }
 
 export interface InboxRequest {
-  action: 'list' | 'read' | 'acknowledge';
+  action: 'list' | 'read';
   source?: string;
   ids?: readonly string[];
   limit?: number;
   offset?: number;
+}
+
+/**
+ * A notification id is a short code a model can copy without transcoding a uuid:
+ * six Crockford base32 characters (`A6GX9H`), with I, L, O and U left out because
+ * they are read as 1, 1, 0 and V. The code is derived from the source and the
+ * reference and nothing else, so it needs no table of its own: the pending
+ * notifications are the only durable record, and the box rebuilds its codes from
+ * them on every pass. A code therefore lives exactly as long as the notification.
+ */
+const CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const CODE_LENGTH = 6;
+const MAX_CODE_LENGTH = 12;
+
+/** The short code for one notification key (`source|reference`), derived, never stored. */
+export function inboxCodeFor(key: string, length = CODE_LENGTH): string {
+  const digest = createHash('sha256').update(key, 'utf8').digest();
+  let code = '';
+  for (let index = 0; index < length; index += 1) code += CODE_ALPHABET[digest[index % digest.length]! % CODE_ALPHABET.length];
+  return code;
 }
 
 export function inboxId(source: string, reference: string): string {
@@ -28,6 +58,44 @@ export function inboxNotice(source: string, count: number): string {
   return `You have ${count} ${JSON.stringify(source)} notification${count === 1 ? '' : 's'}. Use inbox to read.`;
 }
 
+interface PendingNotification {
+  source: string;
+  item: InboxItem;
+}
+
+interface CodedNotification extends PendingNotification {
+  id: string;
+}
+
+/** Oldest first, then by source and reference so every pass sees the same order. */
+function byAge(left: PendingNotification, right: PendingNotification): number {
+  return (
+    left.item.receivedAt.localeCompare(right.item.receivedAt) ||
+    left.source.localeCompare(right.source) ||
+    left.item.reference.localeCompare(right.item.reference)
+  );
+}
+
+/**
+ * Codes for one pass over the pending set. Assigning in age order keeps a code
+ * stable for a notification that a reader has already seen: a newer arrival is
+ * assigned last and can only take a code nobody older holds.
+ */
+function assignCodes(entries: readonly PendingNotification[]): CodedNotification[] {
+  const used = new Set<string>();
+  return entries.map((entry) => {
+    const key = inboxId(entry.source, entry.item.reference);
+    let length = CODE_LENGTH;
+    let id = inboxCodeFor(key, length);
+    while (used.has(id) && length < MAX_CODE_LENGTH) {
+      length += 1;
+      id = inboxCodeFor(key, length);
+    }
+    used.add(id);
+    return { ...entry, id };
+  });
+}
+
 export class AgentInbox {
   private readonly sources = new Map<string, InboxSource>();
 
@@ -36,91 +104,100 @@ export class AgentInbox {
     this.sources.set(source.name, source);
   }
 
+  /** Reads what each source currently holds, reporting one failure without losing the rest. */
+  private async collect(
+    sources: readonly InboxSource[],
+    sessionId: string,
+  ): Promise<{
+    pages: Array<{ source: string; items: InboxItem[]; remaining: number }>;
+    entries: CodedNotification[];
+    errors: Array<{ source: string; error: string }>;
+  }> {
+    const errors: Array<{ source: string; error: string }> = [];
+    const pages = await Promise.all(
+      sources.map(async (source) => {
+        try {
+          const page = await source.list(sessionId);
+          return { source: source.name, items: page.items.filter((item) => item.state === 'unread'), remaining: page.remaining ?? 0 };
+        } catch (error) {
+          errors.push({ source: source.name, error: error instanceof Error ? error.message : String(error) });
+          return { source: source.name, items: [] as InboxItem[], remaining: 0 };
+        }
+      }),
+    );
+    const entries = assignCodes(pages.flatMap((page) => page.items.map((item) => ({ source: page.source, item }))).sort(byAge));
+    return { pages, entries, errors };
+  }
+
+  private select(request: InboxRequest): InboxSource[] {
+    return [...this.sources.values()].filter((source) => !request.source || source.name === request.source);
+  }
+
   async execute(request: InboxRequest, sessionId: string | undefined): Promise<unknown> {
     if (!sessionId) return { status: 'denied', error: 'The reading session could not be identified.' };
-    if (request.action === 'acknowledge' && !request.ids?.length)
-      return { status: 'invalid', error: 'acknowledge requires notification ids.' };
     if (request.source && !this.sources.has(request.source)) return { status: 'invalid', error: 'Unknown inbox source.' };
-    const sources = [...this.sources.values()].filter((source) => !request.source || source.name === request.source);
-    const errors: Array<{ source: string; error: string }> = [];
     const limit = request.limit ?? 20;
     const offset = request.offset ?? 0;
-    if (request.action === 'list' || !request.ids?.length) {
-      const pages = await Promise.all(
-        sources.map(async (source) => {
-          try {
-            const page = await source.list(sessionId);
-            return { source: source.name, ...page, items: page.items.filter((item) => item.state === 'unread') };
-          } catch (error) {
-            errors.push({ source: source.name, error: error instanceof Error ? error.message : String(error) });
-            return { source: source.name, items: [], remaining: 0 };
-          }
-        }),
-      );
-      const items = pages
-        .flatMap((page) => page.items.map((item) => ({ ...item, source: page.source, id: inboxId(page.source, item.reference) })))
-        .sort((left, right) => left.receivedAt.localeCompare(right.receivedAt) || left.id.localeCompare(right.id));
-      const total = items.length + pages.reduce((sum, page) => sum + (page.remaining ?? 0), 0);
-      if (request.action === 'list') {
-        const page = items.slice(offset, offset + limit);
-        return {
-          type: 'inbox',
-          status: errors.length ? 'partial' : 'ok',
-          sources: pages.map((page) => ({
-            source: page.source,
-            count: page.items.length + (page.remaining ?? 0),
-            unread: page.items.filter((item) => item.state === 'unread').length,
-          })),
-          items: page.map(({ reference: _reference, ...item }) => item),
-          remaining: Math.max(0, total - offset - page.length),
-          errors,
-        };
-      }
-      request = {
-        ...request,
-        ids: items
-          .filter((item) => item.state === 'unread')
-          .slice(0, limit)
-          .map((item) => item.id),
+    if (request.action === 'read' && !request.ids?.length)
+      return { status: 'invalid', error: 'read requires notification ids; call inbox with action list first.' };
+    const { pages, entries, errors } = await this.collect(this.select(request), sessionId);
+    if (request.action === 'list') {
+      const page = entries.slice(offset, offset + limit);
+      const total = entries.length + pages.reduce((sum, page) => sum + page.remaining, 0);
+      return {
+        type: 'inbox',
+        status: errors.length ? 'partial' : 'ok',
+        sources: pages.map((page) => ({
+          source: page.source,
+          count: page.items.length + page.remaining,
+          unread: page.items.length,
+        })),
+        items: page.map(({ item, source, id }) => ({
+          id,
+          source,
+          receivedAt: item.receivedAt,
+          state: item.state,
+          from: item.from,
+          subject: item.subject,
+        })),
+        remaining: Math.max(0, total - offset - page.length),
+        errors,
       };
     }
+    // A code names a pending notification, so opening is resolved against the box
+    // itself: an unknown code is reported as such and never guessed at.
+    const byCode = new Map(entries.map((entry) => [entry.id, entry]));
     const grouped = new Map<InboxSource, string[]>();
+    const unresolved: string[] = [];
     for (const id of request.ids ?? []) {
-      const separator = id.indexOf(':');
-      if (separator < 1) return { status: 'invalid', error: 'Use a notification id returned by inbox.' };
-      let name: string;
-      let reference: string;
-      try {
-        name = decodeURIComponent(id.slice(0, separator));
-        reference = decodeURIComponent(id.slice(separator + 1));
-      } catch {
-        return { status: 'invalid', error: 'Invalid notification id.' };
+      const entry = byCode.get(id.trim().toUpperCase());
+      if (!entry) {
+        unresolved.push(id);
+        continue;
       }
-      const source = this.sources.get(name);
-      if (!source || !reference || (request.source && request.source !== name))
-        return { status: 'invalid', error: 'The notification does not belong to the selected inbox source.' };
-      grouped.set(source, [...new Set([...(grouped.get(source) ?? []), reference])]);
+      const source = this.sources.get(entry.source);
+      if (!source) continue;
+      grouped.set(source, [...new Set([...(grouped.get(source) ?? []), entry.item.reference])]);
     }
-    const items: Array<{ id: string; source: string; content: unknown }> = [];
-    const acknowledgements: Array<{ source: string; ids: string[]; result: unknown }> = [];
+    const opened: Array<{ id: string; source: string; content: unknown }> = [];
     // Grouped reads keep each source's attachment and transaction limits intact.
     for (const [source, references] of grouped) {
       try {
-        if (request.action === 'acknowledge') {
-          acknowledgements.push({
-            source: source.name,
-            ids: references.map((reference) => inboxId(source.name, reference)),
-            result: await source.acknowledge(references, sessionId),
-          });
-        } else {
-          const results = await source.read(references, sessionId);
-          for (const result of results)
-            items.push({ id: inboxId(source.name, result.reference), source: source.name, content: result.content });
-        }
+        const results = await source.read(references, sessionId);
+        for (const result of results)
+          opened.push({ id: inboxCodeFor(inboxId(source.name, result.reference)), source: source.name, content: result.content });
       } catch (error) {
         errors.push({ source: source.name, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    return { type: 'inbox', status: errors.length ? 'partial' : 'ok', action: request.action, items, acknowledgements, errors };
+    if (!opened.length && !errors.length) return { status: 'invalid', error: 'Use a notification id returned by inbox.', unresolved };
+    return {
+      type: 'inbox',
+      status: errors.length || unresolved.length ? 'partial' : 'ok',
+      action: request.action,
+      items: opened,
+      ...(unresolved.length ? { unresolved } : {}),
+      errors,
+    };
   }
 }
