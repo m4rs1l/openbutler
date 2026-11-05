@@ -13,6 +13,7 @@ import { mergeMarkdownTokenSegments } from './markdown-merge.js';
 import { displayFilePath, parseHref } from '../web/link-protocol.js';
 import type { ApprovalDecision } from '../agent-session.js';
 import type { AgentSessionClient } from '../agent-session.js';
+import { commandMenu } from '../commands/registry.js';
 import { getCatalogIndex, getProvider, listProviderSummaries } from '../provider/catalog.js';
 import { resolveModelName } from '../provider/model-presentation.js';
 import { listSupportedPackages, listCatalogModels, providerIsConfigured, resolveReasoningVariant } from '../provider/registry.js';
@@ -39,21 +40,9 @@ const approvalActions: Array<{ label: string; decision: ApprovalDecision }> = [
   { label: 'Always allow', decision: 'always' },
 ];
 
-const slashCommands = [
-  { command: '/help', description: 'Show available commands' },
-  { command: '/clear', description: 'Clear this session' },
-  { command: '/settings', description: 'Open settings' },
-  { command: '/permissions', description: 'Choose workspace, auto-review, or full-access mode' },
-  { command: '/reasoning', description: 'Choose model reasoning' },
-  { command: '/thinking', description: 'Show or hide reasoning text' },
-  { command: '/compact', description: 'Summarize the complete model context' },
-  { command: '/stop', description: 'Stop the current run and keep queued messages' },
-  { command: '/models', description: 'Choose a model from configured providers' },
-  { command: '/provider', description: 'Add a provider, API key, and model' },
-  { command: '/session', description: 'Search and open a saved session' },
-  { command: '/skills', description: 'List available global and workspace skills' },
-  { command: '/exit', description: 'Close this terminal UI; the background host keeps running' },
-];
+// The CLI menu is the registry's own list for this surface, so the names,
+// order and wording stay identical everywhere the commands are offered.
+const slashCommands = commandMenu('cli');
 
 const themeOptions = ['Dark', 'Light', 'System'];
 const markdownParser = new Marked({ gfm: true, breaks: true });
@@ -684,6 +673,21 @@ export function SessionScreen({
     [reasoningVariantId],
   );
 
+  // The registry names the command and the transport carries it out. Both
+  // clients behind this screen implement `command`; one that does not is a
+  // version mismatch, which the owner has to see rather than a typed command
+  // that quietly does nothing.
+  const runCommand = useCallback(
+    (name: string, payload?: Record<string, unknown>) => {
+      if (!controller.command) {
+        addEntry({ kind: 'notice', text: 'Commands require an updated host.', tone: 'warn' });
+        return Promise.resolve();
+      }
+      return controller.command(name, payload);
+    },
+    [addEntry, controller],
+  );
+
   const send = useCallback(
     async (raw: string, attachedImages: ClipboardImage[] = []) => {
       const typedText = raw.trim();
@@ -720,11 +724,11 @@ export function SessionScreen({
         return;
       }
       if (commandOnly && text === '/compact') {
-        void controller.compact(turnPreferences());
+        void runCommand('/compact', { preferences: turnPreferences() });
         return;
       }
       if (commandOnly && text === '/stop') {
-        controller.stop({ keepQueue: true });
+        void runCommand('/stop', { keepQueue: true });
         addEntry({ kind: 'notice', text: 'Stopping the current run; queued messages are kept.' });
         return;
       }
@@ -761,13 +765,13 @@ export function SessionScreen({
         else exit();
         return;
       }
-      if (commandOnly && text === '/clear') {
+      if (commandOnly && text === '/new') {
         if (controller.isBusy) {
-          addEntry({ kind: 'notice', text: 'Wait for the current run to finish before clearing the session.', tone: 'warn' });
+          addEntry({ kind: 'notice', text: 'Wait for the current run to finish before starting a new chat.', tone: 'warn' });
           return;
         }
         await flushSessionSave();
-        await controller.createNewSession();
+        await runCommand('/new');
         entryRefs.current.clear();
         entryRefCallbacks.current.clear();
         entryHeightCache.current = new WeakMap();
@@ -804,6 +808,7 @@ export function SessionScreen({
       openProviderPicker,
       openSessionPicker,
       reasoningVariantId,
+      runCommand,
       runtime,
       selectedTheme,
       turnPreferences,

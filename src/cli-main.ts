@@ -23,7 +23,6 @@ import {
   stopDaemon,
   stopWebProcess,
   webProcessStatus,
-  type WebStartOptions,
 } from './daemon.js';
 import {
   autostartDescription,
@@ -32,9 +31,11 @@ import {
   readAutostartWeb,
   refreshAutostartEnv,
   uninstallAutostart,
+  type AutostartWeb,
 } from './daemon-autostart.js';
-import { connectDaemonSession } from './daemon-client.js';
+import { connectDaemonSession, resumeChatAttach } from './daemon-client.js';
 import { parseRetentionDuration, selectFilesToPrune } from './retention.js';
+import { resolveShell } from './tools/shell.js';
 import { getOpenButlerVersion } from './version.js';
 import { getCatalogIndex } from './provider/catalog.js';
 import { resolveModelName } from './provider/model-presentation.js';
@@ -50,6 +51,7 @@ import {
 } from './provider/registry.js';
 import { getConfigPath, getSettingsPath, loadSettings, parseTelegramSettings, saveSettings } from './settings.js';
 import { getDataPath } from './paths.js';
+import { CUSTODIAN_SESSION_ID } from './session-paths.js';
 import { canonicalScopeRoot, resolveInteractiveScope, resolveServerScope } from './workspace-origin.js';
 import type { TelegramStatus } from './telegram.js';
 import {
@@ -94,7 +96,7 @@ function usage(): void {
     ],
     [
       'openbutler daemon',
-      'Start, inspect, stop, or toggle automatic startup of the background host; install --web also starts the browser client at login.',
+      'Start, inspect, stop, or toggle automatic startup of the background host; install --web also registers the separate browser client at login.',
     ],
     ['openbutler usage', 'Show recorded token use and cost: --days, --session, --model, --json.'],
     ['openbutler logs', 'Read the machine log: --lines, --level, --event, --json.'],
@@ -118,7 +120,7 @@ function usage(): void {
   ui.line();
   ui.line('Options:');
   printHelpRows([
-    ['--workspace <path>', 'Select this client’s workspace scope for the shared custodian.', '[string]'],
+    ['--workspace <path>', 'Set the workspace scope this client works in.', '[string]'],
     ['--c "<request>"', 'Ask the agent; it can select available tools.', '[string]'],
     ['--list-models', 'List models that can call tools. --filter, --limit, --provider.', '[boolean]'],
     ['--version', 'Print the installed version.', '[boolean]'],
@@ -275,7 +277,7 @@ async function runPermissions(parsed: Parsed): Promise<void> {
   );
   ui.kv(
     'Approval timeout',
-    settings.approvalTimeoutSeconds === undefined ? '60 seconds (default)' : `${settings.approvalTimeoutSeconds} seconds`,
+    settings.approvalTimeoutSeconds === undefined ? '120 seconds (default)' : `${settings.approvalTimeoutSeconds} seconds`,
   );
   ui.kv(
     'Auto-review model',
@@ -806,7 +808,10 @@ async function runSession(workspaceRoot: string): Promise<void> {
   let controller;
   const connecting = ui.spinner({ text: 'Connecting to host…', discardStdin: false }).start();
   try {
-    controller = await connectDaemonSession(workspaceRoot, { custodian: true });
+    // The terminal is a client of the chat layer. The custodian is the host's own
+    // conversation and no client attaches to it: this surface opens the chat the
+    // user left off in, and a new one only when there is nothing to resume.
+    controller = await connectDaemonSession(workspaceRoot, resumeChatAttach('terminal'));
     connecting.succeed('Connected to host.');
   } catch (error) {
     connecting.fail('Could not connect to host.');
@@ -937,9 +942,19 @@ async function answerQuestionPrompt(question: { id: string; question: string; op
   return trimmed ? trimmed : null;
 }
 
+/** The configured shell as it resolves right now; a bad value must not fail `about`. */
+function configuredShellLabel(): string {
+  try {
+    return resolveShell(loadSettings().commandShell).label;
+  } catch (error) {
+    return `unavailable (${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
 function runAbout(): void {
   ui.section('OpenButler');
   ui.kv('Version', getOpenButlerVersion());
+  ui.kv('Shell', configuredShellLabel());
   ui.kv('Runtime', `${process.version} (${process.platform}/${process.arch})`);
   ui.kv('Settings', getSettingsPath());
   ui.kv('Secrets', getConfigPath());
@@ -1281,7 +1296,7 @@ async function runTelegramSetup(parsed: Parsed): Promise<void> {
   }
   ui.info('Done. Message the bot any time; it shares one thread with this terminal.');
   ui.info(
-    'In the chat: /approvals re-sends pending approvals, /stop stops the current run, /clear starts a new chat, /sessions lists the last 10 chats, /provider adds or checks a provider.',
+    'In the chat: /approvals re-sends pending approvals, /stop stops the current run, /new starts a new chat, /sessions lists the last 10 chats, /provider adds or checks a provider.',
   );
 }
 
@@ -1415,7 +1430,12 @@ async function runSessionsCommand(parsed: Parsed): Promise<void> {
   if (!olderThan) throw new Error('Usage: openbutler sessions prune --older-than <duration> [--yes]');
   const cutoff = Date.now() - parseRetentionDuration(olderThan);
   const { listSessionFiles, removeSavedSession } = await import('./session-store.js');
-  const files = selectFilesToPrune(listSessionFiles(), cutoff);
+  // Retention never deletes the machine's own session: it is not a chat, and nothing
+  // recreates it except the host starting again with an empty record.
+  const files = selectFilesToPrune(
+    listSessionFiles().filter((file) => file.id !== CUSTODIAN_SESSION_ID),
+    cutoff,
+  );
   if (files.length === 0) {
     ui.info(`No session files are older than ${olderThan}; nothing to prune.`);
     return;
@@ -1540,10 +1560,10 @@ async function runActivityLedger(parsed: Parsed, kind: 'events' | 'actions'): Pr
 function reportAutostartWeb(): void {
   const web = readAutostartWeb();
   if (web) {
-    ui.kv('Web at login', `http://${web.host}:${web.port}`);
+    ui.kv('Web client at login', `http://${web.host}:${web.port} (separate process)`);
     ui.kv('Web workspace', web.dir);
   } else {
-    ui.info('Web server is not part of login startup. Add `--web --hostname <address>` to include it.');
+    ui.info('The browser client is not part of login startup. Add `--web --hostname <address>` to include it.');
   }
 }
 
@@ -1559,7 +1579,7 @@ function webFlag(parsed: Parsed | undefined): 'on' | 'off' | 'unset' {
  * The binding to start. Explicit flags win; otherwise the running server (for
  * an install) or the documented defaults describe what should come back.
  */
-async function readWebOptions(parsed: Parsed, fallback: { host: string; port: number; dir?: string } | null): Promise<WebStartOptions> {
+async function readWebOptions(parsed: Parsed, fallback: { host: string; port: number; dir?: string } | null): Promise<AutostartWeb> {
   const { DEFAULT_WEB_HOST } = await import('./web/server.js');
   const { readPort } = await import('./cli/web.js');
   const port = parsed.flags.has('port') ? readPort(parsed) : (fallback?.port ?? readPort(parsed));
@@ -1574,22 +1594,21 @@ async function readWebOptions(parsed: Parsed, fallback: { host: string; port: nu
 
 async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): Promise<void> {
   if (action === 'run') {
-    let web: WebStartOptions | undefined;
-    if (webFlag(parsed) === 'on' && parsed) {
-      try {
-        web = await readWebOptions(parsed, null);
-      } catch (error) {
-        // A broken web configuration must not keep the terminal and Telegram
-        // host from starting; the failure is recorded in daemon.log.
-        console.error(`OpenButler web startup is misconfigured: ${error instanceof Error ? error.message : String(error)}`);
-      }
+    // The host entry is a backend-only process. Web is an independent client
+    // and is composed by the CLI (`daemon start --web`) or by its own login
+    // entry; accepting `--web` here would turn the host into its supervisor.
+    if (webFlag(parsed) !== 'unset') {
+      throw new Error(
+        '`openbutler daemon run` starts the host only. Start the browser client separately with `openbutler web`, or use `openbutler daemon start --web` to start both processes.',
+      );
     }
-    await runDaemonProcess(web);
+    await runDaemonProcess();
     return;
   }
   if (action === 'install') {
     const mode = webFlag(parsed);
-    const web = mode === 'on' && parsed ? await readWebOptions(parsed, webProcessStatus()) : mode === 'off' ? null : undefined;
+    const web =
+      mode === 'on' && parsed ? await readWebOptions(parsed, readAutostartWeb() ?? webProcessStatus()) : mode === 'off' ? null : undefined;
     ui.success(installAutostart({ web }));
     reportAutostartWeb();
     ui.info('OpenButler will start at your next user login. Remove it with `openbutler daemon autostart off`.');
@@ -1610,7 +1629,12 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     }
     if (mode === 'on') {
       const flag = webFlag(parsed);
-      const web = flag === 'on' && parsed ? await readWebOptions(parsed, webProcessStatus()) : flag === 'off' ? null : undefined;
+      const web =
+        flag === 'on' && parsed
+          ? await readWebOptions(parsed, readAutostartWeb() ?? webProcessStatus())
+          : flag === 'off'
+            ? null
+            : undefined;
       ui.success(installAutostart({ web }));
       reportAutostartWeb();
       ui.info('OpenButler will start at your next user login. Remove it with `openbutler daemon autostart off`.');
@@ -1669,7 +1693,7 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     ui.kv('Automatic startup', isAutostartInstalled() ? 'installed' : 'not installed');
     if (isAutostartInstalled()) {
       const loginWeb = readAutostartWeb();
-      if (loginWeb) ui.kv('Web at login', `http://${loginWeb.host}:${loginWeb.port}`);
+      if (loginWeb) ui.kv('Web client at login', `http://${loginWeb.host}:${loginWeb.port} (separate process)`);
     }
     return;
   }
