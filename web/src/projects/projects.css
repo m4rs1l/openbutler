@@ -264,30 +264,130 @@
 .create-project__submit:disabled {
   opacity: 0.4;
 }
-.sidebar-projects-heading {
+/* A project row carries its own detail card, revealed on hover/focus. The wrap
+   owns the pill: one background holds the project and its actions, the way a
+   chat row carries its own controls inside it. */
+.project-row-wrap {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding-right: 8px;
+  gap: var(--ui-space-1);
+  width: calc(100% - 4px);
+  min-height: var(--ui-control-height);
+  margin-inline: 2px;
+  padding: var(--ui-space-1) var(--ui-space-2);
+  border-radius: var(--ui-control-radius);
+  background: transparent;
+  cursor: default;
+  transition: background-color 60ms ease;
 }
-.sidebar-projects-heading .section-label {
-  margin-bottom: 7px;
+.project-row-wrap:hover {
+  background: #ececec;
 }
-.sidebar-projects-heading .icon-button {
+.project-row-wrap .project-row {
+  flex: 1;
+  min-width: 0;
+}
+.project-card-pop {
+  flex: none;
+}
+/* The shared IconButton, but wearing its sidebar form: a bare glyph that only
+   exists while the row is hovered, with no box, border or padding of its own. */
+.project-card-pop .project-card-trigger {
   width: 24px;
   height: 24px;
   min-height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0;
+  color: #8b8f97;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease;
 }
-.sidebar-projects-heading .icon {
-  width: 14px;
-  height: 14px;
+.project-card-pop .project-card-trigger .icon {
+  width: 16px;
+  height: 16px;
 }
-.project-row.is-selected {
-  background: #ecefeb;
+/* Specificity has to beat `.button:hover:not(:disabled)` in the global sheet,
+   or the hover box the owner rejected comes back. */
+.project-row-wrap .project-card-pop .project-card-trigger:hover:not(:disabled),
+.project-row-wrap .project-card-pop .project-card-trigger:focus-visible:not(:disabled),
+.project-row-wrap .project-card-pop .project-card-trigger[aria-expanded='true'] {
+  background: transparent;
+  color: #4a4f57;
+}
+.project-row-wrap:hover .project-card-pop .project-card-trigger,
+.project-card-pop:focus-within .project-card-trigger,
+.project-card-pop .project-card-trigger[aria-expanded='true'] {
+  opacity: 1;
+}
+@media (hover: none) {
+  .project-card-pop .project-card-trigger {
+    opacity: 1;
+  }
+}
+.project-card-pop .popover-panel {
+  top: -4px;
+  right: auto;
+  bottom: auto;
+  left: calc(100% + 6px);
+  width: 252px;
+  padding: 10px 11px;
+  border-radius: 12px;
+}
+.project-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
   color: #303640;
 }
+.project-card__meta {
+  margin: 7px 0 0;
+  font-size: 12px;
+  color: #8b9099;
+}
+.project-card__path {
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: #7b8290;
+  overflow-wrap: anywhere;
+}
+.project-card__action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 8px 4px;
+  border: 0;
+  border-top: 1px solid #eef0f3;
+  background: transparent;
+  color: #555b65;
+  font-size: 12px;
+  text-align: left;
+}
+.project-card__action:hover {
+  background: #f2f4f7;
+  border-radius: 8px;
+}
+.project-empty {
+  margin: 0;
+  padding: 2px var(--ui-space-2) 4px 24px;
+  font-size: var(--ui-small-size);
+  color: #a3a3a3;
+}
+/* The selected project looks identical to every other row; the open chat
+   inside it already carries the highlight. */
+.project-row-wrap.is-selected {
+  background: transparent;
+}
 .project-row:disabled {
-  color: #a7a9ad;
+  color: #8f8f8f;
 }
 @media (max-width: 480px) {
   .project-context {

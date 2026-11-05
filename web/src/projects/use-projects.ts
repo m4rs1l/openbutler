@@ -1,13 +1,9 @@
 import { useEffect, useState } from 'react';
-import { createProject, fetchProjects } from '../api.js';
+import { createProject, fetchProjects, updateProject } from '../api.js';
 import type { Project, SessionPayload } from '../types.js';
 
 /** Domain state is a server projection. Only request/error presentation lives here. */
-export function useProjects(
-  session: SessionPayload['session'] | undefined,
-  requestSelection: (id: string | null) => Promise<void>,
-  canStartChat: boolean,
-) {
+export function useProjects(session: SessionPayload['session'] | undefined, requestSelection: (id: string | null) => Promise<void>) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [selecting, setSelecting] = useState(false);
@@ -51,8 +47,15 @@ export function useProjects(
   const create = async (name: string, folders: string[]) => {
     const project = await createProject(name, folders);
     setProjects((previous) => (previous.some((item) => item.id === project.id) ? previous : [...previous, project]));
-    if ((!session?.projectLocked || canStartChat) && !(await select(project.id)))
-      throw new Error('The project was created, but the chat could not be selected. Open a new chat in it from the sidebar.');
+    // A created project opens: the host decides whether that means this chat or
+    // a new chat in the project, and its refusal lands in selectionError where
+    // the sidebar shows it - never a project that is created and then invisible.
+    await select(project.id);
+    return project;
+  };
+  const update = async (id: string, name: string, folders: string[]) => {
+    const project = await updateProject(id, name, folders);
+    setProjects((previous) => previous.map((item) => (item.id === project.id ? project : item)));
     return project;
   };
   const selectedProject = session?.project?.id ? projects.find((item) => item.id === session.project?.id) : undefined;
@@ -62,7 +65,9 @@ export function useProjects(
     selected: session?.project?.id
       ? {
           ...session.project,
-          name: session.project.name ?? selectedProject?.name ?? null,
+          // The catalog is the authority for the name; the session keeps its own
+          // binding snapshot only as a fallback for a project no longer listed.
+          name: selectedProject?.name ?? session.project.name ?? null,
           folders: session.project.folders.length ? session.project.folders : (selectedProject?.folders ?? []),
         }
       : null,
@@ -74,6 +79,7 @@ export function useProjects(
     supportsSelection,
     select,
     create,
+    update,
     refresh: () => setReload((value) => value + 1),
   };
 }

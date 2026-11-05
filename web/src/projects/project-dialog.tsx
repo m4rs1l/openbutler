@@ -6,11 +6,18 @@ import { IconButton } from '../components/ui.js';
 import { Feedback } from '../components/feedback.js';
 import { Dropdown } from '../components/selection/dropdown.js';
 import type { ProjectController } from './use-projects.js';
+import type { Project } from '../types.js';
 import './projects.css';
 
-export function CreateProjectDialog({ controller, onClose }: { controller: ProjectController; onClose: () => void }) {
-  const [name, setName] = useState('');
-  const [folders, setFolders] = useState<string[]>([]);
+/**
+ * One dialog for both project mutations. The name field starts from the
+ * catalog's name - never from a folder - so creating and editing read the same
+ * way and the stored name always traces back to something the owner typed.
+ */
+export function ProjectDialog({ controller, project, onClose }: { controller: ProjectController; project?: Project; onClose: () => void }) {
+  const editing = project !== undefined;
+  const [name, setName] = useState(project?.name ?? '');
+  const [folders, setFolders] = useState<string[]>(project?.folders ?? []);
   const [manual, setManual] = useState(false);
   const [path, setPath] = useState('');
   const [pending, setPending] = useState(false);
@@ -38,8 +45,9 @@ export function CreateProjectDialog({ controller, onClose }: { controller: Proje
   const close = () => {
     if (!pending && !picking) onClose();
   };
+  const title = editing ? 'Edit project' : 'Create project';
   return (
-    <Dialog label="Create project" onClose={close} className="create-project">
+    <Dialog label={title} onClose={close} className="create-project">
       <form
         onSubmit={async (event) => {
           event.preventDefault();
@@ -47,7 +55,8 @@ export function CreateProjectDialog({ controller, onClose }: { controller: Proje
           setPending(true);
           setError(null);
           try {
-            await controller.create(name, folders);
+            if (project) await controller.update(project.id, name.trim(), folders);
+            else await controller.create(name, folders);
             onClose();
           } catch (problem) {
             setError(problem instanceof Error ? problem.message : String(problem));
@@ -57,7 +66,7 @@ export function CreateProjectDialog({ controller, onClose }: { controller: Proje
         }}
       >
         <header className="create-project__header">
-          <h1>Create project</h1>
+          <h1>{title}</h1>
           <IconButton icon="x" label="Close" onClick={close} disabled={pending || picking} />
         </header>
         <label className="create-project__name">
@@ -164,7 +173,7 @@ export function CreateProjectDialog({ controller, onClose }: { controller: Proje
             Cancel
           </button>
           <button type="submit" className="create-project__submit" disabled={!name.trim() || !folders.length || pending || picking}>
-            {pending ? 'Creating…' : 'Create project'}
+            {pending ? (editing ? 'Saving…' : 'Creating…') : editing ? 'Save changes' : 'Create project'}
           </button>
         </footer>
       </form>
