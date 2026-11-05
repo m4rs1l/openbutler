@@ -16,25 +16,34 @@
 }
 
 .overflow-marquee[data-overflowing='true'] {
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - var(--mb-overlay-text-fade-edge, 0.75rem)), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - var(--mb-overlay-text-fade-edge, 0.75rem)), transparent 100%);
+}
+
+.overflow-marquee[data-overflowing='true']:is(:hover, :focus-within, :active),
+.dropdown__item:is(:hover, :focus-visible) .overflow-marquee[data-overflowing='true'],
+.select-field__trigger:is(:hover, :focus-visible) .overflow-marquee[data-overflowing='true'],
+.session-item:is(:hover, :focus-visible) .overflow-marquee[data-overflowing='true'],
+.project-row-wrap:is(:hover, :focus-within) .overflow-marquee[data-overflowing='true'] {
   -webkit-mask-image: linear-gradient(
     to right,
     transparent 0,
-    #000 var(--mb-overlay-text-fade-edge),
-    #000 calc(100% - var(--mb-overlay-text-fade-edge)),
+    #000 var(--mb-overlay-text-fade-edge, 0.75rem),
+    #000 calc(100% - var(--mb-overlay-text-fade-edge, 0.75rem)),
     transparent 100%
   );
   mask-image: linear-gradient(
     to right,
     transparent 0,
-    #000 var(--mb-overlay-text-fade-edge),
-    #000 calc(100% - var(--mb-overlay-text-fade-edge)),
+    #000 var(--mb-overlay-text-fade-edge, 0.75rem),
+    #000 calc(100% - var(--mb-overlay-text-fade-edge, 0.75rem)),
     transparent 100%
   );
 }
 
 .overflow-marquee[data-overflowing='true'][data-animate-on-interaction='true']:is(:hover, :focus-within, :active) .overflow-marquee__track,
 .overflow-marquee[data-overflowing='true'][data-active='true'] .overflow-marquee__track {
-  animation: overflow-marquee-scroll var(--mb-overlay-marquee-duration) ease-in-out infinite;
+  animation: overflow-marquee-scroll var(--mb-overlay-marquee-duration, 8s) ease-in-out infinite;
 }
 
 .dropdown__item:is(:hover, :focus-visible)
@@ -42,8 +51,14 @@
   .overflow-marquee__track,
 .select-field__trigger:is(:hover, :focus-visible)
   .overflow-marquee[data-overflowing='true'][data-animate-on-interaction='true']
+  .overflow-marquee__track,
+.session-item:is(:hover, :focus-visible)
+  .overflow-marquee[data-overflowing='true'][data-animate-on-interaction='true']
+  .overflow-marquee__track,
+.project-row-wrap:is(:hover, :focus-within)
+  .overflow-marquee[data-overflowing='true'][data-animate-on-interaction='true']
   .overflow-marquee__track {
-  animation: overflow-marquee-scroll var(--mb-overlay-marquee-duration) ease-in-out infinite;
+  animation: overflow-marquee-scroll var(--mb-overlay-marquee-duration, 8s) ease-in-out infinite;
 }
 
 @keyframes overflow-marquee-scroll {

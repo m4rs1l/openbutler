@@ -18,17 +18,17 @@ describe('right panel resizing', () => {
 
 describe('sidebar resizing', () => {
   it('grows with a rightward drag and shrinks with a leftward one', () => {
-    expect(resolveSidebarResize(252, 100, 1200)).toBe(352);
-    expect(resolveSidebarResize(252, -52, 1200)).toBe(200);
+    expect(resolveSidebarResize(252, 100, 1200)).toEqual({ size: 352, snap: false });
+    expect(resolveSidebarResize(252, -52, 1200)).toEqual({ size: 200, snap: false });
   });
-  it('stops at the floor instead of following the pointer further', () => {
-    expect(resolveSidebarResize(252, -100, 1200)).toBe(180);
-    expect(resolveSidebarResize(180, -40, 1200)).toBe(180);
+  it('snaps closed when dragged past the close threshold', () => {
+    expect(resolveSidebarResize(252, -200, 1200)).toEqual({ size: 0, snap: true });
+    expect(resolveSidebarResize(180, -100, 1200)).toEqual({ size: 0, snap: true });
   });
   it('caps at the viewport-aware maximum, not just the fixed ceiling', () => {
-    expect(resolveSidebarResize(400, 500, 420)).toBe(420);
-    expect(resolveSidebarResize(400, 500, 2000)).toBe(560);
+    expect(resolveSidebarResize(400, 500, 420)).toEqual({ size: 420, snap: false });
+    expect(resolveSidebarResize(400, 500, 2000)).toEqual({ size: 560, snap: false });
     // A viewport that leaves less than the minimum still allows dragging to it.
-    expect(resolveSidebarResize(180, 500, 100)).toBe(180);
+    expect(resolveSidebarResize(180, 500, 100)).toEqual({ size: 180, snap: false });
   });
 });

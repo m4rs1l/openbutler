@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, useEffect, useLayoutEffect, type CSSProperties, type ReactNode } from 'react';
 import { ApplicationPanel, panelTransitionMs } from './application-panel.js';
+import { EdgeResizer } from './edge-resizer.js';
 import { PANEL_DEFAULT_WIDTH, PANEL_MIN_WIDTH, resolvePanelResize } from '../panel-resize.js';
 import { useEdgeResize } from '../edge-resize.js';
 import { subscribeFileLink } from '../file-links.js';
@@ -202,24 +203,16 @@ export function WorkspacePanels({
       <div ref={main} className="workspace-main" inert={expanded && selectedSurface !== 'chat'}>
         {children({ panelOpen: visibleWidth > 0, togglePanel })}
       </div>
-      <div
-        role="separator"
-        tabIndex={0}
+      <EdgeResizer
+        edge={edge}
         hidden={visibleWidth === 0}
         className="panel-resizer panel-resizer-right"
-        aria-label="Resize right panel"
-        aria-orientation="vertical"
-        aria-controls="workspace-panel-right"
-        aria-valuemin={0}
-        aria-valuemax={Math.round(maximum)}
-        aria-valuenow={Math.round(visibleWidth)}
-        aria-valuetext={`${Math.round(visibleWidth)} pixels`}
+        label="Resize right panel"
+        controls="workspace-panel-right"
+        min={0}
+        max={maximum}
+        value={visibleWidth}
         title="Drag to resize or close right panel"
-        onPointerDown={edge.start}
-        onPointerMove={edge.move}
-        onPointerUp={edge.finish}
-        onPointerCancel={edge.finish}
-        onLostPointerCapture={edge.finish}
         onKeyDown={(event) => {
           if (!['ArrowLeft', 'ArrowRight', 'Home', 'End', 'Enter', ' '].includes(event.key)) return;
           event.preventDefault();
@@ -228,7 +221,7 @@ export function WorkspacePanels({
         }}
       >
         <span />
-      </div>
+      </EdgeResizer>
       <ApplicationPanel
         open={visibleWidth > 0}
         sessionId={sessionId}
