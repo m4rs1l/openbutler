@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Feedback } from './feedback.js';
 import { Icon } from './icon.js';
 import type { ModelSelectionView } from '../model-selection.js';
@@ -24,6 +24,8 @@ interface Props extends ComposerModelSelectorControl {
   onOpenChange: (open: boolean) => void;
   resetKey: unknown;
   notice?: string | null;
+  /** Which page to land on when a slash command opens the picker. */
+  requestedPage?: 'reasoning' | 'models' | null;
 }
 
 export function ModelSelector({
@@ -35,6 +37,7 @@ export function ModelSelector({
   open,
   onOpenChange,
   resetKey,
+  requestedPage,
   onSelectModel,
   onSelectReasoning,
   onRetry,
@@ -44,6 +47,13 @@ export function ModelSelector({
   const [page, setPage] = useState<'reasoning' | 'models'>('reasoning');
   const [previewLabel, setPreviewLabel] = useState<string | null>(null);
   const navigationSession = useRef(0);
+  // A slash command sets `requestedPage` and opens the picker in the same turn,
+  // so the open handler below still reads the previous render's prop and lands
+  // on the default page. The requested page is applied here instead, after the
+  // prop has arrived; a picker opened from the trigger carries no request.
+  useEffect(() => {
+    if (open && requestedPage) setPage(requestedPage);
+  }, [open, requestedPage]);
   const items: DropdownItem[] = (projection?.models ?? []).map((model) => ({
     id: JSON.stringify([model.route.providerId, model.route.modelId]),
     label: model.label,
@@ -64,7 +74,7 @@ export function ModelSelector({
         navigationSession.current += 1;
         // Keep the outgoing page intact throughout the shared exit animation.
         if (next) {
-          setPage('reasoning');
+          setPage(requestedPage ?? 'reasoning');
           setPreviewLabel(null);
         }
         onOpenChange(next);

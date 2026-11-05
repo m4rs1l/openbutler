@@ -4,12 +4,14 @@ import { projectModelSelection } from './model-selection.js';
 
 /**
  * The selector edits two runtime facts through their server commands: the model
- * and the effort. Neither lives in component state, so what the menu shows is
- * always the runtime the next model request will actually use.
+ * and the effort. Neither lives in component state; the one local view is the
+ * session's pending model pick, which the projection shows at once while a run
+ * defers the change and drops the moment the server accepts it.
  */
 export function useModelSelection(
   runtime: RuntimeInfo | undefined,
   models: ModelChoice[],
+  pendingModel: ModelChoice | null,
   onModel: (model: ModelChoice) => Promise<boolean>,
   onReasoning: (value: string) => Promise<boolean>,
 ) {
@@ -19,7 +21,7 @@ export function useModelSelection(
   const inFlight = useRef(false);
   const retryModel = useRef<ModelChoice | null>(null);
   const retryReasoning = useRef<string | null>(null);
-  const projection = projectModelSelection(runtime, models);
+  const projection = projectModelSelection(runtime, models, pendingModel);
   async function selectModel(model: Pick<ModelChoice, 'providerId' | 'modelId'>) {
     if (inFlight.current) return false;
     const choice = models.find((item) => modelRouteKeyEquals(item, model));
