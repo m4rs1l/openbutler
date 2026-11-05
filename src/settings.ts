@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path';
 import { load as parseYaml, dump as dumpYaml } from 'js-yaml';
 import { getDataPath } from './paths.js';
 import { commitSecrets, commitSettingsPair, withSettingsLock } from './settings-transaction.js';
+import { isShellSettingValue, SHELL_PRESETS } from './tools/shell.js';
 
 /**
  * Persisted configuration.
@@ -135,7 +136,11 @@ export interface SettingsStore {
    */
   defaultProvider: string;
   defaultModel: string;
-  /** Preferred reasoning variant id; a stale id resolves to the strongest variant the model offers. */
+  /**
+   * Machine default reasoning variant id; a stale id resolves to the strongest
+   * variant the model offers. Only a session without its own recorded effort
+   * (SavedSession.reasoning) follows it - a chat the owner set keeps its own.
+   */
   reasoning?: string;
   /** Reasoning deltas are shown in the session transcript unless explicitly switched off. */
   showReasoning?: boolean;
@@ -162,6 +167,13 @@ export interface SettingsStore {
    * run keeps going: an expired approval is a timeout, never an approval.
    */
   approvalTimeoutSeconds?: number;
+  /**
+   * What execute_command launches. Unset or "auto" walks a fixed preference
+   * order (PowerShell 7, then Windows PowerShell, then cmd on Windows; $SHELL,
+   * then /bin/sh on POSIX). A preset — pwsh, powershell, cmd, git-bash, wsl,
+   * bash, zsh, sh — or an executable path pins it explicitly.
+   */
+  commandShell?: string;
   /** Explicit schedules. An empty list starts no observers or scheduled model calls. */
   schedules: ScheduleState[];
   /** Workspace used by bare OpenButler launches; it does not define the machine custodian identity. */
@@ -169,7 +181,32 @@ export interface SettingsStore {
   telegram?: TelegramSettings;
   /** Team membership; absent means this machine is not in a team. */
   team?: TeamSettings;
+  /**
+   * The machine custodian, configured by the owner and only by the owner. Every value
+   * here is read at a named boundary (section 4.6) and none of them is ever written
+   * onto a conversation: a setting that only exists as a field on a record can be
+   * displayed nowhere and changed by nothing while it silently changes behaviour.
+   */
+  custodian?: CustodianSettings;
 }
+
+export interface CustodianSettings {
+  /** Provider and model the head runs with; both must be set together. */
+  provider?: string;
+  model?: string;
+  /** The head's compaction budget; clamped to the model window when it is used. */
+  contextLimitTokens?: number;
+  /** Whether a running turn is shown the bounded line naming reports that arrived. */
+  reportLine?: boolean;
+  /** Smallest gap between two turns the head starts on its own, in seconds. */
+  reportTurnGapSeconds?: number;
+  /** Running-worker limits: width per session, width per worker parent, and the machine total. */
+  workerCaps?: { perSession: number; perWorkerParent: number; perMachine: number; depth: number };
+}
+
+export const CUSTODIAN_WORKER_CAP_DEFAULTS = { perSession: 8, perWorkerParent: 2, perMachine: 10, depth: 2 } as const;
+export const CUSTODIAN_CONTEXT_LIMIT_RANGE = { min: 10_000, max: 2_000_000 } as const;
+export const CUSTODIAN_REPORT_GAP_RANGE = { min: 0, max: 3_600 } as const;
 
 const SETTINGS_FILE = getDataPath('settings.yaml');
 const CONFIG_FILE = getDataPath('config.yaml');
@@ -206,11 +243,13 @@ const KNOWN_KEYS = new Set([
   'autoReviewProvider',
   'autoReviewModel',
   'approvalTimeoutSeconds',
+  'commandShell',
   'schedules',
   'backgroundTasks',
   'defaultWorkspaceRoot',
   'telegram',
   'team',
+  'custodian',
 ]);
 const KNOWN_PROVIDER_KEYS = new Set([
   'enabled',
@@ -611,6 +650,13 @@ function loadSettingsUnlocked(): SettingsStore {
     }
     settings.theme = parsed.theme;
   }
+  if (parsed.commandShell !== undefined) {
+    const shell = typeof parsed.commandShell === 'string' ? parsed.commandShell.trim() : '';
+    if (!isShellSettingValue(shell)) {
+      throw new Error(`commandShell must be one of ${SHELL_PRESETS.join(', ')} or an executable path`);
+    }
+    settings.commandShell = shell;
+  }
   if (parsed.approvalMode !== undefined) {
     if (parsed.approvalMode === 'ask') {
       // Migrate the original v1 approval mode to the folder-scoped default.
@@ -676,7 +722,85 @@ function loadSettingsUnlocked(): SettingsStore {
   }
   if (parsed.telegram !== undefined) settings.telegram = parseTelegramSettings(parsed.telegram);
   if (parsed.team !== undefined) settings.team = parseTeamSettings(parsed.team);
+  if (parsed.custodian !== undefined) settings.custodian = parseCustodianSettings(parsed.custodian);
   mergeSecrets(settings, loadSecrets());
+  return settings;
+}
+
+const CUSTODIAN_KEYS = new Set(['provider', 'model', 'contextLimitTokens', 'reportLine', 'reportTurnGapSeconds', 'workerCaps']);
+const CUSTODIAN_WORKER_CAP_KEYS = new Set(['perSession', 'perWorkerParent', 'perMachine', 'depth']);
+
+function wholeNumberInRange(value: unknown, name: string, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be a whole number between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+/**
+ * The head's settings, validated where they are read. A wrong value is refused by
+ * name and range instead of silently becoming the default: an owner who typed 0 for
+ * the gap must be told that 0 is allowed but 4000 is not, not quietly given 60.
+ */
+export function parseCustodianSettings(raw: unknown): CustodianSettings {
+  if (!isRecord(raw)) throw new Error('custodian must be a mapping');
+  for (const key of Object.keys(raw)) {
+    if (!CUSTODIAN_KEYS.has(key)) {
+      throw new Error(`custodian.${key} is not a setting openbutler knows (known: ${[...CUSTODIAN_KEYS].join(', ')})`);
+    }
+  }
+  const settings: CustodianSettings = {};
+  const provider = raw.provider;
+  const model = raw.model;
+  if (provider !== undefined || model !== undefined) {
+    if (typeof provider !== 'string' || typeof model !== 'string' || !provider.trim() || !model.trim()) {
+      throw new Error('custodian.provider and custodian.model must both be non-empty strings, or both omitted.');
+    }
+    settings.provider = provider.trim();
+    settings.model = model.trim();
+  }
+  if (raw.contextLimitTokens !== undefined) {
+    settings.contextLimitTokens = wholeNumberInRange(
+      raw.contextLimitTokens,
+      'custodian.contextLimitTokens',
+      CUSTODIAN_CONTEXT_LIMIT_RANGE.min,
+      CUSTODIAN_CONTEXT_LIMIT_RANGE.max,
+    );
+  }
+  if (raw.reportLine !== undefined) {
+    if (typeof raw.reportLine !== 'boolean') throw new Error('custodian.reportLine must be true or false.');
+    settings.reportLine = raw.reportLine;
+  }
+  if (raw.reportTurnGapSeconds !== undefined) {
+    settings.reportTurnGapSeconds = wholeNumberInRange(
+      raw.reportTurnGapSeconds,
+      'custodian.reportTurnGapSeconds',
+      CUSTODIAN_REPORT_GAP_RANGE.min,
+      CUSTODIAN_REPORT_GAP_RANGE.max,
+    );
+  }
+  if (raw.workerCaps !== undefined) {
+    if (!isRecord(raw.workerCaps)) throw new Error('custodian.workerCaps must be a mapping');
+    for (const key of Object.keys(raw.workerCaps)) {
+      if (!CUSTODIAN_WORKER_CAP_KEYS.has(key)) {
+        throw new Error(
+          `custodian.workerCaps.${key} is not a setting openbutler knows (known: ${[...CUSTODIAN_WORKER_CAP_KEYS].join(', ')})`,
+        );
+      }
+    }
+    const caps = raw.workerCaps;
+    settings.workerCaps = {
+      perSession: wholeNumberInRange(caps.perSession ?? CUSTODIAN_WORKER_CAP_DEFAULTS.perSession, 'custodian.workerCaps.perSession', 1, 32),
+      perWorkerParent: wholeNumberInRange(
+        caps.perWorkerParent ?? CUSTODIAN_WORKER_CAP_DEFAULTS.perWorkerParent,
+        'custodian.workerCaps.perWorkerParent',
+        0,
+        8,
+      ),
+      perMachine: wholeNumberInRange(caps.perMachine ?? CUSTODIAN_WORKER_CAP_DEFAULTS.perMachine, 'custodian.workerCaps.perMachine', 1, 64),
+      depth: wholeNumberInRange(caps.depth ?? CUSTODIAN_WORKER_CAP_DEFAULTS.depth, 'custodian.workerCaps.depth', 1, 3),
+    };
+  }
   return settings;
 }
 
@@ -872,10 +996,12 @@ function saveSettingsUnlocked(settings: SettingsStore): void {
     ...(settings.autoReviewProvider === undefined ? {} : { autoReviewProvider: settings.autoReviewProvider }),
     ...(settings.autoReviewModel === undefined ? {} : { autoReviewModel: settings.autoReviewModel }),
     ...(settings.approvalTimeoutSeconds === undefined ? {} : { approvalTimeoutSeconds: settings.approvalTimeoutSeconds }),
+    ...(settings.commandShell === undefined ? {} : { commandShell: settings.commandShell }),
     schedules: settings.schedules,
     ...(settings.defaultWorkspaceRoot ? { defaultWorkspaceRoot: settings.defaultWorkspaceRoot } : {}),
     ...(settings.telegram ? { telegram: settings.telegram } : {}),
     ...(settings.team ? { team: settings.team } : {}),
+    ...(settings.custodian ? { custodian: settings.custodian } : {}),
   };
   // Validate the existing secret store BEFORE committing anything. An unreadable
   // store must never be reinterpreted as an empty one.

@@ -580,3 +580,81 @@ describe('schedule parsing', () => {
     expect(() => settings.loadSettings()).toThrow(/Schedule schedule is not a supported setting/);
   });
 });
+
+describe('custodian settings', () => {
+  it('loads a full block and keeps every value as given', async () => {
+    writeSettings(
+      [
+        'custodian:',
+        '  provider: fixture',
+        '  model: strong',
+        '  contextLimitTokens: 320000',
+        '  reportLine: false',
+        '  reportTurnGapSeconds: 90',
+        '  workerCaps: {perSession: 4, perWorkerParent: 1, perMachine: 6, depth: 3}',
+      ].join('\n'),
+    );
+    const settings = await loadSettingsModule();
+    expect(settings.loadSettings().custodian).toEqual({
+      provider: 'fixture',
+      model: 'strong',
+      contextLimitTokens: 320_000,
+      reportLine: false,
+      reportTurnGapSeconds: 90,
+      workerCaps: { perSession: 4, perWorkerParent: 1, perMachine: 6, depth: 3 },
+    });
+  });
+
+  it('refuses a value it does not know by name', async () => {
+    writeSettings('custodian:\n  contextLimit: 100000');
+    const settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.contextLimit is not a setting openbutler knows/);
+  });
+
+  it('names the setting and the range instead of defaulting silently', async () => {
+    writeSettings('custodian:\n  contextLimitTokens: 999');
+    const settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.contextLimitTokens must be a whole number between 10000 and 2000000/);
+  });
+
+  it('refuses half a model', async () => {
+    writeSettings('custodian:\n  provider: fixture');
+    const settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.provider and custodian\.model must both be non-empty strings/);
+  });
+
+  it('refuses a line switch that is not a boolean', async () => {
+    writeSettings('custodian:\n  reportLine: maybe');
+    const settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.reportLine must be true or false/);
+  });
+
+  it('accepts a zero gap and refuses one past the hour', async () => {
+    writeSettings('custodian:\n  reportTurnGapSeconds: 0');
+    let settings = await loadSettingsModule();
+    expect(settings.loadSettings().custodian?.reportTurnGapSeconds).toBe(0);
+    writeSettings('custodian:\n  reportTurnGapSeconds: 3601');
+    settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.reportTurnGapSeconds must be a whole number between 0 and 3600/);
+  });
+
+  it('fills missing worker caps from the defaults and refuses a bad one', async () => {
+    writeSettings('custodian:\n  workerCaps: {perSession: 4}');
+    let settings = await loadSettingsModule();
+    expect(settings.loadSettings().custodian?.workerCaps).toEqual({ perSession: 4, perWorkerParent: 2, perMachine: 10, depth: 2 });
+    writeSettings('custodian:\n  workerCaps: {depth: 4}');
+    settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/custodian\.workerCaps\.depth must be a whole number between 1 and 3/);
+  });
+
+  it('hands the configured worker caps to the next spawn and the defaults when unset', async () => {
+    writeSettings('custodian:\n  workerCaps: {perSession: 3, perWorkerParent: 1, perMachine: 4, depth: 1}');
+    vi.resetModules();
+    const configured = await import('../src/host/worker-service.js');
+    expect(configured.configuredWorkerCaps()).toEqual({ perSession: 3, perWorkerParent: 1, perMachine: 4, depth: 1 });
+    writeSettings('');
+    vi.resetModules();
+    const unset = await import('../src/host/worker-service.js');
+    expect(unset.configuredWorkerCaps()).toEqual({ perSession: 8, perWorkerParent: 2, perMachine: 10, depth: 2 });
+  });
+});
