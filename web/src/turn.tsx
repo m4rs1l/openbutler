@@ -13,7 +13,6 @@ import { ChatDivider } from './components/chat-divider.js';
 import {
   activeGroupIndex,
   formatDuration,
-  formatTokens,
   groupTimeline,
   groupSummary,
   groupSignal,
@@ -24,6 +23,7 @@ import {
   thoughtLabel,
   turnDuration,
   turnContents,
+  workDetailsOpen,
   type GroupSignal,
   type Turn,
 } from './turns.js';
@@ -34,19 +34,33 @@ const HEADLINE_HOLD_MS = 1_200;
 const HEADLINE_ROTATE_MS = 7_000;
 
 /**
- * A compaction changed what the model can see; it reads as a boundary in the
- * transcript, so it shares the divider line and keeps the sizes it moved.
+ * A compaction reads as a boundary, not a message: the request divider, the
+ * checkpoint the model wrote under it, and the divider that says the rewrite
+ * has landed. The token sizes stay on the entry, out of the reading path.
  */
-function CompactionRow({ entry }: { entry: Entry }) {
+function CompactionRow({ entry, summaries, thoughts, live }: { entry: Entry; summaries?: Entry[]; thoughts?: Entry[]; live: boolean }) {
   const status = entry.status ?? 'running';
-  const label = status === 'done' ? 'Context compacted' : status === 'failed' ? 'Compaction interrupted' : 'Compacting context…';
-  const sizes =
-    entry.beforeTokens !== undefined && entry.afterTokens !== undefined
-      ? `${formatTokens(entry.beforeTokens)} → ${formatTokens(entry.afterTokens)}`
-      : entry.beforeTokens !== undefined
-        ? `${formatTokens(entry.beforeTokens)} → …`
-        : null;
-  return <ChatDivider entry={{ text: sizes ? `${label} · ${sizes}` : label }} />;
+  const tail = status === 'done' ? 'Compacted' : status === 'failed' ? 'Compaction interrupted' : null;
+  return (
+    <>
+      <ChatDivider entry={{ text: 'Compacting context…' }} />
+      {/* The thinking behind the rewrite: a row of its own, open only while it streams. */}
+      {thoughts?.map((thought, index) =>
+        thought.text?.trim() ? <StepRow key={thought.eventId || `thought-${index}`} entry={thought} live={live} /> : null,
+      )}
+      {summaries?.map((summary, index) =>
+        summary.text?.trim() ? (
+          // Markdown only: the raw-text `prose` class carries white-space:
+          // pre-wrap, which turned the renderer's own newlines between blocks
+          // into an extra blank line at every block boundary.
+          <div className="compaction-summary" key={summary.eventId || index}>
+            <Markdown text={summary.text.trimEnd()} reveal={summary.streamReveal} />
+          </div>
+        ) : null,
+      )}
+      {tail ? <ChatDivider entry={{ text: tail }} /> : null}
+    </>
+  );
 }
 
 function failed(entry: Entry): boolean {
@@ -68,11 +82,14 @@ function EntryNotice({ entry }: { entry: Entry }) {
   ) : null;
 }
 
-function StepRow({ entry, live }: { entry: Entry; live: boolean }) {
+function StepRow({ entry, live, tail = false }: { entry: Entry; live: boolean; tail?: boolean }) {
   // A thinking block streams its text and only gets its duration once the block
   // ends. It stays open while it is being written and folds into "Thought for
   // Xs" the moment the duration lands; a block the reader opened stays open.
-  const thinking = live && entry.kind === 'reasoning' && entry.durationMs === undefined;
+  // A block that arrives already stamped (a batched flush after a hidden tab)
+  // would mount closed forever; in a live turn the newest reasoning row stays
+  // open for as long as the turn is writing.
+  const thinking = live && entry.kind === 'reasoning' && (entry.durationMs === undefined || tail);
   const [open, setOpen] = useState(thinking);
   const [automatic, setAutomatic] = useState(thinking);
   const [wasThinking, setWasThinking] = useState(thinking);
@@ -183,6 +200,17 @@ function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: 
     const timer = setTimeout(() => setTick((value) => value + 1), Math.max(0, hold - (Date.now() - shown.at)));
     return () => clearTimeout(timer);
   }, [holding, hold, shown.at]);
+  // The newest reasoning row of a live turn is the one the model is writing;
+  // it stays open even when it arrived already stamped.
+  let streamingIndex = -1;
+  if (live) {
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      if (entries[index]?.kind === 'reasoning') {
+        streamingIndex = index;
+        break;
+      }
+    }
+  }
   const label = active ? shown.text || summary : summary;
   return (
     <div className={`tool-group${open ? ' open' : ''}${live && running ? ' running' : ''}`}>
@@ -204,13 +232,15 @@ function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: 
       </button>
       <Collapsible open={open}>
         <ScrollArea className="steps" role="region" aria-label="Step details" tabIndex={0} follow={live}>
-          {entries.map((entry, index) =>
-            entry.kind === 'tool' || entry.kind === 'reasoning' ? (
-              <StepRow key={entry.eventId || index} entry={entry} live={live} />
+          {entries.map((entry, index) => {
+            // The newest reasoning row of a live turn is the one the model is
+            // writing; it stays open even when it arrived already stamped.
+            return entry.kind === 'tool' || entry.kind === 'reasoning' ? (
+              <StepRow key={entry.eventId || index} entry={entry} live={live} tail={index === streamingIndex} />
             ) : (
               <EntryNotice key={entry.eventId || index} entry={entry} />
-            ),
-          )}
+            );
+          })}
         </ScrollArea>
       </Collapsible>
     </div>
@@ -219,8 +249,18 @@ function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: 
 export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live: boolean; sessionId: string; runtime?: RuntimeInfo }) {
   const [expanded, setExpanded] = useState<boolean | null>(null);
   const detailsId = useId();
+  // The duration below reads Date.now() at render time. Without its own clock
+  // the number only advanced when an entry streamed in, so a quiet provider or
+  // tool stretch froze the counter and the next entry made it jump - the
+  // "stuttering" report. A live turn ticks every second while it is live.
+  const [, setLiveTick] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    const timer = setInterval(() => setLiveTick((value) => value + 1), 1_000);
+    return () => clearInterval(timer);
+  }, [live]);
   const groups = groupTimeline(turn);
-  const { details, answer, afterword } = turnContents(turn);
+  const { details, answer, afterword } = turnContents(turn, groups);
   const firstWork = details.findIndex((group) => group.kind !== 'message' || group.entry.kind !== 'user');
   const leadingUsers = details.slice(0, firstWork < 0 ? details.length : firstWork);
   const workDetails = details.slice(leadingUsers.length);
@@ -229,17 +269,18 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
   const leadingDividers: Array<{ kind: 'divider'; entry: Entry }> = [];
   while (workDetails[0]?.kind === 'divider') leadingDividers.push(workDetails.shift() as { kind: 'divider'; entry: Entry });
   // A reader's explicit choice takes precedence over the automatic live/finished state.
+  const detailsContainUserMessage = workDetails.some((group) => group.kind === 'message' && group.entry.kind === 'user');
   // A turn whose ask lives before the loaded window has nothing collapsible to
   // hide: opening it keeps the tail readable without the click that used to be
   // required to discover the messages at all.
-  const open =
-    expanded ?? (live || turn.user === null || workDetails.some((group) => group.kind === 'message' && group.entry.kind === 'user'));
+  const open = workDetailsOpen(expanded, live, turn, detailsContainUserMessage);
   const duration = live && turn.startedAt !== null ? Math.max(0, Date.now() - turn.startedAt) : turnDuration(turn);
   const outcome = turn.user?.turnOutcome;
   const label = live ? 'Working for' : outcome === 'cancelled' ? 'Stopped after' : outcome === 'failed' ? 'Failed after' : 'Took';
   // The open group belongs to the run that is still going: once the work stops,
   // the last group folds like every other finished group.
-  const activeGroup = activeGroupIndex(groups, live);
+  const activeGroupIndexValue = activeGroupIndex(groups, live);
+  const activeGroup = activeGroupIndexValue >= 0 ? groups[activeGroupIndexValue] : undefined;
   return (
     <section className={`turn${live ? ' live' : ''}`}>
       {turn.user ? (
@@ -287,11 +328,20 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
                 key={index}
                 entries={group.entries}
                 live={live}
-                active={index + leadingUsers.length === activeGroup}
+                active={group === activeGroup}
                 titles={runtime?.reasoningTitles === true}
               />
             );
-          if (group.kind === 'compaction') return <CompactionRow key={`compaction-${index}`} entry={group.entry} />;
+          if (group.kind === 'compaction')
+            return (
+              <CompactionRow
+                key={`compaction-${index}`}
+                entry={group.entry}
+                summaries={group.summaries}
+                thoughts={group.thoughts}
+                live={live}
+              />
+            );
           if (group.kind === 'divider') return <ChatDivider key={`divider-${index}`} entry={group.entry} />;
           const entry = group.entry;
           // A message the owner sent into a running turn is still their words, not
@@ -323,9 +373,19 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
           </div>
         </div>
       ) : null}
-      {afterword.map((entry, index) => (
-        <ChatDivider key={`afterword-divider-${index}`} entry={entry} />
-      ))}
+      {afterword.map((group, index) =>
+        group.kind === 'compaction' ? (
+          <CompactionRow
+            key={`afterword-compaction-${index}`}
+            entry={group.entry}
+            summaries={group.summaries}
+            thoughts={group.thoughts}
+            live={live}
+          />
+        ) : (
+          <ChatDivider key={`afterword-divider-${index}`} entry={group.entry} />
+        ),
+      )}
     </section>
   );
 }

@@ -8,21 +8,12 @@ export interface Turn {
   steps: Entry[];
   assistant: Entry[];
   timeline: Entry[];
-  notices: Entry[];
   startedAt: number | null;
   endedAt: number | null;
-  toolCount: number;
-  failedCount: number;
 }
 
 function isStep(entry: Entry): boolean {
   return entry.kind === 'reasoning' || entry.kind === 'tool';
-}
-
-function failed(entry: Entry): boolean {
-  if (entry.kind !== 'tool') return false;
-  const text = `${entry.result ?? ''}`.toLowerCase();
-  return /^error|failed|not permitted|refused|denied/.test(text) || text.includes('exit 1');
 }
 
 /**
@@ -75,11 +66,8 @@ export function buildTurns(entries: Entry[], base = 0): Turn[] {
       steps: [],
       assistant: [],
       timeline: [],
-      notices: [],
       startedAt: entry?.at ?? null,
       endedAt: null,
-      toolCount: 0,
-      failedCount: 0,
     };
     turns.push(turn);
     if (entry?.turnId !== undefined) byTurn.set(entry.turnId, turn);
@@ -89,9 +77,20 @@ export function buildTurns(entries: Entry[], base = 0): Turn[] {
   for (const [index, entry] of entries.entries()) {
     const turnId = entry.turnId ? (displayTurnIds.get(entry.turnId) ?? entry.turnId) : undefined;
     // Text the machinery wrote is stored so the record stays complete, but it is
-    // not part of the conversation: the compaction row already carries the event,
-    // and the checkpoint prose would read as an answer nobody asked for.
-    if (entry.internal === 'compaction') continue;
+    // not part of the conversation: it must never count as an answer or as work.
+    // It rides the timeline only so the compaction group can carry it between
+    // its boundary rows, the way the terminal already shows it.
+    if (entry.internal === 'compaction') {
+      // Thinking too: the reasoning belongs to the compaction that produced it,
+      // and dropping it here left the reader with no trace of either.
+      const carries = (entry.kind === 'assistant' || entry.kind === 'reasoning') && Boolean(entry.text?.trim());
+      if (carries) {
+        if (!current) current = open(null, index);
+        current.timeline.push(entry);
+        if (entry.at) current.endedAt = entry.at;
+      }
+      continue;
+    }
     if (entry.kind === 'user' && (turnId === undefined || turnId !== currentTurnId)) {
       current = open(entry, index);
       current.user = entry;
@@ -117,17 +116,12 @@ export function buildTurns(entries: Entry[], base = 0): Turn[] {
 
     if (isStep(entry)) {
       current.steps.push(entry);
-      if (entry.kind === 'tool') {
-        current.toolCount += 1;
-        if (failed(entry)) current.failedCount += 1;
-      }
       continue;
     }
     if (entry.kind === 'assistant') {
       current.assistant.push(entry);
       continue;
     }
-    current.notices.push(entry);
   }
 
   return turns;
@@ -147,22 +141,43 @@ export function awaitingFirstChunk(turns: Turn[], liveTurnId: string | undefined
 export type TurnGroup =
   | { kind: 'steps'; entries: Entry[] }
   | { kind: 'message'; entry: Entry }
-  | { kind: 'compaction'; entry: Entry }
+  | { kind: 'compaction'; entry: Entry; summaries?: Entry[]; thoughts?: Entry[] }
   | { kind: 'divider'; entry: Entry };
 /** Work and diagnostics share a group; only conversation messages close it. */
 export function groupTimeline(turn: Turn): TurnGroup[] {
   const groups: TurnGroup[] = [];
+  // A compaction owns what it produced: its thinking and the checkpoint it wrote
+  // attach to its own row, wherever this turn carries that row. Provenance alone
+  // decides: a transcript that lost the marker is stamped when its session opens.
+  let compaction: Extract<TurnGroup, { kind: 'compaction' }> | null = null;
   for (const entry of turn.timeline) {
     // The renderer hides blank assistant text, so it cannot be a visible group boundary.
     if (entry.kind === 'assistant' && !entry.text?.trim()) continue;
-    if (entry.kind === 'user' || entry.kind === 'assistant') {
-      groups.push({ kind: 'message', entry });
+    // The compaction checkpoint attaches under its boundary rows, never as a
+    // message: a summary nobody asked for must not read as an answer. The row can
+    // be anywhere in this turn - adjacency is what used to drop it on the floor.
+    if (entry.internal === 'compaction') {
+      if (compaction && entry.text?.trim()) {
+        if (entry.kind === 'assistant') {
+          compaction.summaries ??= [];
+          compaction.summaries.push(entry);
+        } else if (entry.kind === 'reasoning') {
+          compaction.thoughts ??= [];
+          compaction.thoughts.push(entry);
+        }
+      }
       continue;
     }
     // Compaction is its own event: it is not work the agent did, and folding it
     // into a step group would hide the moment the context changed.
     if (entry.kind === 'compaction') {
-      groups.push({ kind: 'compaction', entry });
+      const own: Extract<TurnGroup, { kind: 'compaction' }> = { kind: 'compaction', entry };
+      groups.push(own);
+      compaction = own;
+      continue;
+    }
+    if (entry.kind === 'user' || entry.kind === 'assistant') {
+      groups.push({ kind: 'message', entry });
       continue;
     }
     // A divider is a boundary the backend wrote (settings change, day break):
@@ -192,15 +207,58 @@ export function activeGroupIndex(groups: readonly TurnGroup[], current: boolean)
   return last?.kind === 'steps' ? groups.length - 1 : -1;
 }
 
+/** A boundary the reader must keep seeing: a divider or a compaction row. */
+function isTrailing(group: TurnGroup): group is Extract<TurnGroup, { kind: 'divider' | 'compaction' }> {
+  return group.kind === 'divider' || group.kind === 'compaction';
+}
+
+/**
+ * Whether the run behind this turn ended interrupted rather than completed.
+ *
+ * The stamp lives on the turn's ask, so turns recorded before it existed report
+ * `false` - a stopped or failed turn from an old transcript reads like one that
+ * finished. The disclosure treats both as "fold the log" for those, which is
+ * the pre-existing behaviour, not a regression we are introducing.
+ */
+export function turnInterrupted(turn: Turn): boolean {
+  return turn.user?.turnOutcome === 'cancelled' || turn.user?.turnOutcome === 'failed';
+}
+
+/**
+ * Whether the work disclosure opens by itself. A reader's explicit choice always
+ * wins; failing that, the disclosure stays open while the turn is live, when the
+ * turn carries no ask at all, when the owner spoke inside it, and when the turn
+ * ended interrupted - the failure detail lives inside the disclosure, and folding
+ * it would hide the one thing the reader came back to look at.
+ */
+export function workDetailsOpen(
+  expanded: boolean | null,
+  live: boolean,
+  turn: Turn,
+  detailsContainUserMessage: boolean,
+): boolean {
+  if (expanded !== null) return expanded;
+  return live || turn.user === null || turnInterrupted(turn) || detailsContainUserMessage;
+}
+
 /** Keep the latest answer outside the work disclosure; interrupted text stays in the log. */
-export function turnContents(turn: Turn): { details: TurnGroup[]; answer: Entry | null; afterword: Entry[] } {
-  const groups = groupTimeline(turn);
+export function turnContents(
+  turn: Turn,
+  timeline?: TurnGroup[],
+): {
+  details: TurnGroup[];
+  answer: Entry | null;
+  afterword: Extract<TurnGroup, { kind: 'divider' | 'compaction' }>[];
+} {
+  const groups = timeline ?? groupTimeline(turn);
   let answerIndex = groups.length - 1;
   // Connection/status notices appended after an answer do not turn it back into work.
-  // Neither do dividers: they record when the transcript changed, not more work.
+  // Neither do dividers or a compaction boundary: they record when the transcript
+  // changed, not more work. A compaction behind the answer used to demote it into
+  // the disclosure, which is why a finished turn lost its reply after compacting.
   while (answerIndex >= 0) {
     const group = groups[answerIndex];
-    if (group.kind === 'divider') {
+    if (isTrailing(group)) {
       answerIndex--;
       continue;
     }
@@ -212,23 +270,21 @@ export function turnContents(turn: Turn): { details: TurnGroup[]; answer: Entry 
     answerIndex--;
   }
   const last = groups[answerIndex];
-  const interrupted = turn.user?.turnOutcome === 'cancelled' || turn.user?.turnOutcome === 'failed';
+  const interrupted = turnInterrupted(turn);
   const answer = !interrupted && last?.kind === 'message' && last.entry.kind === 'assistant' && last.entry.text?.trim() ? last.entry : null;
-  // Trailing dividers render at section level: folding them with the work would
-  // hide the boundary the reader came back for.
-  const afterword: Entry[] = answer
-    ? groups
-        .slice(answerIndex + 1)
-        .filter((group): group is Extract<TurnGroup, { kind: 'divider' }> => group.kind === 'divider')
-        .map((group) => group.entry)
+  // A trailing boundary renders at section level: folding it with the work would
+  // hide the boundary the reader came back for. A compaction row belongs there as
+  // much as a divider does - without it the rows disappear with the disclosure the
+  // moment the turn finishes.
+  const afterword: Extract<TurnGroup, { kind: 'divider' | 'compaction' }>[] = answer
+    ? groups.slice(answerIndex + 1).filter(isTrailing)
     : [];
   const details = answer
-    ? groups.filter((group, index) => index !== answerIndex && !(index > answerIndex && group.kind === 'divider'))
+    ? groups.filter((group, index) => index !== answerIndex && !(index > answerIndex && isTrailing(group)))
     : [...groups];
   if (!answer) {
-    while (details.length > 0 && details[details.length - 1]!.kind === 'divider') {
-      const tail = details.pop() as Extract<TurnGroup, { kind: 'divider' }>;
-      afterword.unshift(tail.entry);
+    while (details.length > 0 && isTrailing(details[details.length - 1]!)) {
+      afterword.unshift(details.pop() as Extract<TurnGroup, { kind: 'divider' | 'compaction' }>);
     }
   }
   return { details, answer, afterword };
@@ -367,19 +423,25 @@ export function turnDuration(turn: Turn): number | null {
   return Math.max(0, end - turn.startedAt);
 }
 
-/** 784.4k, 126.9k: a token count a reader can size at a glance. */
-export function formatTokens(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return String(Math.round(value));
-}
-
+/**
+ * Human scale for a turn header or a thought label: whole seconds under a
+ * minute, then minutes, hours and days, dropping exact zero parts -
+ * `7m 34s`, `48m`, `1h 34m`, `1d 14h`. Only the sub-second window keeps
+ * a decimal, so a fresh block does not read as `0s`.
+ */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.max(1, Math.round(ms / 100)) / 10}s`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${Math.round(seconds - minutes * 60)}s`;
+  const restSeconds = seconds % 60;
+  if (minutes < 60) return restSeconds === 0 ? `${minutes}m` : `${minutes}m ${restSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  if (hours < 24) return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`;
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours === 0 ? `${days}d` : `${days}d ${restHours}h`;
 }
 
 export function isShellTool(entry: Entry): boolean {
@@ -396,13 +458,4 @@ export function stepLabel(entry: Entry): { verb: string; target: string } {
   const space = command.indexOf(' ');
   if (space === -1) return { verb: command, target: '' };
   return { verb: command.slice(0, space), target: command.slice(space + 1) };
-}
-
-export function turnSummary(turn: Turn): string {
-  const parts: string[] = [];
-  if (turn.toolCount > 0) parts.push(`${turn.toolCount} step${turn.toolCount === 1 ? '' : 's'}`);
-  if (turn.failedCount > 0) parts.push(`${turn.failedCount} failed`);
-  const duration = turnDuration(turn);
-  if (duration !== null) parts.push(formatDuration(duration));
-  return parts.join(' · ');
 }

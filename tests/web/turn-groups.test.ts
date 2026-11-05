@@ -4,7 +4,7 @@ import {
   awaitingFirstChunk,
   buildTurns,
   classifyTool,
-  formatTokens,
+  formatDuration,
   groupSummary,
   groupTimeline,
   groupSignal,
@@ -15,6 +15,8 @@ import {
   thoughtLabel,
   turnContents,
   turnDuration,
+  turnInterrupted,
+  workDetailsOpen,
 } from '../../web/src/turns.js';
 import type { Entry } from '../../web/src/types.js';
 
@@ -44,7 +46,7 @@ describe('divider groups', () => {
     ];
     const { details, answer, afterword } = turnContents(onlyTurn(entries));
     expect(answer?.text).toBe('Answer');
-    expect(afterword.map((entry) => entry.text)).toEqual(['Wednesday 03:49']);
+    expect(afterword.map((group) => group.entry.text)).toEqual(['Wednesday 03:49']);
     expect(details.some((group) => group.kind === 'divider')).toBe(false);
   });
 
@@ -57,7 +59,7 @@ describe('divider groups', () => {
     ]);
     const { answer, afterword } = turnContents(turn);
     expect(answer?.text).toBe('Answer');
-    expect(afterword.map((entry) => entry.text)).toEqual(['Model changed from "a" to "b"']);
+    expect(afterword.map((group) => group.entry.text)).toEqual(['Model changed from "a" to "b"']);
   });
 });
 
@@ -92,6 +94,51 @@ describe('whole-turn disclosure', () => {
       { kind: 'tool', command: 'inspect', result: '' },
     ]);
     expect(turnContents(turn).answer).toBeNull();
+  });
+
+  it.each(['cancelled', 'failed'] as const)(
+    'keeps the work disclosure open for a %s turn, where the detail is the answer',
+    (turnOutcome) => {
+      const turn = onlyTurn([
+        { kind: 'user', text: 'Task', turnOutcome },
+        { kind: 'assistant', text: 'Partial output' },
+      ]);
+      expect(turnInterrupted(turn)).toBe(true);
+      expect(workDetailsOpen(null, false, turn, false)).toBe(true);
+    },
+  );
+
+  it('closes the disclosure for an unstamped finished turn, like it did before outcomes were recorded', () => {
+    const turn = onlyTurn([
+      { kind: 'user', text: 'Task' },
+      { kind: 'assistant', text: 'Answer' },
+    ]);
+    expect(turnInterrupted(turn)).toBe(false);
+    expect(workDetailsOpen(null, false, turn, false)).toBe(false);
+  });
+
+  it('honours the reader folding the disclosure of an interrupted turn', () => {
+    const turn = onlyTurn([
+      { kind: 'user', text: 'Task', turnOutcome: 'failed' },
+      { kind: 'assistant', text: 'Partial output' },
+    ]);
+    expect(workDetailsOpen(false, false, turn, false)).toBe(false);
+    expect(workDetailsOpen(false, true, turn, false)).toBe(false);
+  });
+
+  it('opens the disclosure for a turn whose ask is absent, even once the work has ended', () => {
+    const turn = onlyTurn([{ kind: 'tool', command: 'inspect', result: '', turnId: 't' }]);
+    expect(turn.user).toBeNull();
+    expect(workDetailsOpen(null, false, turn, false)).toBe(true);
+  });
+
+  it('opens the disclosure when a steering message lives inside the work details', () => {
+    const turn = onlyTurn([
+      { kind: 'user', text: 'Task', turnOutcome: 'completed' },
+      { kind: 'tool', command: 'inspect', result: '', turnId: 't' },
+      { kind: 'user', text: 'Also this.', turnId: 't' },
+    ]);
+    expect(workDetailsOpen(null, false, turn, true)).toBe(true);
   });
 
   it('keeps the answer visible after a connection notice and reads the recorded completion time', () => {
@@ -286,13 +333,6 @@ describe('group summary', () => {
     expect(groups.map((group) => group.kind)).toEqual(['steps', 'compaction', 'message']);
   });
 
-  it('sizes a token count so a reader can compare two of them', () => {
-    expect(formatTokens(784_400)).toBe('784.4k');
-    expect(formatTokens(126_900)).toBe('126.9k');
-    expect(formatTokens(1_500_000)).toBe('1.5M');
-    expect(formatTokens(940)).toBe('940');
-  });
-
   it('counts what the group actually ran', () => {
     expect(groupSummary([tool('host:execute_command', 'git status'), tool('host:execute_command', 'npm test')])).toBe('2 commands run');
   });
@@ -318,7 +358,7 @@ describe('group summary', () => {
   });
 
   it('falls back to the thinking time for a group with no tools', () => {
-    expect(groupSummary([{ kind: 'reasoning', text: 'a', durationMs: 2_000 }])).toBe('Thought for 2.0s');
+    expect(groupSummary([{ kind: 'reasoning', text: 'a', durationMs: 2_000 }])).toBe('Thought for 2s');
   });
 });
 
@@ -355,7 +395,7 @@ describe('open group signal', () => {
   it('says the thinking time when the group has no tools', () => {
     expect(groupSignal([{ kind: 'reasoning', text: 'a', durationMs: 2_000 }], '')).toEqual({
       kind: 'summary',
-      text: 'Thought for 2.0s',
+      text: 'Thought for 2s',
     });
   });
 });
@@ -468,9 +508,19 @@ describe('thought headline', () => {
 
 describe('thinking time', () => {
   it('names the duration in the label', () => {
-    expect(thoughtLabel(11_600)).toBe('Thought for 11.6s');
+    expect(thoughtLabel(11_600)).toBe('Thought for 11s');
     expect(thoughtLabel(75_000)).toBe('Thought for 1m 15s');
     expect(thoughtLabel(undefined)).toBe('Thought');
+  });
+
+  it('climbs seconds, minutes, hours and days, dropping exact zero parts', () => {
+    expect(formatDuration(400)).toBe('0.4s');
+    expect(formatDuration(52_000)).toBe('52s');
+    expect(formatDuration(454_000)).toBe('7m 34s');
+    expect(formatDuration(2_880_000)).toBe('48m');
+    expect(formatDuration(7_200_000)).toBe('2h');
+    expect(formatDuration(5_640_000)).toBe('1h 34m');
+    expect(formatDuration(136_800_000)).toBe('1d 14h');
   });
 
   it('sums a group and stays unknown while one block is unstamped', () => {
@@ -491,10 +541,10 @@ describe('thinking time', () => {
 });
 
 describe('compaction output', () => {
-  // The checkpoint the model writes is stored so the record stays complete, but
-  // it is not part of the conversation: the reader gets the row, not 30k of
-  // summary prose that looks like an answer.
-  it('shows the compaction row and drops the text the machinery wrote', () => {
+  // What the machinery wrote belongs under the compaction row, the way the
+  // terminal already shows it: the reader gets the row, its thinking and its
+  // checkpoint, and none of it joins the conversation around it.
+  it('carries the reasoning and the checkpoint under the row without counting them as work', () => {
     const entries: Entry[] = [
       { kind: 'user', text: 'Task' },
       { kind: 'compaction', status: 'done', beforeTokens: 784_400, afterTokens: 126_900, at: 1 },
@@ -505,9 +555,29 @@ describe('compaction output', () => {
     ];
     const turn = onlyTurn(entries);
     expect(turn.user?.text).toBe('Task');
-    expect(turn.timeline.map((entry) => entry.kind)).toEqual(['compaction', 'tool', 'assistant']);
+    // Both ride the timeline so the row can carry them, and neither may join the
+    // work or the answers of the turn they happened in.
+    expect(turn.timeline.map((entry) => entry.kind)).toEqual(['compaction', 'reasoning', 'assistant', 'tool', 'assistant']);
     expect(turn.assistant.map((entry) => entry.text)).toEqual(['Answer']);
-    expect(groupTimeline(turn).map((group) => group.kind)).toEqual(['compaction', 'steps', 'message']);
+    const groups = groupTimeline(turn);
+    expect(groups.map((group) => group.kind)).toEqual(['compaction', 'steps', 'message']);
+    const row = groups[0];
+    if (row?.kind !== 'compaction') throw new Error('expected the compaction row');
+    expect(row.thoughts?.map((entry) => entry.text)).toEqual(['Checkpoint thinking']);
+    expect(row.summaries?.map((entry) => entry.text)).toEqual(['## Objective and current request']);
+  });
+
+  it('keeps the answer above a trailing compaction row and shows that row outside the disclosure', () => {
+    const entries: Entry[] = [
+      { kind: 'user', text: 'Task' },
+      { kind: 'assistant', text: 'Answer' },
+      { kind: 'compaction', status: 'done', beforeTokens: 784_400, afterTokens: 126_900 },
+      { kind: 'assistant', text: '## Objective and current request', internal: 'compaction' },
+    ];
+    const { details, answer, afterword } = turnContents(onlyTurn(entries));
+    expect(answer?.text).toBe('Answer');
+    expect(afterword.map((group) => group.kind)).toEqual(['compaction']);
+    expect(details.some((group) => group.kind === 'compaction')).toBe(false);
   });
 
   it('keeps unmarked assistant text, even when a compaction row precedes it', () => {

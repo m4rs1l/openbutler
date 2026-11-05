@@ -15,12 +15,18 @@ export function ApprovalSelector({
   value,
   disabled,
   onChange,
+  open: controlledOpen,
+  onOpenChange,
 }: {
   value?: string | null;
   disabled: boolean;
   onChange: (mode: ApprovalMode) => Promise<void>;
+  /** Controlled only when a slash command opens the picker; otherwise local. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = controlledOpen ?? localOpen;
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const saving = useRef(false);
@@ -28,7 +34,8 @@ export function ApprovalSelector({
     <Dropdown
       open={open}
       onOpenChange={(next) => {
-        setOpen(next);
+        setLocalOpen(next);
+        onOpenChange?.(next);
         if (next) setError(null);
       }}
       ariaLabel="Safety and approval"
