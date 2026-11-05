@@ -1,6 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="OPENBUTLER R logo">
-  <!-- Preserves the original Liberation Sans Bold fully-filled R outline and its transform, without geometric edits. -->
-  <g transform="translate(18 468) scale(0.304 -0.304)">
-    <path d="M432 0H137V1409H841Q1093 1409 1230.0 1300.5Q1367 1192 1367 989Q1367 841 1283.0 733.5Q1199 626 1056 592L1437 0Z" fill="#000000"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" color="#090B0F" role="img" aria-label="OpenButler"><path d="M75 68C75 32 96 15 128 15S181 32 181 68Z" fill="currentColor"/><rect x="43" y="66" width="170" height="19" rx="9.5" fill="currentColor"/><rect x="36" y="119" width="26" height="49" rx="13" fill="currentColor"/><rect x="194" y="119" width="26" height="49" rx="13" fill="currentColor"/><path fill-rule="evenodd" d="M91 84H165C191 84 206 100 206 127V159C206 185 190 201 165 201H91C66 201 50 185 50 159V127C50 100 65 84 91 84ZM92 101C76 101 67 111 67 127V159C67 176 76 184 92 184H164C180 184 189 176 189 159V127C189 111 180 101 164 101Z" fill="currentColor"/><path d="M87 142Q101 122 115 142M141 142Q155 122 169 142" fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round"/><path d="M89 209Q81 205 81 214V234Q81 244 89 240L119 226V221L89 209ZM167 209Q175 205 175 214V234Q175 244 167 240L137 226V221L167 209Z" fill="currentColor"/><rect x="116" y="215" width="24" height="20" rx="6" fill="currentColor"/></svg>

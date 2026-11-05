@@ -12,12 +12,20 @@ mkdirSync(distDir, { recursive: true });
 const svg = readFileSync(new URL('openbutler.svg', sourceDir));
 const sourceText = svg.toString('utf8');
 if (!sourceText.includes('</svg>')) throw new Error('The canonical brand SVG is invalid.');
-
-const themedSvg = sourceText.replace('</svg>', '<style>@media (prefers-color-scheme: dark) { path { fill: #fff; } }</style></svg>');
+// Both logo eras have to work. A currentColor logo flips the one inherited token for the dark
+// favicon (overriding fill there would repaint stroked and fill="none" shapes); an explicit-fill
+// logo keeps the old fill override.
+const usesCurrentColor = sourceText.includes('currentColor');
+const darkRule = usesCurrentColor ? 'svg { color: #fff; }' : 'path { fill: #fff; }';
+const themedSvg = sourceText.replace('</svg>', `<style>@media (prefers-color-scheme: dark) { ${darkRule} }</style></svg>`);
 const generated = new Map([['favicon.svg', Buffer.from(themedSvg)]]);
 
+// sharp builds no DOM: a currentColor logo rasterizes from the file's own declared color token.
+const colorToken = sourceText.match(/color="(#[0-9A-Fa-f]{3,8})"/)?.[1] ?? '#000000';
+const rasterSource = usesCurrentColor ? Buffer.from(sourceText.replaceAll('currentColor', colorToken)) : svg;
+
 for (const size of [16, 32, 48, 180]) {
-  const png = await sharp(svg)
+  const png = await sharp(rasterSource)
     .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
     .png({ compressionLevel: 9 })
     .toBuffer();

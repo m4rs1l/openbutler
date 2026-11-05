@@ -1,5 +1,10 @@
 # OpenButler
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="src/assets/branding/mascot-dark.svg">
+  <img src="src/assets/branding/mascot-color.svg" alt="OpenButler" width="360">
+</picture>
+
 OpenButler is a general-purpose AI agent for the terminal. It runs as one background host on your machine and answers from a terminal UI, from Telegram, or from a browser client. It uses local tools, MCP servers, Agent Skills, and durable memory.
 
 ## Install
@@ -297,8 +302,10 @@ Approvals/Stop reply keyboard that is removed again on unpair, disable, or reset
 Login startup (`openbutler daemon autostart on`; `openbutler daemon install` also works)
 carries the token too: on macOS it is embedded in the managed LaunchAgent (written
 0600), on Linux the unit reads an optional 0600 env file, on Windows the user
-environment already covers logon. Rewiring happens automatically during setup;
-`reset` unwires it again.
+environment already covers logon. It installs two independent per-user entries —
+a host service running `daemon run` and, when `--web` is given, a separate
+browser-client service running `web --serve` — so starting the host alone leaves
+web off. Rewiring happens automatically during setup; `reset` unwires it again.
 
 On servers, provide the token through the service manager (systemd
 `EnvironmentFile`, Docker `-e`, Task Scheduler environment) and run
@@ -312,14 +319,17 @@ openbutler telegram setup --token-env=TELEGRAM_BOT_TOKEN --workspace=/srv/openbu
 
 `openbutler web` serves a browser client from this machine and pushes the same session
 over one server-sent event stream; rendering happens in the browser, so the host
-process stays where it is.
+process stays where it is. The browser client is a client, not a backend: it
+requires a running background host (`openbutler daemon start`) and never starts
+one. `openbutler daemon start --web` is the explicit way to start both processes.
 
 ```sh
 openbutler web [--port 45278] [--hostname 127.0.0.1] [--dir path/to/project] [--pair]
 ```
 
 Plain `openbutler web` starts the server in the background and prints its address;
-paired browsers reconnect on their own. Pairing is explicit: `openbutler web --pair`
+it attaches to an already-running host and fails if none is running. Paired browsers
+reconnect on their own. Pairing is explicit: `openbutler web --pair`
 runs a pairing session in this terminal, prints a one-time link that expires in
 five minutes, and sets an HttpOnly session cookie when opened. Press Enter for a
 fresh link; Ctrl+C stops the session. The address binds loopback by default;
