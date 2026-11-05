@@ -18,7 +18,7 @@ export function createQuestionTool(): ToolDefinition {
     providerId: 'host',
     name: 'question',
     description:
-      'Ask the user one direct question during a run and wait for their answer. Provide short options when you can enumerate the likely answers; the user can still reply in their own words. Use it for a blocking choice or a missing detail you cannot discover with tools or safe defaults — not for progress updates or rhetorical questions. If no interactive user is attached, use send_message_to_owner for a necessary owner question when available; a worker reports it to its parent with parent_message or its final report. Otherwise preserve the blocker in the closing report. Continue independent work while awaiting a required answer; silence is not approval.',
+      'Ask the user one direct question during a run and wait for their answer. Provide short options when you can enumerate the likely answers; the user can still reply in their own words. Use it for a blocking choice or a missing detail you cannot discover with tools or safe defaults — not for progress updates or rhetorical questions. If no interactive user is attached, ask in your final reply; a worker reports it to its parent with parent_message or its final report. Preserve the blocker rather than guessing. Continue independent work while awaiting a required answer; silence is not approval.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -61,7 +61,7 @@ export function createQuestionTool(): ToolDefinition {
         return {
           status: 'unavailable',
           error:
-            'No interactive user is attached to this run. Use send_message_to_owner when available; workers report to their parent. Otherwise record the question in your closing report. Continue independent work; do not assume a required answer.',
+            'No interactive user is attached to this run. Ask in your final reply; workers report to their parent. Continue independent work; do not assume a required answer.',
         };
       }
       const answer = await context.ask({ text: question, ...(options ? { options } : {}) }, signal);

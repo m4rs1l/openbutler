@@ -224,13 +224,63 @@ describe('live runtime settings', () => {
     );
     const saved = settings.loadSettings();
     await runtime.reloadSettings!();
-    expect(runtime.contextWindowTokens).toBe(1048576);
+    // Capabilities refresh with the catalog, but the explicit settings window
+    // survives it: an owner-set context wins over the catalog value.
+    expect(runtime.contextWindowTokens).toBe(100_000);
     expect(runtime.outputLimitTokens).toBe(32768);
     expect(runtime.reasoningVariants.map((variant) => variant.id)).toEqual(['default', 'low', 'high']);
     expect(runtime.reasoningMetadataSource).toBe('mirror');
     expect(settings.loadSettings()).toEqual(saved);
     await runtime.reloadSettings!();
     expect(calls.build).toHaveBeenCalledTimes(3);
+  });
+
+  it('lets an explicit modelSpecs context win over the catalog window in both directions', async () => {
+    const overridden = settings.loadSettings();
+    overridden.providers.vercel!.modelSpecs = { mimo: { context: 500_000 } };
+    settings.saveSettings(overridden);
+    await runtime.reloadSettings!();
+    // The catalog still reports 100000 for this model; the explicit value wins.
+    expect(runtime.contextWindowTokens).toBe(500_000);
+
+    await runtime.selectModel('vercel', 'minimax');
+    // No explicit window for this model, so the catalog limit applies again.
+    expect(runtime.contextWindowTokens).toBe(100_000);
+  });
+
+  it('resolves window and output from the same authority at every call site', async () => {
+    const catalog = await import('../src/provider/catalog.js');
+    catalog.writeCatalogSnapshot(
+      {
+        vercel: {
+          npm: '@ai-sdk/gateway',
+          models: {
+            mimo: { tool_call: true, limit: { context: 100_000, output: 32_768 } },
+            minimax: { tool_call: true, limit: { context: 100_000, output: 32_768 } },
+          },
+        },
+      },
+      new Date().toISOString(),
+    );
+    // Settings names only the window: output still falls back to the catalog
+    // instead of reversing the priority (the 2026-11-03 divergence bug).
+    const windowOnly = settings.loadSettings();
+    windowOnly.providers.vercel!.modelSpecs = { mimo: { context: 500_000 } };
+    settings.saveSettings(windowOnly);
+    await runtime.reloadSettings!();
+    expect(runtime.contextWindowTokens).toBe(500_000);
+    expect(runtime.outputLimitTokens).toBe(32_768);
+
+    // Settings names both: both win, on creation and across a model switch.
+    const both = settings.loadSettings();
+    both.providers.vercel!.modelSpecs = { mimo: { context: 500_000, output: 4_096 } };
+    settings.saveSettings(both);
+    await runtime.reloadSettings!();
+    expect(runtime.contextWindowTokens).toBe(500_000);
+    expect(runtime.outputLimitTokens).toBe(4_096);
+    await runtime.selectModel('vercel', 'minimax');
+    expect(runtime.contextWindowTokens).toBe(100_000);
+    expect(runtime.outputLimitTokens).toBe(32_768);
   });
 
   it('restores another chat model without changing defaults or the first runtime', async () => {

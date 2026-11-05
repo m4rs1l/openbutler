@@ -44,7 +44,7 @@ it("rebuilds every tool schema through the run's sanitizer when one is given", a
     });
 
     expect(seen.length).toBe(catalogue.length);
-    expect(seen).toContain(catalogue.find((definition) => definition.name === 'send_message_to_owner')?.inputSchema);
+    expect(seen).toContain(catalogue.find((definition) => definition.name === 'inbox')?.inputSchema);
     expect(Object.keys(built.tools).length).toBe(catalogue.length);
   } finally {
     await memoryIndex.close();

@@ -73,29 +73,44 @@ const ALWAYS_OFFERED = [
   'session_list',
   'session_search',
   'session_read',
-  'send_message_to_owner',
   'inbox',
   'team_send',
   'team_group',
   'team_history',
   'team_status',
-  'team_remember',
   'team_send_file',
   'team_receive_file',
   'team_files',
-  'session_message',
   'subagent',
-  'parent_message',
   'subagent_stop',
   'mcp_manage',
   'schedule',
 ];
 
 describe('tool catalogue', () => {
-  it('offers every host tool to every session, even with no host handlers', () => {
+  it('offers every session-level host tool to every session, even with no host handlers', () => {
     const names = catalogueNames();
     for (const name of ALWAYS_OFFERED) expect(names).toContain(name);
-    for (const retired of ['read_owner_messages', 'team_inbox', 'subagent_poll']) expect(names).not.toContain(retired);
+    for (const retired of ['read_owner_messages', 'team_inbox', 'subagent_poll', 'team_remember']) expect(names).not.toContain(retired);
+  });
+
+  it('leaves every authority-and-messaging tool out of the shared catalogue', () => {
+    // These names are the addressee, and a runtime only holds the ones it can
+    // reach: the owner channel and the way into a chat belong to the custodian,
+    // reporting upward belongs to sessions, and the parent channel belongs to
+    // workers. A catalogue that listed them would offer every layer a tool it may
+    // not use.
+    const names = catalogueNames();
+    for (const layered of ['send_message_to_owner', 'session_message', 'custodian_message', 'worker_message', 'parent_message'])
+      expect(names).not.toContain(layered);
+  });
+
+  it('never puts the owner-channel tool in the shared catalogue', () => {
+    // The owner channel belongs to the custodian layer, so the catalogue does not
+    // carry it: the runtime that owns it registers it. Listing it here - even as
+    // an unavailable stub - would offer every chat and worker a capability it does
+    // not have.
+    expect(catalogueNames()).not.toContain('send_message_to_owner');
   });
 
   it('answers unavailable instead of vanishing when a handler is absent', async () => {

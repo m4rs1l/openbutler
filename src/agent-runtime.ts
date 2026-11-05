@@ -1,6 +1,7 @@
 import type { InboxRequest } from './inbox.js';
 import type { ParentMessageInput } from './worker-records.js';
 import { canonicalScopeRoot as canonicalWorkspaceRoot } from './workspace-origin.js';
+import { resolveContextBudget } from './context-budget.js';
 import type { LanguageModel } from 'ai';
 import { getCatalogIndex, getCatalogRevision, isCatalogLoaded } from './provider/catalog.js';
 import { resolveModelName, resolveProviderName } from './provider/model-presentation.js';
@@ -40,6 +41,12 @@ import type { AgentEnvironment } from './agent-session.js';
 import type { UsageRecordInput } from './usage/recorder.js';
 import type { SubagentRequest } from './tools/subagent.js';
 import type { McpConnectionManager } from './tools/mcp.js';
+import { createSendMessageToOwnerTool } from './tools/owner-communication.js';
+import { createCustodianMessageTool } from './tools/custodian-message.js';
+import { createSessionMessageTool } from './tools/session-message.js';
+import { createWorkerMessageTool } from './tools/worker-message.js';
+import { createApprovalDecideTool } from './tools/approval-decide.js';
+import { createSessionNewTool } from './tools/session-new.js';
 
 /** A session cannot manage its context safely without a verified model limit.
  * Never silently invent an arbitrary 8k/32k window for unknown providers.
@@ -57,6 +64,12 @@ export interface CreateAgentRuntimeOptions {
   workspaceRoot?: string;
   /** Restore a conversation's model without changing the machine's defaults. */
   initialModel?: { providerId: string; modelId: string };
+  /**
+   * The head's configured compaction budget, as a function so it is read at the
+   * compaction decision rather than frozen when the runtime was built. Only the
+   * custodian runtime is given one.
+   */
+  custodianContextLimitTokens?: () => number | undefined;
   /** Interactive chats open before external tools connect; the first turn prepares them. */
   deferMcp?: boolean;
   /** Borrowed from the daemon; closing a chat never closes shared transports. */
@@ -65,7 +78,8 @@ export interface CreateAgentRuntimeOptions {
   onMcpConnected?: (serverId: string, toolCount: number) => void;
   backgroundManage?: (input: Record<string, unknown>, workspaceRoot: string, senderSessionId: string | undefined) => Promise<unknown>;
   inbox?: (request: InboxRequest, sessionId: string | undefined) => Promise<unknown>;
-  ownerMessageSend?: (input: Record<string, unknown>, workspaceRoot: string, senderSessionId?: string) => Promise<unknown>;
+  /** Owner-channel writer. Only the custodian runtime is given one, and its presence is what registers the tool. */
+  ownerMessageSend?: (input: Record<string, unknown>, workspaceRoot: string) => Promise<unknown>;
   teamDelivery?: (input: Record<string, unknown>) => Promise<unknown>;
   teamSend?: (input: { recipient: string; text: string; replyTo?: string }) => Promise<unknown>;
   teamGroup?: (limit: number, acknowledge?: number) => Promise<unknown>;
@@ -76,8 +90,19 @@ export interface CreateAgentRuntimeOptions {
   teamFiles?: () => Promise<unknown>;
   teamProfile?: (input: Record<string, unknown>) => Promise<unknown>;
   teamWork?: (input: Record<string, unknown>) => Promise<unknown>;
-  teamRemember?: (input: { topic: 'decisions' | 'shared'; text: string }) => Promise<unknown>;
+  /** A session's channel to the head. Supplied to session runtimes only. */
+  custodianMessage?: (
+    input: { text: string; kind: 'progress' | 'result' },
+    senderSessionId: string | undefined,
+  ) => Promise<unknown> | unknown;
+  /** The head's way into a chat. Supplied to the custodian runtime only. */
   sessionMessage?: (input: Record<string, unknown>, senderSessionId: string | undefined) => Promise<unknown> | unknown;
+  /** The head's verb for a delegated approval. Supplied to the custodian runtime only. */
+  approvalDecide?: (input: { requestId: string; decision: 'allow' | 'deny' }, senderSessionId: string | undefined) => unknown;
+  /** The head's way to start a durable chat. Supplied to the custodian runtime only. */
+  sessionNew?: (input: { instruction: string }, senderSessionId: string | undefined) => Promise<unknown> | unknown;
+  /** Steering a live worker. Supplied wherever a runtime may own one. */
+  workerMessage?: (input: { session: string; text: string }, senderSessionId: string | undefined) => Promise<unknown> | unknown;
   subagent?: (request: SubagentRequest, senderSessionId: string | undefined, signal?: AbortSignal) => Promise<unknown> | unknown;
   parentMessage?: (input: ParentMessageInput, senderSessionId: string | undefined) => Promise<unknown> | unknown;
   subagentStop?: (input: { session: string }, senderSessionId: string | undefined) => Promise<unknown> | unknown;
@@ -124,11 +149,12 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
   const resolved = await createLanguageModel(providerId, modelId, provider, createPayloadFetch(provider, modelId), reportRetry);
   if (!resolved.ok) throw new Error(resolved.error.reason);
   const reasoningCatalog = findReasoningCatalogMatch(providerId, modelId, resolved.resolved);
-  const contextWindowTokens = requireModelContextWindow(
-    reasoningCatalog.model?.limit?.context ?? provider.modelSpecs?.[modelId]?.context,
-    providerId,
-    modelId,
-  );
+  // An explicit settings window is authoritative over the catalog: the owner may
+  // cap a model below its advertised limit or give a model the catalog lacks one.
+  // One resolver decides window and output together so the two can never read
+  // opposite orderings at the same call site.
+  const budget = resolveContextBudget(provider.modelSpecs?.[modelId], reasoningCatalog.model?.limit);
+  const contextWindowTokens = requireModelContextWindow(budget.window, providerId, modelId);
   const catalogVariants = listReasoningVariants(resolved.resolved, reasoningCatalog.model);
   const reasoningVariants = [
     ...catalogVariants,
@@ -201,7 +227,6 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         },
         ...(options.backgroundManage ? { backgroundManage: options.backgroundManage } : {}),
         ...(options.inbox ? { inbox: options.inbox } : {}),
-        ...(options.ownerMessageSend ? { ownerMessageSend: options.ownerMessageSend } : {}),
         ...(options.teamDelivery ? { teamDelivery: options.teamDelivery } : {}),
         ...(options.teamSend ? { teamSend: options.teamSend } : {}),
         ...(options.teamGroup ? { teamGroup: options.teamGroup } : {}),
@@ -212,14 +237,22 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         ...(options.teamFiles ? { teamFiles: options.teamFiles } : {}),
         ...(options.teamProfile ? { teamProfile: options.teamProfile } : {}),
         ...(options.teamWork ? { teamWork: options.teamWork } : {}),
-        ...(options.teamRemember ? { teamRemember: options.teamRemember } : {}),
-        ...(options.sessionMessage ? { sessionMessage: options.sessionMessage } : {}),
         ...(options.subagent ? { subagent: options.subagent } : {}),
-        ...(options.parentMessage ? { parentMessage: options.parentMessage } : {}),
         ...(options.subagentStop ? { subagentStop: options.subagentStop } : {}),
       })) {
         registry.register(definition);
       }
+      // Messaging tools are named after their addressee and none of them is in the
+      // shared catalogue: a runtime registers the ones it is handed a handler for.
+      // That is the layer table in one place - a chat holds custodian_message and
+      // worker_message, the head holds session_message and worker_message, and a
+      // worker's registry is built by the host with parent_message instead.
+      if (options.ownerMessageSend) registry.register(createSendMessageToOwnerTool(scopeRoot, options.ownerMessageSend));
+      if (options.sessionMessage) registry.register(createSessionMessageTool(options.sessionMessage));
+      if (options.custodianMessage) registry.register(createCustodianMessageTool(options.custodianMessage));
+      if (options.workerMessage) registry.register(createWorkerMessageTool(options.workerMessage));
+      if (options.approvalDecide) registry.register(createApprovalDecideTool(options.approvalDecide));
+      if (options.sessionNew) registry.register(createSessionNewTool(options.sessionNew));
       return registry;
     }
     let activeResolved = resolved.resolved;
@@ -254,11 +287,8 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       );
       if (!next.ok) throw new Error(next.error.reason);
       const nextCatalog = findReasoningCatalogMatch(nextProviderId, nextModelId, next.resolved);
-      const nextContextWindowTokens = requireModelContextWindow(
-        nextCatalog.model?.limit?.context ?? nextProvider.modelSpecs?.[nextModelId]?.context,
-        nextProviderId,
-        nextModelId,
-      );
+      const nextBudget = resolveContextBudget(nextProvider.modelSpecs?.[nextModelId], nextCatalog.model?.limit);
+      const nextContextWindowTokens = requireModelContextWindow(nextBudget.window, nextProviderId, nextModelId);
       const nextCatalogVariants = listReasoningVariants(next.resolved, nextCatalog.model);
       const nextVariants = [
         ...nextCatalogVariants,
@@ -280,7 +310,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       runtime.providerId = nextProviderId;
       runtime.modelId = nextModelId;
       runtime.contextWindowTokens = nextContextWindowTokens;
-      runtime.outputLimitTokens = nextCatalog.model?.limit?.output ?? nextProvider.modelSpecs?.[nextModelId]?.output ?? null;
+      runtime.outputLimitTokens = nextBudget.output;
       runtime.supportsVision = modelSupportsVision(nextProviderId, nextModelId, next.resolved);
       runtime.supportsImageToolResult = supportsImageToolResult(next.resolved, nextModelId);
       runtime.reasoningVariants = nextVariants;
@@ -302,7 +332,12 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       providerId,
       modelId,
       contextWindowTokens,
-      outputLimitTokens: reasoningCatalog.model?.limit?.output ?? provider.modelSpecs?.[modelId]?.output ?? null,
+      // Read at the compaction decision, not frozen when the runtime was built: the
+      // owner may change the budget without restarting the host.
+      get custodianContextLimitTokens() {
+        return options.custodianContextLimitTokens?.();
+      },
+      outputLimitTokens: budget.output,
       supportsVision: modelSupportsVision(providerId, modelId, activeResolved),
       supportsImageToolResult: supportsImageToolResult(resolved.resolved, modelId),
       disableImageInput: () => {

@@ -132,6 +132,28 @@ export class ToolRegistry {
     return this.definitions.get(identity)?.title;
   }
 
+  /**
+   * A registry holding only the named host tools of this one. Names that do not
+   * exist here are skipped, so a caller states what a session may use and gets
+   * exactly that; a session never sees a tool it was not granted.
+   */
+  subset(names: readonly string[]): ToolRegistry {
+    const scoped = new ToolRegistry();
+    const wanted = new Set(names);
+    // Host tools first: a granted name means the machine's own tool when both a
+    // host tool and a provider tool carry it.
+    for (const definition of this.definitions.values()) {
+      if (definition.providerId === 'host' && wanted.has(definition.name)) {
+        scoped.register(definition);
+        wanted.delete(definition.name);
+      }
+    }
+    for (const definition of this.definitions.values()) {
+      if (wanted.has(definition.name)) scoped.register(definition);
+    }
+    return scoped;
+  }
+
   register(definition: ToolDefinition): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(definition.providerId)) {
       throw new Error(`Invalid tool provider id: ${definition.providerId}`);
@@ -174,8 +196,6 @@ export class ToolRegistry {
     sessionId?: string;
     /** Worker write lease check, passed through to tools that write files. */
     guardWrite?: (absolutePath: string) => string | null;
-    /** When set, only these tool names are offered to the model for this run (worker tool sets). */
-    allowTools?: readonly string[];
     /** Rebuilds every tool schema for the run's provider before it reaches the model. */
     schemaSanitizer?: (schema: Record<string, unknown>) => Record<string, unknown>;
     onStart?: (request: ToolCallRequest, toolCallId?: string) => void;
@@ -350,16 +370,16 @@ export class ToolRegistry {
         if (autoReviewDenied) {
           result = {
             status: 'denied',
-            error: `Auto-review denied this exact action: ${outcome?.reason ?? ''} Do not retry it, change its wording, or switch tools to bypass the decision. Only propose a materially safer alternative or ask the user.`,
+            error: `Auto-review denied this exact action: ${outcome?.reason ?? ''} Do not retry it, change its wording, or switch tools to bypass the decision. Propose a materially safer alternative or drop this line of work and say so in your report.`,
           };
         } else if (approvalTimedOut) {
           const seconds = outcome?.timeoutSeconds ?? 60;
           result = {
             status: 'denied',
-            error: `No approval decision within ${seconds} seconds: nobody approved or declined, so the action was not run. This is not a refusal on the merits. Work around it: propose a materially safer alternative that needs no approval, defer the action, or ask the user about it in chat.`,
+            error: `No approval decision within ${seconds} seconds: nobody approved or declined, so the action was not run. This is not a refusal on the merits. Work around it: propose a materially safer alternative that needs no approval, defer it, and name the blocked action in your report.`,
           };
         } else {
-          result = { status: 'denied', error: 'The user declined this tool call. It was not run.' };
+          result = { status: 'denied', error: 'The approval was declined. The tool call was not run.' };
         }
         try {
           await options.onAction?.(request, 'denied', { result });
@@ -471,7 +491,6 @@ export class ToolRegistry {
     };
 
     for (const definition of this.definitions.values()) {
-      if (options.allowTools && !options.allowTools.includes(definition.name)) continue;
       const identity = `${definition.providerId}:${definition.name}`;
       const isMcpTool = definition.providerId.startsWith('mcp-');
       const rawName =

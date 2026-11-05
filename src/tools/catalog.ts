@@ -1,5 +1,4 @@
 import type { InboxRequest } from '../inbox.js';
-import type { ParentMessageInput } from '../worker-records.js';
 import type { MemoryIndex } from '../memory-index.js';
 import { createScheduleTool } from './schedule.js';
 import { createExecuteCommandTool } from './execute-command.js';
@@ -10,24 +9,20 @@ import { createWriteTool } from './file-write.js';
 import { createMcpManagementTool, type McpConnectionManager } from './mcp.js';
 import { createMemorySearchTool } from './memory-search.js';
 import { createMemoryWriteTool } from './memory-write.js';
-import { createParentMessageTool } from './parent-message.js';
 import { createQuestionTool } from './question.js';
 import { createSessionListTool } from './session-list.js';
-import { createSessionMessageTool } from './session-message.js';
 import { createSessionReadTool } from './session-read.js';
 import { createSessionSearchTool } from './session-search.js';
 import { createInboxTool } from './inbox.js';
 import { createSubagentStopTool } from './subagent-stop.js';
 import { createSubagentTool, type SubagentRequest } from './subagent.js';
 import type { ToolDefinition } from './registry.js';
-import { createSendMessageToOwnerTool } from './owner-communication.js';
 import { createTeamProfileTool, createTeamWorkTool } from './team-coordination.js';
 import {
   createTeamFilesTool,
   createTeamGroupTool,
   createTeamHistoryTool,
   createTeamReceiveFileTool,
-  createTeamRememberTool,
   createTeamSendFileTool,
   createTeamSendTool,
   createTeamDeliveryTool,
@@ -43,7 +38,6 @@ export interface ToolCatalogueOptions {
   onMcpConnectionsChanged: () => void;
   backgroundManage?: (input: Record<string, unknown>, workspaceRoot: string, senderSessionId: string | undefined) => Promise<unknown>;
   inbox?: (request: InboxRequest, sessionId: string | undefined) => Promise<unknown>;
-  ownerMessageSend?: (input: Record<string, unknown>, workspaceRoot: string, senderSessionId?: string) => Promise<unknown>;
   teamDelivery?: (input: Record<string, unknown>) => Promise<unknown>;
   teamSend?: (input: { recipient: string; text: string; replyTo?: string }) => Promise<unknown>;
   teamGroup?: (limit: number, acknowledge?: number) => Promise<unknown>;
@@ -54,10 +48,7 @@ export interface ToolCatalogueOptions {
   teamFiles?: () => Promise<unknown>;
   teamProfile?: (input: Record<string, unknown>) => Promise<unknown>;
   teamWork?: (input: Record<string, unknown>) => Promise<unknown>;
-  teamRemember?: (input: { topic: 'decisions' | 'shared'; text: string }) => Promise<unknown>;
-  sessionMessage?: (input: Record<string, unknown>, senderSessionId: string | undefined) => Promise<unknown> | unknown;
   subagent?: (request: SubagentRequest, senderSessionId: string | undefined, signal?: AbortSignal) => Promise<unknown> | unknown;
-  parentMessage?: (input: ParentMessageInput, senderSessionId: string | undefined) => Promise<unknown> | unknown;
   subagentStop?: (input: { session: string }, senderSessionId: string | undefined) => Promise<unknown> | unknown;
 }
 
@@ -66,12 +57,19 @@ export interface ToolCatalogueOptions {
  * native, memory, MCP, and background surfaces compose into one catalogue.
  * Definitions stay the mechanism; this module is the structure.
  *
- * Every session sees every tool, always. A missing host handler is not a
- * missing tool: the tool is still offered and answers `unavailable` with the
- * reason, so the model learns the boundary from one call instead of guessing
- * from an absent name. (Worker sandboxes are the only exception: `allowTools`
- * narrows what a worker is offered, and that narrowing is containment, not a
- * condition on sessions.)
+ * Every session sees every tool in this catalogue, always. A missing host
+ * handler is not a missing tool: the tool is still offered and answers
+ * `unavailable` with the reason, so the model learns the boundary from one call
+ * instead of guessing from an absent name. (A worker's toolkit is a registry of
+ * its own, built from what its spawn granted; that narrowing is containment, not
+ * a condition on sessions.)
+ *
+ * Tools that address one layer are not in here at all. The owner channel belongs
+ * to the custodian, and messaging is named after its addressee, so those are
+ * registered by the runtime that owns them (`src/agent-runtime.ts`), and every
+ * other runtime is
+ * unaware of the name rather than told it is unavailable. A tool listed but
+ * refused is a promise with small print.
  */
 export function createToolCatalogue(options: ToolCatalogueOptions): ToolDefinition[] {
   const unavailable = (name: string) => async () => ({
@@ -91,9 +89,7 @@ export function createToolCatalogue(options: ToolCatalogueOptions): ToolDefiniti
     createSessionListTool(options.workspaceRoot),
     createSessionSearchTool(options.workspaceRoot),
     createSessionReadTool(),
-    createSendMessageToOwnerTool(options.workspaceRoot, options.ownerMessageSend ?? unavailable('send_message_to_owner')),
     createInboxTool(options.inbox ?? unavailable('inbox')),
-    createSessionMessageTool(options.sessionMessage ?? (async () => ({ status: 'unavailable' as const }))),
     createTeamDeliveryTool(options.teamDelivery ?? (async () => ({ status: 'unavailable', error: 'Team delivery is not available.' }))),
     createTeamSendTool(options.teamSend ?? unavailable('team_send')),
     createTeamGroupTool(options.teamGroup ?? unavailable('team_group')),
@@ -104,11 +100,7 @@ export function createToolCatalogue(options: ToolCatalogueOptions): ToolDefiniti
     createTeamFilesTool(options.teamFiles ?? unavailable('team_files')),
     createTeamProfileTool(options.teamProfile ?? unavailable('team_profile')),
     createTeamWorkTool(options.teamWork ?? unavailable('team_work')),
-    createTeamRememberTool(
-      options.teamRemember ?? (async () => ({ status: 'unavailable' as const, error: 'team_remember is not available in this session.' })),
-    ),
     createSubagentTool(options.subagent ?? (async () => ({ status: 'unavailable' as const }))),
-    createParentMessageTool(options.parentMessage ?? (async () => ({ status: 'unavailable' as const }))),
     createSubagentStopTool(options.subagentStop ?? (async () => ({ status: 'unavailable' as const }))),
     createScheduleTool(
       options.workspaceRoot,
