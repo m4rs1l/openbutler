@@ -87,33 +87,40 @@ export function listProjects(): Project[] {
   return readProjects().map((project) => ({ ...project, available: available(project) }));
 }
 
-export function createProject(input: unknown): Project {
-  if (!input || typeof input !== 'object') throw new ProjectInputError('Enter the project details.');
-  const { name, folders } = input as Record<string, unknown>;
-  if (typeof name !== 'string' || !name.trim() || name.trim().length > 80 || /[\x00-\x1f]/.test(name))
+/**
+ * The owner types the name; a folder path never names a project. Every write
+ * goes through these two validators, so create and update cannot drift apart.
+ */
+function projectName(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 80 || /[\x00-\x1f]/.test(value))
     throw new ProjectInputError('A project name must be 1 to 80 characters.');
-  if (!Array.isArray(folders) || folders.length === 0 || folders.length > MAX_FOLDERS)
+  return value.trim();
+}
+
+function projectFolders(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_FOLDERS)
     throw new ProjectInputError(`Add 1 to ${MAX_FOLDERS} source folders.`);
   const unique = new Map<string, string>();
-  for (const folder of folders) {
+  for (const folder of value) {
     const canonical = projectFolder(folder);
     unique.set(key(canonical), canonical);
   }
-  const projects = readProjects();
-  if (projects.length >= MAX_PROJECTS) throw new ProjectInputError('The project limit has been reached.');
-  if (projects.some((project) => project.name.toLocaleLowerCase('tr') === name.trim().toLocaleLowerCase('tr')))
+  return [...unique.values()];
+}
+
+function assertNameFree(projects: readonly StoredProject[], name: string, exceptId?: string): void {
+  const wanted = name.toLocaleLowerCase('tr');
+  if (projects.some((project) => project.id !== exceptId && project.name.toLocaleLowerCase('tr') === wanted))
     throw new ProjectInputError('A project with this name already exists.');
-  const project: StoredProject = {
-    id: randomUUID(),
-    name: name.trim(),
-    folders: [...unique.values()],
-    createdAt: new Date().toISOString(),
-  };
+}
+
+/** One atomic write path: temp file, then rename. Both mutations use it. */
+function writeProjects(projects: readonly StoredProject[]): void {
   const file = getDataPath('projects.json');
   mkdirSync(dirname(file), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(temporary, JSON.stringify({ version: 1, projects: [...projects, project] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    writeFileSync(temporary, JSON.stringify({ version: 1, projects }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
     renameSync(temporary, file);
   } catch (error) {
     try {
@@ -123,7 +130,47 @@ export function createProject(input: unknown): Project {
     }
     throw error;
   }
+}
+
+export function createProject(input: unknown): Project {
+  if (!input || typeof input !== 'object') throw new ProjectInputError('Enter the project details.');
+  const { name, folders } = input as Record<string, unknown>;
+  const ownerName = projectName(name);
+  const ownerFolders = projectFolders(folders);
+  const projects = readProjects();
+  if (projects.length >= MAX_PROJECTS) throw new ProjectInputError('The project limit has been reached.');
+  assertNameFree(projects, ownerName);
+  const project: StoredProject = {
+    id: randomUUID(),
+    name: ownerName,
+    folders: ownerFolders,
+    createdAt: new Date().toISOString(),
+  };
+  writeProjects([...projects, project]);
   return { ...project, available: true };
+}
+
+/**
+ * Rename or repoint an existing project. The name stays whatever the owner
+ * typed - editing folders never rewrites it - and id and createdAt are stable,
+ * so chats already bound to the project keep pointing at it.
+ */
+export function updateProject(id: unknown, input: unknown): Project {
+  if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new ProjectInputError('Project not found.');
+  if (!input || typeof input !== 'object') throw new ProjectInputError('Enter the project details.');
+  const { name, folders } = input as Record<string, unknown>;
+  if (name === undefined && folders === undefined) throw new ProjectInputError('Nothing to update.');
+  const projects = readProjects();
+  const index = projects.findIndex((project) => project.id === id);
+  if (index < 0) throw new ProjectInputError('Project not found.');
+  const current = projects[index]!;
+  const nextName = name === undefined ? current.name : projectName(name);
+  const nextFolders = folders === undefined ? current.folders : projectFolders(folders);
+  assertNameFree(projects, nextName, id);
+  const updated: StoredProject = { ...current, name: nextName, folders: nextFolders };
+  projects[index] = updated;
+  writeProjects(projects);
+  return { ...updated, available: available(updated) };
 }
 
 /** Resolve once at queue admission. A queued turn keeps the owner's chosen scope. */
