@@ -11,25 +11,32 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 let root: string;
 let entry: string;
-let registryValue: string | null;
+let registry: Record<string, string>;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'openbutler-autostart-check-'));
   vi.stubEnv('OPENBUTLER_DATA_DIR', root);
   vi.stubEnv('OPENBUTLER_TEST_SECRET', 'must-not-be-in-launcher');
   entry = process.argv[1]!;
   process.argv[1] = join(root, 'OpenButler CLI', 'cli.js');
-  registryValue = null;
+  registry = {};
   vi.resetModules();
   commands.run.mockReset();
   commands.run.mockImplementation((program: string, args: string[]) => {
     if (program !== 'reg.exe') throw new Error('Unexpected OS command in fixture.');
+    const value = args[args.indexOf('/v') + 1]!;
     if (args[0] === 'query')
-      return registryValue === null
+      return registry[value] === undefined
         ? { status: 1, stdout: '', stderr: 'Not found' }
-        : { status: 0, stdout: `OpenButler REG_SZ ${registryValue}`, stderr: '' };
-    if (args[0] === 'add') registryValue = args[args.indexOf('/d') + 1]!;
-    if (args[0] === 'delete') registryValue = null;
-    return { status: 0, stdout: '', stderr: '' };
+        : { status: 0, stdout: `${value} REG_SZ ${registry[value]}`, stderr: '' };
+    if (args[0] === 'add') {
+      registry[value] = args[args.indexOf('/d') + 1]!;
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'delete') {
+      delete registry[value];
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    throw new Error(`Unexpected reg.exe verb in fixture: ${String(args[0])}`);
   });
 });
 afterEach(() => {
@@ -39,6 +46,9 @@ afterEach(() => {
     throw new Error('Unsafe fixture cleanup path.');
   rmSync(root, { recursive: true, force: true });
 });
+
+const hostLauncher = (): string => join(root, 'autostart', 'openbutler-logon.vbs');
+const webLauncher = (): string => join(root, 'autostart', 'openbutler-web-logon.vbs');
 
 describe('login startup Telegram wiring (cross-platform builders)', () => {
   it('embeds the token inline in the macOS agent and escapes XML', async () => {
@@ -63,15 +73,38 @@ describe('login startup Telegram wiring (cross-platform builders)', () => {
     expect(plain).toContain('Environment="OPENBUTLER_DATA_DIR=/data"');
   });
 
-  it('puts the web binding in the login command instead of a second service', async () => {
+  it('keeps the host unit free of web and gives the browser client its own unit', async () => {
     const service = await import('../src/daemon-autostart.js');
-    const unit = service.buildLinuxUnit(
+    const host = service.buildLinuxUnit('/bin/openbutler', ['/app/cli.js', 'daemon', 'run'], '/data', null);
+    expect(host).toContain('"daemon" "run"');
+    expect(host).not.toContain('--web');
+    expect(host).not.toContain('openbutler-web.service');
+
+    const web = service.buildLinuxWebUnit(
       '/bin/openbutler',
-      ['/app/cli.js', 'daemon', 'run', '--web', '--port', '45278', '--hostname', '0.0.0.0', '--dir', '/work'],
+      ['/app/cli.js', 'web', '--serve', '--port', '45278', '--hostname', '0.0.0.0', '--dir', '/work'],
       '/data',
-      null,
     );
-    expect(unit).toContain('"daemon" "run" "--web" "--port" "45278" "--hostname" "0.0.0.0" "--dir" "/work"');
+    expect(web).toContain('"web" "--serve" "--port" "45278" "--hostname" "0.0.0.0" "--dir" "/work"');
+    expect(web).toContain('After=openbutler.service');
+    expect(web).toContain('Wants=openbutler.service');
+    expect(web).not.toContain('daemon"');
+  });
+
+  it('labels the macOS host and web agents independently', async () => {
+    const service = await import('../src/daemon-autostart.js');
+    const host = service.buildMacosDocument('/bin/openbutler', ['/app/cli.js', 'daemon', 'run'], '/data', '/data/daemon.log', {});
+    const web = service.buildMacosDocument(
+      '/bin/openbutler',
+      ['/app/cli.js', 'web', '--serve'],
+      '/data',
+      '/data/daemon.log',
+      {},
+      undefined,
+      'ai.openbutler.web',
+    );
+    expect(host).toContain('<key>Label</key><string>ai.openbutler.agent</string>');
+    expect(web).toContain('<key>Label</key><string>ai.openbutler.web</string>');
   });
 
   it('rejects invalid variable names in builders', async () => {
@@ -109,58 +142,94 @@ describe.skipIf(process.platform !== 'win32')('user Windows automatic startup ow
     const service = await import('../src/daemon-autostart.js');
     service.installAutostart();
     expect(service.isAutostartInstalled()).toBe(true);
-    const launcher = join(root, 'autostart', 'openbutler-logon.vbs');
-    const content = readFileSync(launcher, 'utf8');
+    const content = readFileSync(hostLauncher(), 'utf8');
     expect(content).toContain('OPENBUTLER_DATA_DIR');
     expect(content).toContain(root);
     expect(content).toContain('""' + process.argv[1] + '"" daemon run');
     expect(content).not.toContain('must-not-be-in-launcher');
     service.uninstallAutostart();
-    expect(registryValue).toBeNull();
-    expect(existsSync(launcher)).toBe(false);
+    expect(registry).toEqual({});
+    expect(existsSync(hostLauncher())).toBe(false);
   });
 
   it('preserves an existing foreign startup command and accepts a development TypeScript entry', async () => {
     const service = await import('../src/daemon-autostart.js');
-    registryValue = 'unrelated-user-command.exe';
+    registry.OpenButler = 'unrelated-user-command.exe';
     expect(() => service.installAutostart()).toThrow('another command');
     service.uninstallAutostart();
-    expect(registryValue).toBe('unrelated-user-command.exe');
+    expect(registry.OpenButler).toBe('unrelated-user-command.exe');
     expect(commands.run.mock.calls.some(([, args]) => args[0] === 'delete' || args[0] === 'add')).toBe(false);
-    registryValue = null;
+    registry = {};
     process.argv[1] = join(root, 'cli.ts');
     expect(() => service.installAutostart()).not.toThrow();
-    const launcher = readFileSync(join(root, 'autostart', 'openbutler-logon.vbs'), 'utf8');
+    const launcher = readFileSync(hostLauncher(), 'utf8');
     expect(launcher).toContain('--import');
     expect(launcher).toContain('cli.ts');
   });
 
-  it('writes the web binding into login startup and keeps it when only the host is reinstalled', async () => {
+  it('starts the host and the browser client as two independent login entries', async () => {
     const service = await import('../src/daemon-autostart.js');
     const web = { host: '0.0.0.0', port: 45278, dir: root };
     service.installAutostart({ web });
-    const launcher = join(root, 'autostart', 'openbutler-logon.vbs');
-    expect(readFileSync(launcher, 'utf8')).toContain('--web');
-    expect(readFileSync(launcher, 'utf8')).toContain('--hostname 0.0.0.0');
-    expect(readFileSync(launcher, 'utf8')).toContain('--port 45278');
-    expect(readFileSync(launcher, 'utf8')).toContain('--dir');
+
+    expect(service.isAutostartInstalled()).toBe(true);
+    expect(service.isWebAutostartInstalled()).toBe(true);
+    const host = readFileSync(hostLauncher(), 'utf8');
+    const client = readFileSync(webLauncher(), 'utf8');
+    expect(host).toContain('daemon run');
+    expect(host).not.toContain('--web');
+    expect(host).not.toContain('--serve');
+    expect(client).toContain('web --serve');
+    expect(client).toContain('--port 45278');
+    expect(client).toContain('--hostname 0.0.0.0');
+    expect(client).toContain('--dir');
+    expect(client).not.toContain('daemon run');
+    expect(registry.OpenButler).toContain('openbutler-logon.vbs');
+    expect(registry.OpenButlerWeb).toContain('openbutler-web-logon.vbs');
     expect(service.readAutostartWeb()).toEqual(web);
+  });
 
+  it('preserves the saved web binding when only the host entry is reinstalled', async () => {
+    const service = await import('../src/daemon-autostart.js');
+    const web = { host: '0.0.0.0', port: 45278, dir: root };
+    service.installAutostart({ web });
     service.installAutostart();
-    expect(readFileSync(launcher, 'utf8')).toContain('--web');
+    expect(service.readAutostartWeb()).toEqual(web);
+    expect(readFileSync(hostLauncher(), 'utf8')).not.toContain('--web');
+    expect(readFileSync(webLauncher(), 'utf8')).toContain('web --serve');
+  });
 
+  it('removes only the web entry when web startup is turned off', async () => {
+    const service = await import('../src/daemon-autostart.js');
+    service.installAutostart({ web: { host: '0.0.0.0', port: 45278, dir: root } });
     service.installAutostart({ web: null });
-    expect(readFileSync(launcher, 'utf8')).not.toContain('--web');
+
+    expect(service.isAutostartInstalled()).toBe(true);
+    expect(service.isWebAutostartInstalled()).toBe(false);
+    expect(registry.OpenButler).toBeDefined();
+    expect(registry.OpenButlerWeb).toBeUndefined();
+    expect(existsSync(hostLauncher())).toBe(true);
+    expect(existsSync(webLauncher())).toBe(false);
     expect(service.readAutostartWeb()).toBeNull();
   });
 
-  it('cleans the generated launcher if registration fails without modifying other startup data', async () => {
+  it('never overwrites a foreign web startup value', async () => {
+    const service = await import('../src/daemon-autostart.js');
+    registry.OpenButlerWeb = 'unrelated-web-command.exe';
+    expect(() => service.installAutostart({ web: { host: '0.0.0.0', port: 45278, dir: root } })).toThrow('another command');
+    expect(registry.OpenButlerWeb).toBe('unrelated-web-command.exe');
+    expect(registry.OpenButler).toBeUndefined();
+    expect(existsSync(hostLauncher())).toBe(false);
+  });
+
+  it('cleans both generated launchers if registration fails without modifying other startup data', async () => {
     const service = await import('../src/daemon-autostart.js');
     commands.run.mockImplementation((_program: string, args: string[]) =>
       args[0] === 'query' ? { status: 1, stdout: '', stderr: 'Not found' } : { status: 5, stdout: '', stderr: 'Fixture access denied' },
     );
-    expect(() => service.installAutostart()).toThrow('code 5');
-    expect(existsSync(join(root, 'autostart', 'openbutler-logon.vbs'))).toBe(false);
-    expect(registryValue).toBeNull();
+    expect(() => service.installAutostart({ web: { host: '127.0.0.1', port: 45278, dir: root } })).toThrow('code 5');
+    expect(existsSync(hostLauncher())).toBe(false);
+    expect(existsSync(webLauncher())).toBe(false);
+    expect(registry).toEqual({});
   });
 });
