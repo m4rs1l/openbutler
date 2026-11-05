@@ -4,6 +4,36 @@ import * as api from './api.js';
 import type { ApprovalMode, DraftImage, ModelChoice, SessionInfo, SessionPayload } from './types.js';
 import { materializeNewChat, newChatDraft, newChatPayload, type NewChatDraft } from './new-chat-draft.js';
 
+/** The chat list is cached so an F5 never blanks the sidebar; it refreshes in the background. */
+const SESSIONS_CACHE_KEY = 'openbutler:web-sessions';
+
+function readCachedSessions(): SessionInfo[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(SESSIONS_CACHE_KEY) ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is SessionInfo =>
+          item !== null &&
+          typeof item === 'object' &&
+          typeof (item as SessionInfo).id === 'string' &&
+          typeof (item as SessionInfo).title === 'string',
+      )
+      // A run that ended while the page was closed must not read as running.
+      .map((session) => ({ ...session, running: undefined }));
+  } catch {
+    return [];
+  }
+}
+
+function saveCachedSessions(sessions: SessionInfo[]): void {
+  try {
+    localStorage.setItem(SESSIONS_CACHE_KEY, JSON.stringify(sessions));
+  } catch {
+    /* Private browsing can disable storage. */
+  }
+}
+
 /** The client-side id of a chat that exists only as a placeholder while the host creates it. */
 export const PENDING_CHAT_ID = 'new-chat';
 
@@ -21,7 +51,7 @@ export function useSession() {
   const streamEpoch = useRef(0);
   const hasSnapshot = useRef(false);
   const [status, setStatus] = useState<'connecting' | 'open' | 'error'>('connecting');
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sessions, setSessions] = useState<SessionInfo[]>(readCachedSessions);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState(false);
   const [reload, setReload] = useState(0);
@@ -165,6 +195,7 @@ export function useSession() {
       .fetchSessions()
       .then((list) => {
         if (cancelled) return;
+        saveCachedSessions(list);
         setSessions(list);
         const id = selected.current;
         if (!hasSnapshot.current && id && !list.some((session) => session.id === id)) {

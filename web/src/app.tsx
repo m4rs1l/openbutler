@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import type { DraftImage } from './types.js';
+import type { DraftImage, Project } from './types.js';
 import { PENDING_CHAT_ID, useSession } from './use-session.js';
+import { runCommand } from './api.js';
 import { useProjects } from './projects/use-projects.js';
 import { ProjectContextBar } from './projects/project-selector.js';
-import { CreateProjectDialog } from './projects/create-project-dialog.js';
+import { ProjectDialog } from './projects/project-dialog.js';
 import { awaitingFirstChunk, buildTurns } from './turns.js';
 import { TurnView } from './turn.js';
 import { TypingIndicator } from './components/typing-indicator.js';
@@ -21,6 +22,7 @@ import { IconButton } from './components/ui.js';
 import { readDrafts, saveDraft } from './composer-state.js';
 import { WorkspacePanels } from './components/workspace-panels.js';
 import { Feedback } from './components/feedback.js';
+import { EdgeResizer } from './components/edge-resizer.js';
 import { useEdgeResize } from './edge-resize.js';
 import {
   SIDEBAR_CHAT_MIN_WIDTH,
@@ -46,19 +48,19 @@ export function App() {
   // Where the placeholder chat's text came from; set when a new chat starts
   // and consumed once the host answers it.
   const placeholderRef = useRef<{ key: string; previousId: string } | null>(null);
-  const projects = useProjects(
-    session.payload?.session,
-    async (projectId) => {
-      if (session.payload?.session.projectLocked) {
-        const from = session.payload?.session.id;
-        if (!(await session.switchSession(undefined, projectId))) throw new Error('A new chat could not be opened in this project.');
-        if (from) placeholderRef.current = { key: PENDING_CHAT_ID, previousId: from };
-      } else await session.selectProject(projectId);
-    },
-    !session.payload?.busy && (session.payload?.queuedMessageCount ?? 0) === 0,
-  );
+  const projects = useProjects(session.payload?.session, async (projectId) => {
+    if (session.payload?.session.projectLocked) {
+      const from = session.payload?.session.id;
+      if (!(await session.switchSession(undefined, projectId))) throw new Error('A new chat could not be opened in this project.');
+      if (from) placeholderRef.current = { key: PENDING_CHAT_ID, previousId: from };
+    } else await session.selectProject(projectId);
+  });
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
-  const closeCreateProject = useCallback(() => setCreateProjectOpen(false), []);
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const closeCreateProject = useCallback(() => {
+    setCreateProjectOpen(false);
+    setEditingProject(null);
+  }, []);
   const [sidebarVisible, setSidebarVisible] = useState(() => window.matchMedia('(min-width: 761px)').matches);
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 760px)').matches);
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
@@ -156,8 +158,18 @@ export function App() {
     direction: 1,
     width: activeSidebarWidth,
     getMaximum: () => sidebarMaximum,
-    resolve: (initial, distance, available) => ({ size: resolveSidebarResize(initial, distance, available) }),
-    onResize: (size) => setSidebarWidth(size),
+    resolve: (initial, distance, available) => {
+      const resolved = resolveSidebarResize(initial, distance, available);
+      return { size: resolved.size, end: resolved.snap };
+    },
+    onResize: (size, end) => {
+      if (end) {
+        setSidebarVisible(false);
+        setSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
+      } else {
+        setSidebarWidth(size);
+      }
+    },
   });
   // The width survives reloads; a drag only writes once the pointer lets go.
   useEffect(() => {
@@ -256,10 +268,12 @@ export function App() {
         projectSelectionDisabled={projects.selecting || (projects.locked && navigationDisabled)}
         projectsLoading={projects.loading}
         projectsError={projects.error}
+        selectionError={projects.selectionError}
         onSelectProject={(id) => {
           void projects.select(id);
         }}
         onCreateProject={() => setCreateProjectOpen(true)}
+        onEditProject={setEditingProject}
         onRetryProjects={projects.refresh}
         loading={session.sessionsLoading}
         error={session.sessionsError}
@@ -275,23 +289,15 @@ export function App() {
         onSettings={() => openSettings(DEFAULT_SETTINGS_SECTION)}
       />
       {sidebarVisible && !narrow && !settingsSection ? (
-        <div
-          role="separator"
-          tabIndex={0}
+        <EdgeResizer
+          edge={sidebarEdge}
           className="sidebar-resizer"
-          aria-label="Resize sidebar"
-          aria-orientation="vertical"
-          aria-controls="sidebar-nav"
-          aria-valuemin={SIDEBAR_MIN_WIDTH}
-          aria-valuemax={Math.round(sidebarMaximum)}
-          aria-valuenow={Math.round(activeSidebarWidth)}
-          aria-valuetext={`${Math.round(activeSidebarWidth)} pixels`}
-          title="Drag to resize sidebar"
-          onPointerDown={sidebarEdge.start}
-          onPointerMove={sidebarEdge.move}
-          onPointerUp={sidebarEdge.finish}
-          onPointerCancel={sidebarEdge.finish}
-          onLostPointerCapture={sidebarEdge.finish}
+          label="Resize sidebar"
+          controls="sidebar-nav"
+          min={SIDEBAR_MIN_WIDTH}
+          max={sidebarMaximum}
+          value={activeSidebarWidth}
+          title="Drag to resize or close sidebar"
           onKeyDown={(event) => {
             if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
             event.preventDefault();
@@ -303,7 +309,7 @@ export function App() {
                   : event.key === 'ArrowRight'
                     ? 32
                     : -32;
-            setSidebarWidth(resolveSidebarResize(activeSidebarWidth, distance, sidebarMaximum));
+            setSidebarWidth(resolveSidebarResize(activeSidebarWidth, distance, sidebarMaximum).size);
           }}
         />
       ) : null}
@@ -417,6 +423,37 @@ export function App() {
                       await session.send(text, images, reasoning);
                     }}
                     onStop={() => void session.stop()}
+                    onCommand={async (name) => {
+                      // A surface command moves this interface, a host command
+                      // goes through the registry-backed route, and neither is
+                      // ever sent as a message.
+                      if (name === '/new') {
+                        if (!independentChats && (busy || queued > 0))
+                          throw new Error('Wait for the current run to finish before starting a new chat.');
+                        await navigate();
+                        return;
+                      }
+                      if (name === '/session') {
+                        setSearchOpen(true);
+                        return;
+                      }
+                      if (name === '/provider') {
+                        openSettings('providers');
+                        return;
+                      }
+                      if (name === '/settings') {
+                        openSettings(DEFAULT_SETTINGS_SECTION);
+                        return;
+                      }
+                      if (!id) throw new Error('Wait until the chat is connected.');
+                      await runCommand(
+                        name,
+                        id,
+                        // The stop button holds its queue rather than dropping it;
+                        // the command means the same thing as that button.
+                        name === '/stop' ? { keepQueue: true, holdQueue: true } : {},
+                      );
+                    }}
                     onModel={session.selectModel}
                     onReasoning={session.saveReasoning}
                     onApprovalMode={session.selectApprovalMode}
@@ -428,7 +465,9 @@ export function App() {
           )}
         </WorkspacePanels>
       </div>
-      {createProjectOpen ? <CreateProjectDialog controller={projects} onClose={closeCreateProject} /> : null}
+      {createProjectOpen || editingProject ? (
+        <ProjectDialog project={editingProject ?? undefined} controller={projects} onClose={closeCreateProject} />
+      ) : null}
       {settingsSection ? (
         <SettingsSessionProvider
           value={{

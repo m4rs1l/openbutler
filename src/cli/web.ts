@@ -25,6 +25,9 @@ export function readPort(parsed: Parsed): number {
 
 const PAIR_HINT = 'Pair another device with `openbutler web --pair`; paired browsers reconnect on their own.';
 const LOCAL_ONLY_HINT = 'Local only on this computer. For phone or LAN access, run `openbutler web --hostname 0.0.0.0`.';
+// Login startup starts the host service and this client independently; the
+// detached entry waits briefly for the socket instead of exiting on the race.
+const SERVE_HOST_WAIT_MS = 30_000;
 const isLoopback = (host: string): boolean => host === '127.0.0.1' || host === '::1';
 
 /**
@@ -36,7 +39,8 @@ const isLoopback = (host: string): boolean => host === '127.0.0.1' || host === '
  * returns. `--pair` is the explicit pairing session: it runs the server in
  * this terminal with a one-time link. `--serve` is the detached child's own
  * marker (see `webSpawnArgs`) and never prints a link, so no credential lands
- * in the host log.
+ * in the host log; because login startup launches it beside the host service,
+ * it waits briefly for the host instead of failing on a cold-boot race.
  */
 export async function runWebCommand(parsed: Parsed): Promise<void> {
   const port = readPort(parsed);
@@ -92,7 +96,7 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
     ui.warn('This server is reachable from the network. Keep the pairing link private.');
   }
 
-  const hostStatus = await requireBackgroundHost();
+  const hostStatus = await requireBackgroundHost(serving ? SERVE_HOST_WAIT_MS : 0);
   const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry);
   if (vintageWarning) ui.warn(vintageWarning);
   let server: WebServer | null = null;
