@@ -105,3 +105,19 @@
     transition: none;
   }
 }
+
+/* A provider's own mark sits inline with its id. The mark keeps a fixed slot
+   so the id column does not shift when the registry has no logo for it. */
+.settings-provider-id {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.settings-provider-id__mark {
+  display: inline-flex;
+  flex: 0 0 15px;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+}

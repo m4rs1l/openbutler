@@ -44,7 +44,6 @@ describe('shared sidebar design system', () => {
       'sidebar-footer',
       'sidebar-scroll',
       'section-label',
-      'recent-label',
       'session-list',
       'session-item',
       'session-name',
@@ -61,12 +60,14 @@ describe('shared sidebar design system', () => {
   });
 
   it('reuses sidebar structure and limits Settings CSS to its own layout', () => {
-    const chat = read('components/sidebar.tsx');
+    // The chat sidebar is composed of these three files; every shared class it
+    // renders has to live in one of them, never in a stylesheet of its own.
+    const chat = ['components/sidebar.tsx', 'components/sidebar-section.tsx', 'components/session-row.tsx'].map(read).join('\n');
     const settings = read('components/settings/settings-page.tsx');
     const settingsCss = read('components/settings/settings-page.css');
     for (const cls of ['sidebar-scroll', 'section-label', 'session-list', 'session-item', 'session-name']) {
-      expect(chat).toContain(cls);
-      expect(settings).toContain(cls);
+      expect(chat, cls).toContain(cls);
+      expect(settings, cls).toContain(cls);
     }
     expect(chat).toContain('<SidebarHeader');
     expect(settings).toContain('<SidebarHeader');

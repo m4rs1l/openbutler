@@ -8,12 +8,12 @@ export interface SettingsSectionDef {
   id: string;
   label: string;
   icon: IconName;
-  group: 'Intelligence' | 'Workspace' | 'System';
+  group: 'General' | 'Intelligence' | 'Workspace' | 'System';
   description: string;
   render: () => ReactNode;
 }
 
-const GROUPS = ['Intelligence', 'Workspace', 'System'] as const;
+const GROUPS = ['General', 'Intelligence', 'Workspace', 'System'] as const;
 
 /** Settings owns its layout; conversation components and styles are not altered. */
 export function SettingsView({

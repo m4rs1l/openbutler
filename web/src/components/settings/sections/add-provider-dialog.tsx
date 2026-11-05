@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react';
 import { addProvider, fetchProviderCatalog } from '../../../api.js';
 import { Dialog } from '../../dialog.js';
 import { Icon } from '../../icon.js';
+import { providerIconName } from '../../../icons/registry.js';
 import { Feedback } from '../../feedback.js';
 import { IconButton } from '../../ui.js';
 import type { ModelCatalogRow, ProviderCatalogRow } from '../../../types.js';
@@ -138,21 +139,25 @@ export function AddProviderDialog({
                   Try a different search.
                 </Feedback>
               ) : null}
-              {matches.map((row) => (
-                <button
-                  key={row.providerId}
-                  type="button"
-                  role="option"
-                  aria-selected={selected === row.providerId}
-                  className={`add-provider__item${selected === row.providerId ? ' is-selected' : ''}`}
-                  disabled={pending}
-                  onClick={() => setSelected(row.providerId)}
-                >
-                  <span className="add-provider__name">{row.providerId}</span>
-                  <span className="add-provider__meta">{row.modelCount} models</span>
-                  {selected === row.providerId ? <Icon name="check" size={14} /> : null}
-                </button>
-              ))}
+              {matches.map((row) => {
+                const logo = providerIconName(row.providerId);
+                return (
+                  <button
+                    key={row.providerId}
+                    type="button"
+                    role="option"
+                    aria-selected={selected === row.providerId}
+                    className={`add-provider__item${selected === row.providerId ? ' is-selected' : ''}`}
+                    disabled={pending}
+                    onClick={() => setSelected(row.providerId)}
+                  >
+                    <span className="add-provider__item-icon">{logo ? <Icon name={logo} size={16} /> : null}</span>
+                    <span className="add-provider__name">{row.providerId}</span>
+                    <span className="add-provider__meta">{row.modelCount} models</span>
+                    {selected === row.providerId ? <Icon name="check" size={14} /> : null}
+                  </button>
+                );
+              })}
             </div>
           </>
         ) : (

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { fetchProviderCatalog, removeProvider } from '../../../api.js';
 import { Icon } from '../../icon.js';
+import { providerIconName } from '../../../icons/registry.js';
 import type { ProviderCatalogRow } from '../../../types.js';
 import { SettingsGroup, SettingsPage, SettingsRow, SettingsSection, SettingsStatus } from '../primitives.js';
 import { AddProviderDialog } from './add-provider-dialog.js';
@@ -79,39 +80,47 @@ export function ProvidersSettings() {
         {configured.length > 0 && filtered.length === 0 ? <SettingsStatus>No providers match your search.</SettingsStatus> : null}
         {filtered.length > 0 ? (
           <SettingsGroup>
-            {filtered.map((row) => (
-              <SettingsRow
-                key={row.providerId}
-                label={row.providerId}
-                description={row.custom ? 'Custom API endpoint' : `${row.modelCount} models in catalog`}
-              >
-                <span className="settings-value settings-value--muted">{row.activeModels} active</span>
-                {confirming === row.providerId ? (
-                  <>
-                    <button type="button" className="settings-choice" disabled={removing !== null} onClick={() => setConfirming(null)}>
-                      Cancel
-                    </button>
+            {filtered.map((row) => {
+              const logo = providerIconName(row.providerId);
+              return (
+                <SettingsRow
+                  key={row.providerId}
+                  label={
+                    <span className="settings-provider-id">
+                      <span className="settings-provider-id__mark">{logo ? <Icon name={logo} size={15} /> : null}</span>
+                      {row.providerId}
+                    </span>
+                  }
+                  description={row.custom ? 'Custom API endpoint' : `${row.modelCount} models in catalog`}
+                >
+                  <span className="settings-value settings-value--muted">{row.activeModels} active</span>
+                  {confirming === row.providerId ? (
+                    <>
+                      <button type="button" className="settings-choice" disabled={removing !== null} onClick={() => setConfirming(null)}>
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-choice settings-choice--danger"
+                        disabled={removing !== null}
+                        onClick={() => void remove(row.providerId)}
+                      >
+                        {removing === row.providerId ? 'Removing…' : 'Confirm removal'}
+                      </button>
+                    </>
+                  ) : (
                     <button
                       type="button"
-                      className="settings-choice settings-choice--danger"
+                      className="settings-choice"
                       disabled={removing !== null}
-                      onClick={() => void remove(row.providerId)}
+                      onClick={() => setConfirming(row.providerId)}
                     >
-                      {removing === row.providerId ? 'Removing…' : 'Confirm removal'}
+                      Remove
                     </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    className="settings-choice"
-                    disabled={removing !== null}
-                    onClick={() => setConfirming(row.providerId)}
-                  >
-                    Remove
-                  </button>
-                )}
-              </SettingsRow>
-            ))}
+                  )}
+                </SettingsRow>
+              );
+            })}
           </SettingsGroup>
         ) : null}
       </SettingsSection>

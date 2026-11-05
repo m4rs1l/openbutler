@@ -8,9 +8,18 @@ import { AboutSettings } from './about.js';
 import { TelegramSettings } from './telegram.js';
 import { ApprovalsSettings } from './approvals.js';
 import { MemorySettings } from './memory.js';
+import { GeneralSettings } from './general.js';
 
 /** Navigation, descriptions and sections share one authoritative registry. */
 export const SETTINGS_SECTIONS: SettingsSectionDef[] = [
+  {
+    id: 'general',
+    label: 'General',
+    icon: 'settings',
+    group: 'General',
+    description: 'Shell and machine defaults',
+    render: () => <GeneralSettings />,
+  },
   {
     id: 'providers',
     label: 'Providers',
