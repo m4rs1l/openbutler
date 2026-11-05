@@ -114,15 +114,33 @@ export function hostVintageMismatchWarning(clientEntry: string | undefined | nul
  * A client attaches to a running host; only the daemon commands may start one.
  * The friendly failure replaces the silent auto-start clients used to do, so the
  * boot verb stays visible and its code vintage stays deliberate.
+ *
+ * Login startup launches the host service and the web client independently, so
+ * the web client can reach this check before the host socket exists. `waitMs`
+ * lets that detached entry wait for the host it depends on; the host itself is
+ * still never started from here.
  */
-export async function requireBackgroundHost(): Promise<DaemonStatus> {
-  const status = await getDaemonStatus();
-  if (!status) throw new Error('The background host is not running. Start it with `openbutler daemon start`.');
-  if (status.legacy)
-    throw new Error('An older OpenButler host is still running. Stop it with `openbutler daemon stop`, then start OpenButler again.');
-  if (status.unresponsive)
-    throw new Error(`The background host process ${status.pid} does not answer IPC health checks. Recover it with \`openbutler restart\`.`);
-  return status;
+export async function requireBackgroundHost(waitMs = 0): Promise<DaemonStatus> {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    const status = await getDaemonStatus();
+    if (status) {
+      if (status.legacy)
+        throw new Error('An older OpenButler host is still running. Stop it with `openbutler daemon stop`, then start OpenButler again.');
+      if (status.unresponsive)
+        throw new Error(
+          `The background host process ${status.pid} does not answer IPC health checks. Recover it with \`openbutler restart\`.`,
+        );
+      return status;
+    }
+    if (Date.now() >= deadline)
+      throw new Error(
+        waitMs > 0
+          ? `The background host did not become ready within ${Math.round(waitMs / 1_000)} seconds. Start it with \`openbutler daemon start\`.`
+          : 'The background host is not running. Start it with `openbutler daemon start`.',
+      );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  }
 }
 
 export async function requestHost(action: string, payload: Record<string, unknown> = {}): Promise<unknown> {
@@ -243,9 +261,9 @@ export type RestartOutcome = { status: DaemonStatus; web: WebPidRecord | null; w
 
 /**
  * Restarts the background host and, when a tracked browser server is running,
- * that server too: both children share one code vintage, so recycling only the
+ * that server too: both processes share one code vintage, so recycling only the
  * host would leave the browser client serving the previous build. The host
- * result stays authoritative; a web child that fails to return is reported
+ * result stays authoritative; a web process that fails to return is reported
  * instead of thrown, because the host is already running again.
  */
 export async function restartDaemon(_legacyWorkspaceScope?: string): Promise<RestartOutcome> {
@@ -265,7 +283,10 @@ export async function restartDaemon(_legacyWorkspaceScope?: string): Promise<Res
   }
 }
 
-/** The optional web server `openbutler daemon start --web` opens: its own pid record so stop reaches it. */
+/**
+ * The browser client the CLI starts on request: its own pid record so stop and
+ * restart reach it. The host never manages this process.
+ */
 function webPidPath(): string {
   return getDataPath('web.pid');
 }
@@ -301,9 +322,9 @@ function readWebPidRecord(): WebPidRecord | null {
 }
 
 /**
- * Mirrors how the daemon itself is launched, so the web child runs the same code vintage as
+ * Mirrors how the host itself is launched, so the browser client runs the same code vintage as
  * this CLI. `--serve` marks the detached child: it runs the server in its own process instead
- * of spawning again, and `--hostname` keeps the binding the parent chose.
+ * of spawning again, and `--hostname` keeps the binding the caller chose.
  */
 export function webSpawnArgs(entry: string, port: number, host: string): string[] {
   return cliNodeArgs(entry, ['web', '--serve', '--port', String(port), '--hostname', host]);
@@ -418,24 +439,27 @@ export function untrackWebProcess(pid: number): void {
   }
 }
 
-/** Where a daemon-supervised web server should listen and which workspace it serves. */
-export type WebStartOptions = { port: number; host: string; dir: string };
-
-/** Internal child-process entry point for `openbutler daemon run`. */
-export async function runDaemonProcess(web?: WebStartOptions): Promise<void> {
+/**
+ * Internal child-process entry point for `openbutler daemon run`.
+ *
+ * This process is the backend only. It has no web option and never spawns the
+ * browser client: the host and web are independent processes, and only the CLI
+ * may compose them (`daemon start --web`, or two separate login entries).
+ */
+export async function runDaemonProcess(): Promise<void> {
   const startLock = await acquireDaemonStartLock();
   try {
     const active = await getDaemonStatus();
     if (active?.legacy)
       throw new Error('An older OpenButler host is still running. Stop it with `openbutler daemon stop`, then start OpenButler again.');
     if (active) throw new Error(`An OpenButler host is already running (pid ${active.pid}).`);
-    await runLockedDaemonProcess(startLock.startedAt, web);
+    await runLockedDaemonProcess(startLock.startedAt);
   } finally {
     releaseDaemonStartLock(startLock);
   }
 }
 
-async function runLockedDaemonProcess(startedAt: string, web?: WebStartOptions): Promise<void> {
+async function runLockedDaemonProcess(startedAt: string): Promise<void> {
   let stopping = false;
   let shutdownReason: string | null = null;
   let resolveStop!: () => void;
@@ -475,20 +499,6 @@ async function runLockedDaemonProcess(startedAt: string, web?: WebStartOptions):
     await host.start();
     await writeDaemonPidFile(startedAt);
     console.log(`OpenButler host ready (${process.pid}); ${host.getStatus().workspaceCount} workspace loaded.`);
-    if (web) {
-      try {
-        const record = await startWebProcess(process.argv[1], web.port, web.host, web.dir);
-        logger.info('web.started', { pid: record.pid, host: record.host, port: record.port, dir: web.dir });
-        console.log(`OpenButler web ready (${record.pid}) at http://${record.host}:${record.port}.`);
-      } catch (error) {
-        // A busy port or a deleted workspace must not take the host down with
-        // it: the terminal and Telegram still work, and the next explicit
-        // `openbutler web` can report the problem to the owner.
-        const message = error instanceof Error ? error.message : String(error);
-        logger.warn('web.start.failed', { host: web.host, port: web.port, dir: web.dir, error: message });
-        console.error(`OpenButler web failed to start: ${message}`);
-      }
-    }
     await stopRequested;
   } finally {
     process.off('SIGINT', onSigint);
