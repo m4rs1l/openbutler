@@ -1,6 +1,17 @@
-import { GROUP_RECIPIENT, isGroupRecipient, makeFileId, makeMessageId, validateMemberName } from './service.js';
+import {
+  fingerprintOf,
+  GROUP_RECIPIENT,
+  hashTicket,
+  isGroupRecipient,
+  makeFileId,
+  makeInviteCode,
+  makeMessageId,
+  makeRequestId,
+  makeTicket,
+  validateMemberName,
+} from './service.js';
 import { MAX_TEAM_MESSAGE_ID_CHARS } from './contracts.js';
-import type { TeamMemoryTopic, TeamMessage, TeamStore, TeamFile } from './store.js';
+import type { JoinRequest, TeamMessage, TeamStore, TeamFile } from './store.js';
 
 export const MAX_MESSAGE_CHARS = 8000;
 /** Largest file the hub will accept and relay, in bytes. */
@@ -108,14 +119,6 @@ export class TeamOperations {
     });
   }
 
-  /** Validates and appends one signed shared-memory entry. */
-  appendMemory(author: string, topic: TeamMemoryTopic, body: string): number {
-    if (topic !== 'decisions' && topic !== 'shared') throw new TeamError('topic must be "decisions" or "shared".', 400);
-    if (!body.trim()) throw new TeamError('A memory entry cannot be empty.', 400);
-    if (body.length > MAX_MESSAGE_CHARS) throw new TeamError(`A memory entry is limited to ${MAX_MESSAGE_CHARS} characters.`, 400);
-    return this.store.appendMemory({ topic, author, body, createdAt: Date.now() });
-  }
-
   /**
    * Records a shared file's metadata and posts the message that announces it.
    * The bytes are stored on the hub's disk by the transport before this runs;
@@ -153,6 +156,68 @@ export class TeamOperations {
     if (file.recipient !== member && file.recipient !== GROUP_RECIPIENT && file.sender !== member)
       throw new TeamError('This file is not addressed to you.', 403);
     return file;
+  }
+
+  initHub(hubId: string, teamId: string, teamName: string, hubName: string, now = Date.now()): void {
+    this.store.initHub(hubId, teamId, teamName, hubName, now);
+  }
+
+  createInvite(actor: string, ttlMs: number, now = Date.now()): { code: string; fingerprint: string } {
+    if (!this.store.isInitialized()) throw new TeamError('Team store is not initialized. Run team init first.', 400);
+    const code = makeInviteCode();
+    this.store.createInvite(code, ttlMs, now);
+    const hubId = this.store.getMeta('hub_id');
+    if (!hubId) throw new TeamError('Team store is not initialized. Run team init first.', 400);
+    this.store.appendAudit({ kind: 'invite.created', actor, detail: code, createdAt: now });
+    return { code, fingerprint: fingerprintOf(hubId) };
+  }
+
+  revokeInvite(actor: string, code: string, now = Date.now()): boolean {
+    if (!this.store.revokeInvite(code)) return false;
+    this.store.appendAudit({ kind: 'invite.revoked', actor, detail: code, createdAt: now });
+    return true;
+  }
+
+  requestJoin(code: string, name: string, now = Date.now()): JoinRequest {
+    const invite = this.store.getInvite(code, now);
+    if (!invite) throw new TeamError('Invite code is invalid.', 404);
+    if (this.store.nameTaken(name)) throw new TeamError(`"${name}" is already taken in this team. Pick another name.`, 409);
+    if (!this.store.consumeInvite(invite.code, name, now)) throw new TeamError('Invite code is invalid.', 404);
+    const id = makeRequestId();
+    this.store.createJoinRequest(id, name, invite.code, now);
+    this.store.appendAudit({ kind: 'join.requested', actor: name, detail: invite.code, createdAt: now });
+    const created = this.store.getJoinRequest(id);
+    if (!created) throw new TeamError('Join request could not be recorded.', 500);
+    return created;
+  }
+
+  decideJoin(actor: string, requestId: string, approve: boolean, now = Date.now()): { decided: 'approved' | 'denied'; name: string } {
+    const entry = this.store.getJoinRequest(requestId);
+    if (!entry) throw new TeamError('Unknown join request.', 404);
+    if (entry.status !== 'pending') throw new TeamError(`Request is already ${entry.status}.`, 409);
+    if (!approve) {
+      this.store.decideJoin(requestId, false, null, null, now);
+      this.store.appendAudit({ kind: 'join.denied', actor, detail: entry.name, createdAt: now });
+      return { decided: 'denied', name: entry.name };
+    }
+    const ticket = makeTicket();
+    if (!this.store.decideJoin(requestId, true, ticket, hashTicket(ticket), now)) {
+      throw new TeamError(`"${entry.name}" is already taken in this team. Deny the request and invite them to pick another name.`, 409);
+    }
+    this.store.appendAudit({ kind: 'join.approved', actor, detail: entry.name, createdAt: now });
+    return { decided: 'approved', name: entry.name };
+  }
+
+  removeMember(actor: string, name: string, now = Date.now()): 'removed' | 'missing' | 'hub' {
+    const outcome = this.store.removeMember(name, now);
+    if (outcome === 'removed') this.store.appendAudit({ kind: 'member.removed', actor, detail: name, createdAt: now });
+    return outcome;
+  }
+
+  leave(name: string, now = Date.now()): void {
+    const outcome = this.store.removeMember(name, now);
+    if (outcome === 'hub') throw new TeamError('The hub cannot leave its own team. Shut the team down instead.', 403);
+    if (outcome === 'removed') this.store.appendAudit({ kind: 'member.left', actor: name, detail: null, createdAt: now });
   }
 
   registerFile(sender: string, input: { recipient: string; name: string; size: number; sha256: string; fileId?: string }): TeamMessage {

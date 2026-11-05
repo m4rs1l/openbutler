@@ -62,11 +62,27 @@ describe('message rules live in one place', () => {
     expect(again.duplicate).toBe(true);
     expect(store.groupLatestSeq()).toBe(1);
   });
+});
 
-  it('applies the same rules to shared-memory writes', () => {
-    expect(() => operations.appendMemory('Atreus-OpenButler', 'decisions', '   ')).toThrow(/cannot be empty/);
-    expect(() => operations.appendMemory('Atreus-OpenButler', 'nope' as never, 'x')).toThrow(/topic must be/);
-    expect(operations.appendMemory('Atreus-OpenButler', 'decisions', 'ok')).toBe(1);
+describe('membership writes go through operations', () => {
+  it('creates an invite with a fingerprint and audit row', () => {
+    const created = operations.createInvite('Atreus-OpenButler', 60_000);
+    expect(created.code).toBeTruthy();
+    expect(created.fingerprint).toBeTruthy();
+    expect(store.listInvites(Date.now())).toHaveLength(1);
+    expect(store.listAudit(1)[0]?.kind).toBe('invite.created');
+  });
+
+  it('approves a pending join and refuses a second decide', () => {
+    store.createJoinRequest('jr_ops', 'New-OpenButler', 'kartal-ops', Date.now());
+    expect(operations.decideJoin('Atreus-OpenButler', 'jr_ops', true)).toEqual({ decided: 'approved', name: 'New-OpenButler' });
+    expect(() => operations.decideJoin('Atreus-OpenButler', 'jr_ops', false)).toThrow(TeamError);
+  });
+
+  it('removes a member and records the audit', () => {
+    expect(operations.removeMember('Atreus-OpenButler', 'Murphy-OpenButler')).toBe('removed');
+    expect(store.canonicalMemberName('Murphy-OpenButler')).toBeNull();
+    expect(store.listAudit(1)[0]?.kind).toBe('member.removed');
   });
 });
 

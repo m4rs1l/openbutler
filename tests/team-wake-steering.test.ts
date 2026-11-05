@@ -164,10 +164,11 @@ describe('team wake steering', () => {
     expect(prompts[1]).toContain('[Host context: inbox notification]');
   });
 
-  it('steers a same-route owner message only after explicit promotion', async () => {
+  it('steers a same-route web message only after explicit promotion', async () => {
     const { model, release, first } = await setupBusyRun();
+    // Web is the surface whose follow-ups wait for the steer button; CLI messages steer by default.
     const second = session!.sendMessage(
-      { text: 'OWNER_NOTE', images: [], eventId: 'owner', communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
+      { text: 'OWNER_NOTE', images: [], eventId: 'owner', communication: { source: 'web', replyTo: { channel: 'terminal' } } },
       preferences,
     );
     session!.manageQueuedMessage(session!.getSnapshot().queuedMessages[0]!.id!, 'steer', session!.getSnapshot().session.id);
@@ -187,11 +188,13 @@ describe('team wake steering', () => {
     const notification = session!.sendEvent({ text: 'WORKER_SIGNAL', images: [], communication: { source: 'inbox' } }, preferences);
     release();
     await Promise.all([first, waiting, notification]);
-    expect(model.doStreamCalls).toHaveLength(3);
+    // CLI follow-ups steer into the live run by default (owner decision 2026-10-31),
+    // so both join the same admitted step: the notification is never starved behind
+    // the queued owner message, and no separate run is needed for it.
+    expect(model.doStreamCalls).toHaveLength(2);
     const active = JSON.stringify(model.doStreamCalls[1]!.prompt);
     expect(active).toContain('WORKER_SIGNAL');
-    expect(active).not.toContain('LATER_OWNER_TASK');
-    expect(JSON.stringify(model.doStreamCalls[2]!.prompt.at(-1))).toContain('LATER_OWNER_TASK');
+    expect(active).toContain('LATER_OWNER_TASK');
   });
 
   it('decides a wake on the cursor alone, independent of busy state', () => {
