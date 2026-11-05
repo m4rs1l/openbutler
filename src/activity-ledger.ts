@@ -640,6 +640,17 @@ export class ActivityLedger {
     return rows.map(eventFromRow);
   }
 
+  /** Unread messages addressed to one session, oldest first. Reading is what marks them read. */
+  agentMessages(toSessionId: string, limit = 50): ObservedEventRow[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM openbutler_events e WHERE source = 'agent-inbox' AND status != 'ignored' AND json_extract(payload_json, '$.toSessionId') = ? AND NOT EXISTS (SELECT 1 FROM openbutler_state WHERE key = 'agent-inbox:read:' || e.event_id) ORDER BY received_at, rowid LIMIT ?",
+      )
+      .all(toSessionId, Math.max(1, Math.min(1000, Math.trunc(limit)))) as unknown as EventDbRow[];
+    return rows.map(eventFromRow);
+  }
+
   /** Newest-first events of one schedule, for run history. Reads the payload, never the transcript. */
   scheduleEvents(scheduleId: string, limit = 50): ObservedEventRow[] {
     this.assertOpen();

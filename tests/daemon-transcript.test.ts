@@ -21,9 +21,11 @@ let snapshot: SessionSnapshotData;
 let runtime: RuntimeViewData;
 let connect: typeof import('../src/daemon-client.js').connectDaemonSession;
 let supportsClientKind: boolean;
+let supportsChats: boolean;
 
 beforeEach(async () => {
   supportsClientKind = true;
+  supportsChats = true;
   root = mkdtempSync(join(tmpdir(), 'openbutler-transcript-'));
   vi.stubEnv('OPENBUTLER_DATA_DIR', root);
   vi.resetModules();
@@ -83,6 +85,7 @@ beforeEach(async () => {
               runtime,
               savedSessions: [],
               ...(supportsClientKind ? { clientKind: request.clientKind ?? 'terminal' } : {}),
+              ...(supportsChats ? { sessionAttachments: true, workspaceKey: root } : {}),
             },
           }) + '\n',
         );
@@ -126,11 +129,17 @@ function patch(append: SessionEntry[] = [], appendText: Array<{ index: number; d
   });
 }
 
-it('refuses silent web-to-terminal fallback on an older host while retaining terminal compatibility', async () => {
+it('asks for a restart instead of falling back when the host cannot identify the client or open chats', async () => {
   supportsClientKind = false;
-  await expect(connect(root, { clientKind: 'web' })).rejects.toThrow('Restart the OpenButler host');
-  client = await connect(root);
-  expect(client.getSnapshot().session.id).toBe('chat');
+  await expect(connect(root, { clientKind: 'web', newChatSession: true })).rejects.toThrow('Restart the OpenButler host');
+
+  // The host answers the attach without chat support: a surface reports that and keeps
+  // running, it never lands in another surface's conversation.
+  supportsClientKind = true;
+  supportsChats = false;
+  await expect(connect(root, { clientKind: 'terminal', newChatSession: true })).rejects.toThrow(
+    'Restart the OpenButler host to enable independent chats',
+  );
 });
 
 it('rejects an unsupported local connection source', async () => {
@@ -139,7 +148,7 @@ it('rejects an unsupported local connection source', async () => {
 });
 
 it('expires local notices without changing the host index space used by later text deltas', async () => {
-  client = await connect(root);
+  client = await connect(root, { isolatedSession: true });
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   notify('Disconnected');
   notify('Reconnected');

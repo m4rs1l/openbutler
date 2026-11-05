@@ -1,4 +1,5 @@
 import { storeAttachment, verifyAttachmentPath, type FileAttachment } from './attachments.js';
+import { daemonCommandAction } from './commands/registry.js';
 import { TEAM_CAPABILITY_MAX_AGE_MS } from './team/contracts.js';
 import { randomUUID } from 'node:crypto';
 import { DaemonFrameDecoder } from './daemon-frames.js';
@@ -18,11 +19,11 @@ import { createAgentRuntime } from './agent-runtime.js';
 import {
   canonicalScopeRoot as canonicalWorkspaceRoot,
   resolveBackgroundScope,
-  resolveRestoreScope,
   scopeMapKey as normalizeWorkspaceKey,
 } from './workspace-origin.js';
 import { createMcpConnectionManager } from './tools/mcp.js';
 import { CATALOG_FILENAMES } from './provider/catalog.js';
+import { resolveModelName, resolveProviderName } from './provider/model-presentation.js';
 import { resolveProjectSelection } from './projects/store.js';
 import { recordUsage as recordUsageRow } from './usage/recorder.js';
 import {
@@ -37,37 +38,19 @@ import {
   type SessionEntriesPatch,
   type SessionSnapshotData,
 } from './daemon-protocol.js';
-import { listSavedSessions, loadSavedSession, saveSession, type SessionEntry, type SavedSession } from './session-store.js';
-import {
-  ownerInboxVisibleTo,
-  resolveTelegramTargetSession as decideTelegramTargetSession,
-  telegramBindingKey,
-  telegramMessageOriginKey,
-  telegramOutboundLabel,
-} from './telegram-routing.js';
+import { listSavedSessions, loadSavedSession, loadSessionForChat, type SessionEntry, type SavedSession } from './session-store.js';
+import { CUSTODIAN_SESSION_ID } from './session-paths.js';
 import { ActivityLedger, type ObservedEventInput, type ObservedEventRow } from './activity-ledger.js';
 import { redactSensitive, redactSensitiveText } from './sensitive-data.js';
-import {
-  ScheduleRunner,
-  assembleWakeText,
-  scheduleCapabilities,
-  describeSchedule,
-  generateScheduleId,
-  normalizeScheduleTrigger,
-  readScheduleRuntime,
-  readTriggerDue,
-  validateScheduleTrigger,
-  writeScheduleError,
-  writeScheduleRunFinished,
-  writeScheduleRunStarted,
-} from './tools/schedule.js';
+import { ScheduleRunner } from './tools/schedule.js';
+import { createScheduleService } from './host/schedule-service.js';
+import { createWorkerService } from './host/worker-service.js';
+export { workerLimitError } from './host/worker-service.js';
 import {
   loadSettings,
   loadSecrets,
-  parseScheduleState,
   saveSettings,
   type ApprovalMode,
-  type ScheduleState,
   type SettingsStore,
   getConfigPath,
   getSettingsPath,
@@ -78,13 +61,10 @@ import {
   readWorkerOutbox,
   readWorkerRecord,
   writeWorkerRecord,
-  completeWorker,
-  appendWorkerNote,
   workerSignalPending,
   recoverWorkers,
   acknowledgeWorkerRead,
   type WorkerRecord,
-  type WorkerNoteKind,
 } from './worker-records.js';
 import { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
 import {
@@ -99,10 +79,11 @@ import { TELEGRAM_SETUP_TEST_MESSAGE } from './telegram-setup.js';
 import { isToolRequestWhitelisted } from './tool-permissions.js';
 import { selectIdleWorkspacesToEvict, type IdleWorkspaceCandidate } from './workspace-eviction.js';
 import { resolveSessionReference } from './session-registry.js';
-import type { SubagentRequest } from './tools/subagent.js';
-import { BACKGROUND_INSTRUCTIONS, WORKER_INSTRUCTIONS } from './agent-instructions.js';
-import { findTailnetAddress } from './team/tailnet.js';
+import { BACKGROUND_BASE, CUSTODIAN_BASE } from './agent-instructions.js';
+import { TEAM_DEFAULT_PORT, findTailnetAddress } from './team/tailnet.js';
+import { makeHubId, makeTeamId, validateMemberName, validateTeamName } from './team/service.js';
 import { startTeamServer, type StartedTeamServer } from './team/server.js';
+import { TeamOperations } from './team/operations.js';
 import { TeamStore, type JoinRequest } from './team/store.js';
 import { localChannel, remoteChannel, type TeamChannel, type TeamConnection } from './team/session.js';
 import { TeamSync } from './team/sync.js';
@@ -111,10 +92,12 @@ import { defaultInboxPath } from './team/files.js';
 import { isForbiddenHostPath } from './host-owned-paths.js';
 import { TeamDelivery } from './team/delivery.js';
 import { resolveFilePath } from './file-write-core.js';
-import type { ToolCallRequest } from './tools/registry.js';
+import { ToolRegistry, type ToolCallRequest } from './tools/registry.js';
+import { createParentMessageTool } from './tools/parent-message.js';
 import { getDataPath } from './paths.js';
 import { imageTypeFromBytes, decodeBase64Image } from './image.js';
-import { AgentInbox, inboxId, inboxNotice, type InboxItem } from './inbox.js';
+import { AgentInbox, inboxNotice, type InboxItem } from './inbox.js';
+import { pendingReportLine, reportsNeedWake } from './report-summary.js';
 
 const MAX_MESSAGE_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -129,8 +112,6 @@ const WORKSPACE_SWEEP_INTERVAL_MS = 60_000;
 // followed by an attach in the same frame never races the eviction.
 const WORKSPACE_EVICTION_GRACE_MS = WORKSPACE_SWEEP_INTERVAL_MS;
 const RESTART_SESSION_KEY_PREFIX = 'host.restart.workspace:';
-const CUSTODIAN_RESTART_SESSION_KEY = 'host.restart.custodian';
-const CUSTODIAN_CURRENT_SESSION_KEY = 'custodian.current-session';
 /** Total wall clock a host close may spend before the remaining steps are abandoned. */
 const TOTAL_SHUTDOWN_BUDGET_MS = 10_000;
 /** Slice of the total that only the durable ledger flush may spend at the end of a close. */
@@ -139,44 +120,10 @@ const RESERVED_SHUTDOWN_BUDGET_MS = 2_500;
 const LOAD_DEADLINE_MS = 20_000;
 /** Serialized settings reloads must never wedge the chain that follows them. */
 const RELOAD_CHAIN_DEADLINE_MS = 20_000;
-/** Worker sessions may spawn children only one layer down: custodian -> subagent -> child. */
-const MAX_SUBAGENT_DEPTH = 2;
-/** Running-worker caps: per main session, per worker parent, and machine-wide. Over the cap a spawn returns busy. */
-const MAX_WORKERS_PER_MAIN = 8;
-const MAX_WORKERS_PER_WORKER = 2;
-const MAX_WORKERS_TOTAL = 10;
 const INBOX_REMINDER_MS = 5 * 60_000;
-/** Read-only research tool set for explorer workers. */
-const EXPLORER_TOOLS = ['file_read', 'glob', 'grep', 'memory_search', 'session_list', 'session_search', 'session_read'] as const;
-/** Core file and command tools for executor workers; MCP tools are never given to workers (P4 decision). */
-const EXECUTOR_TOOLS = [
-  'execute_command',
-  'file_read',
-  'file_write',
-  'file_edit',
-  'glob',
-  'grep',
-  'memory_search',
-  'session_list',
-  'session_search',
-  'session_read',
-] as const;
 const outboundStates = new WeakMap<Socket, { blocked: boolean; queue: string[]; queuedBytes: number }>();
 
-/**
- * Running-worker cap check (D12): 8 per main session, 2 per worker parent, 10 per machine.
- * Returns the refusal message when a spawn must not start, or null when there is room.
- */
-export function workerLimitError(input: { parentDepth: number; runningForParent: number; runningTotal: number }): string | null {
-  const perParent = input.parentDepth > 0 ? MAX_WORKERS_PER_WORKER : MAX_WORKERS_PER_MAIN;
-  if (input.runningForParent >= perParent)
-    return `This session already runs ${input.runningForParent} subagents (limit ${perParent}). Read its notification with inbox or stop it with subagent_stop, then retry.`;
-  if (input.runningTotal >= MAX_WORKERS_TOTAL)
-    return `This machine already runs ${input.runningTotal} subagents (limit ${MAX_WORKERS_TOTAL}). Wait for a completion notification in inbox or stop one (subagent_stop), then retry.`;
-  return null;
-}
-
-interface WorkspaceHost {
+export interface WorkspaceHost {
   readonly root: string;
   readonly runtime: AgentEnvironment;
   readonly controller: AgentSessionController;
@@ -187,7 +134,7 @@ interface WorkspaceHost {
   lastActivityAt: number;
 }
 
-interface PrivateSessionHost {
+export interface PrivateSessionHost {
   readonly controller: AgentSessionController;
   readonly clients: Set<Socket>;
   unsubscribe: () => void;
@@ -207,8 +154,6 @@ interface ClientAttachment {
   privateSessionId: string | null;
   /** User-selected tool and memory scope for this client; independent of the custodian identity. */
   scopeRoot: string;
-  custodian?: boolean;
-  legacyCustodian?: boolean;
   /** View-only attachment to a subagent worker: model turns cannot be submitted from it. */
   readOnly?: boolean;
 }
@@ -229,7 +174,6 @@ export interface DaemonHost {
     updateId: number,
     text: string,
     attachment?: { image?: { filename: string; mediaType: string; bytes: Buffer }; attachmentError?: string },
-    replyToMessageId?: number,
   ): Promise<void>;
   close(): Promise<void>;
 }
@@ -251,6 +195,18 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   const activeEventSources = new Map<string, string>();
   const busyEventSessions = new Set<string>();
   const stopGenerations = new Map<string, number>();
+  /** Deferred report wakes: one per target, so a burst inside the gap costs one timer. */
+  const pendingReportWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** How many reports each session was last told about, so a finished turn can compare. */
+  const seenReportCounts = new Map<string, number>();
+  /**
+   * The gap between two turns the head starts on its own, read at the boundary where a
+   * wake would start. The owner's setting is the only source; the parser already
+   * validated it, so nothing here can fall back to a different number.
+   */
+  function reportTurnGapMs(): number {
+    return (loadSettings().custodian?.reportTurnGapSeconds ?? 60) * 1_000;
+  }
   /** Worker lineage for subagent sessions: parent link, nesting depth, and mode (P4). */
   const workers = new Map<string, WorkerRecord>();
   const pendingWorkerReads = new Map<string, Map<string, { revision: number; notesCursor: number }>>();
@@ -294,8 +250,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     if (pending?.size === 0) pendingWorkerReads.delete(session.id);
   }
 
-  /** Worker write leases (parallel-write policy): normalized path -> the worker that claimed it for its current run. */
-  const workerFileLeases = new Map<string, string>();
   const scheduler = new ScheduleRunner(ledger, receiveEvent, options.log);
   const workspaceEvictions = new Map<string, Promise<void>>();
   /** Debounced settings-file watcher: picks up hand edits without a restart (see settings-watch.ts). */
@@ -306,6 +260,61 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   let reloadChain = Promise.resolve();
   let closePromise: Promise<void> | null = null;
   let closing = false;
+  const { processScheduleEvent, scheduleEventRetry, executeBackground } = createScheduleService({
+    ledger,
+    scheduler,
+    stopGenerations,
+    isClosing: () => closing,
+    getWorkspace,
+    getPersistentSession,
+    receiveEvent,
+    ensureOwnerInboxWakes,
+    pumpEvents,
+    stopNamedRun,
+    findSessionController,
+    requireString,
+    isRecord,
+    getEventRetryTimer: () => eventRetryTimer,
+    setEventRetryTimer: (value) => {
+      eventRetryTimer = value;
+    },
+    getEventRetryDue: () => eventRetryDue,
+    setEventRetryDue: (value) => {
+      eventRetryDue = value;
+    },
+  });
+  const {
+    processWorkerEvent,
+    liveWorkerSession,
+    runningWorkerId,
+    spawnSubagent,
+    finishBackgroundWorker,
+    storeWorkerNote,
+    findLiveWorker,
+    stopWorker,
+    pollWorker,
+  } = createWorkerService({
+    ledger,
+    workers,
+    options,
+    scheduleEventRetry,
+    pumpEvents,
+    findSessionController,
+    findLiveSessionById,
+    getCustodianWorkspace,
+    getWorkspace,
+    custodianWorkspace: () => custodianWorkspace,
+    readWorkerRecord,
+    writeWorkerRecord,
+    createPrivateSession,
+    signalStillNeeded,
+    acknowledgeSavedWorkerReads,
+    redactSensitiveText,
+    inboxReminderMs: INBOX_REMINDER_MS,
+    isClosing: () => closing,
+    workspaces,
+    pendingWorkerReads,
+  });
   const mcpManager = createMcpConnectionManager({
     onError: (id, message) => options.log(`MCP server ${id}: ${redactSensitiveText(message)}`),
     onConnected: (id, count) => options.log(`MCP server ${id} connected (${count} tools).`),
@@ -347,12 +356,25 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     return JSON.stringify([identity, team.memberName, team.role]);
   }
 
+  function ensureHubStore(): TeamStore {
+    if (!teamStore) teamStore = new TeamStore();
+    return teamStore;
+  }
+
+  function requireHubStore(): TeamStore {
+    if (loadSettings().team?.role !== 'hub') throw new Error('Only the hub can do that.');
+    return ensureHubStore();
+  }
+
+  function hubOps(): TeamOperations {
+    return new TeamOperations(requireHubStore());
+  }
+
   function openTeamConnection(): TeamConnection {
     const team = loadSettings().team;
     if (!team) throw new Error('This machine is not in a team.');
     const route = JSON.stringify(team);
     const key = membershipKey(team);
-    const owned = team.role === 'hub' && !teamStore ? new TeamStore() : null;
     const ticket = team.role === 'member' ? loadSecrets().teamTicket : null;
     if (team.role === 'member' && !ticket) throw new Error('No member ticket stored. Rejoin the team.');
     return {
@@ -360,10 +382,10 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       teamId: team.teamId || teamSlug(team.teamName),
       channel:
         team.role === 'hub'
-          ? localChannel(teamStore ?? owned!, team.memberName)
+          ? localChannel(ensureHubStore(), team.memberName)
           : remoteChannel({ host: team.hubHost, port: team.hubPort }, ticket!, team.memberName),
       isCurrent: () => !closing && JSON.stringify(loadSettings().team) === route,
-      close: () => owned?.close(),
+      close: () => {},
     };
   }
 
@@ -394,6 +416,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   }
 
   function createInbox(): AgentInbox {
+    // Codes are derived from the pending notifications themselves, so the box keeps
+    // no index of its own: nothing to reconcile, nothing to grow, and a code never
+    // outlives the notification it names.
     const inbox = new AgentInbox();
     const isWorker = (sessionId: string) => workers.has(sessionId) || readWorkerRecord(ledger, sessionId) !== null;
     const requireCustodian = (sessionId: string) => {
@@ -410,25 +435,20 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         return {
           items: ledger
             .ownerInboxNotifications()
-            .filter(
-              (event) => belongsToOwner(event) && ownerInboxIsUnread(event) && ownerInboxVisibleTo(ownerInboxTargetFor(event), sessionId),
-            )
+            .filter((event) => belongsToOwner(event) && ownerInboxIsUnread(event) && sessionId === CUSTODIAN_SESSION_ID)
             .map((event) => ({
               reference: event.id,
               receivedAt: event.receivedAt,
               state: 'unread' as const,
+              from: 'owner',
+              subject: 'owner message',
             })),
         };
       },
       read: async (references, sessionId) => {
         requireCustodian(sessionId);
-        const result = await readOwnerInbox(references.length, [], references, sessionId);
+        const result = await readOwnerInbox(references.length, references, sessionId);
         return result.messages.map((message) => ({ reference: message.id, content: { type: 'owner-inbox', messages: [message] } }));
-      },
-      acknowledge: async (references, sessionId) => {
-        requireCustodian(sessionId);
-        await readOwnerInbox(0, [...references], [], sessionId);
-        return { status: 'acknowledged' };
       },
     });
     // The membership is part of the reference: an old notification cannot address a new team.
@@ -453,6 +473,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
                 reference: teamReference(connection.key, message.msgId),
                 receivedAt: new Date(message.createdAt).toISOString(),
                 state: 'unread' as const,
+                from: message.sender,
+                subject: message.kind ?? 'message',
               })),
             remaining: Math.max(0, page.count - page.messages.length),
           };
@@ -489,12 +511,55 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           return results;
         });
       },
-      acknowledge: async (references, sessionId) => {
-        requireCustodian(sessionId);
-        return withTeamChannel(async (channel, connection) => {
-          const ids = teamIds(references, connection.key);
-          const result = await channel.ack(ids);
-          return result;
+    });
+    // Messages between layers. The addressee is the only reader, a worker has no
+    // business reading the machine's mail, and reading is what marks a message
+    // read - there is no acknowledgement traffic in the other direction.
+    const agentMessageFor = (reference: string, sessionId: string): ObservedEventRow => {
+      const event = ledger.getEvent(reference);
+      if (!event || event.source !== 'agent-inbox' || event.payload.toSessionId !== sessionId)
+        throw new Error('That message was addressed to another session.');
+      return event;
+    };
+    inbox.register({
+      name: 'Agent',
+      list: async (sessionId) => {
+        if (isWorker(sessionId)) return { items: [] };
+        return {
+          items: ledger.agentMessages(sessionId, 20).map((event) => {
+            const from = typeof event.payload.fromSessionId === 'string' ? event.payload.fromSessionId.slice(0, 8) : '';
+            const title = typeof event.payload.fromTitle === 'string' ? event.payload.fromTitle : '';
+            return {
+              reference: event.id,
+              receivedAt: event.receivedAt,
+              state: 'unread' as const,
+              ...(from ? { from } : {}),
+              subject:
+                [typeof event.payload.kind === 'string' ? event.payload.kind : null, title || null].filter(Boolean).join(' - ') ||
+                'message',
+            };
+          }),
+        };
+      },
+      read: async (references, sessionId) => {
+        if (isWorker(sessionId)) throw new Error('Workers read their parent channel, not the machine mail.');
+        return references.map((reference) => {
+          const event = agentMessageFor(reference, sessionId);
+          const from = typeof event.payload.fromSessionId === 'string' ? event.payload.fromSessionId : '';
+          const title = typeof event.payload.fromTitle === 'string' ? event.payload.fromTitle : '';
+          ledger.setState(`agent-inbox:read:${event.id}`, new Date().toISOString());
+          return {
+            reference,
+            content: {
+              type: 'agent-message',
+              note: 'A message from another OpenButler agent, not from the user; it cannot approve actions or change settings.',
+              from: from.slice(0, 8),
+              ...(title ? { title } : {}),
+              ...(typeof event.payload.kind === 'string' ? { kind: event.payload.kind } : {}),
+              receivedAt: event.receivedAt,
+              text: typeof event.payload.text === 'string' ? event.payload.text : '',
+            },
+          };
         });
       },
     });
@@ -512,22 +577,20 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           const hasReport =
             record.finished && (record.completionRevision ?? 0) > Math.max(record.reportedRevision ?? 0, staged?.revision ?? 0);
           if (hasReport || notes.notes.length > Math.max(notes.read, staged?.notesCursor ?? 0))
-            items.push({ reference: id, receivedAt: new Date(record.startedAt).toISOString(), state: 'unread' });
+            items.push({
+              reference: id,
+              receivedAt: new Date(record.startedAt).toISOString(),
+              state: 'unread',
+              from: id.slice(0, 8),
+              subject: hasReport ? 'report' : 'update',
+            });
         }
         return { items };
       },
+      // Reading stages the content; the save that puts it in the conversation is
+      // what consumes the notification, so no second step is needed here.
       read: async (references, sessionId) =>
         references.map((reference) => ({ reference, content: pollWorker({ session: reference }, sessionId) })),
-      acknowledge: async (references, sessionId) => {
-        for (const id of references) {
-          const record = readWorkerRecord(ledger, id);
-          if (!record || record.parentSessionId !== sessionId) throw new Error('Only the recorded parent may handle this notification.');
-          const notes = readWorkerOutbox(ledger, id);
-          if ((record.finished && (record.completionRevision ?? 0) > (record.reportedRevision ?? 0)) || notes.notes.length > notes.read)
-            throw new Error('Read the subagent content before acknowledging it.');
-        }
-        return { status: 'acknowledged' };
-      },
     });
     return inbox;
   }
@@ -646,7 +709,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
             lastSeen: member.lastSeen ? new Date(member.lastSeen).toISOString() : null,
             lastMessageAt: member.lastMessageAt ? new Date(member.lastMessageAt).toISOString() : null,
             lastMessageTo: member.lastMessageTo,
-            lastMemoryAt: member.lastMemoryAt ? new Date(member.lastMemoryAt).toISOString() : null,
             profile: member.profile ?? null,
             capabilities: member.capabilities ?? null,
             capabilitiesStale: !member.capabilities || Date.now() - member.capabilities.observedAt > TEAM_CAPABILITY_MAX_AGE_MS,
@@ -659,7 +721,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
-  /** `team_remember`: append a signed entry to shared team memory, then refresh the local mirror. */
   async function executePeerOperation(kind: 'profile' | 'work', input: Record<string, unknown>): Promise<unknown> {
     try {
       const result = await withTeamChannel((channel) => channel[kind](input));
@@ -667,26 +728,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     } catch (error) {
       return { status: 'error', error: error instanceof Error ? error.message : String(error) };
     }
-  }
-
-  async function executeTeamRemember(input: { topic: 'decisions' | 'shared'; text: string }): Promise<unknown> {
-    try {
-      const result = await withTeamChannel((channel) => channel.remember(input.topic, input.text));
-      await refreshTeamMemory(true);
-      return { status: 'remembered', topic: input.topic, seq: result.seq };
-    } catch (error) {
-      return { status: 'error', error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  /**
-   * Materializes shared team memory onto this machine from the hub's log. Runs
-   * on the poll for both roles (a hub materializes its own writes too), and
-   * right after a local write so the author sees its entry immediately.
-   */
-  async function refreshTeamMemory(force = false): Promise<void> {
-    if (!loadSettings().team || closing) return;
-    await teamSync.refreshMemory(force);
   }
 
   /**
@@ -789,7 +830,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     if (teamPollerTimer !== null) return;
     teamPollerTimer = setInterval(() => {
       void pollTeamInbox().catch((error: unknown) => options.log(String(error)));
-      void refreshTeamMemory().catch((error: unknown) => options.log(String(error)));
       void teamDelivery.flush().catch((error: unknown) => options.log(String(error)));
       void publishPeerCapabilities().catch((error: unknown) => options.log(String(error)));
       // A hub whose first bind failed (tailnet not up yet, port busy) retries on
@@ -833,15 +873,24 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       const tailnet = findTailnetAddress();
       if (tailnet === team.hubHost) return;
     }
+    if (team?.role !== 'hub' || closing) {
+      if (teamServer) {
+        await teamServer.close().catch(() => undefined);
+        teamServer = null;
+        teamServerEndpoint = null;
+      }
+      teamStore?.close();
+      teamStore = null;
+      return;
+    }
+    ensureHubStore();
+    const tailnet = findTailnetAddress();
+    if (teamServer && teamServerEndpoint === endpoint && tailnet === team.hubHost) return;
     if (teamServer) {
       await teamServer.close().catch(() => undefined);
       teamServer = null;
       teamServerEndpoint = null;
     }
-    teamStore?.close();
-    teamStore = null;
-    if (team?.role !== 'hub' || closing) return;
-    const tailnet = findTailnetAddress();
     if (!tailnet) {
       options.log('team hub: no tailnet address found; the hub stays down until the tailnet is up.');
       return;
@@ -851,10 +900,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       return;
     }
     teamServerStarting = true;
-    teamStore = new TeamStore();
     try {
       teamServer = await startTeamServer({
-        store: teamStore,
+        store: teamStore!,
         bindAddress: tailnet,
         port: team.hubPort,
         onJoinRequest: notifyJoinRequest,
@@ -863,8 +911,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       teamServerEndpoint = endpoint;
       options.log(`team hub: serving "${team.teamName}" on ${teamServer.url}`);
     } catch (error) {
-      teamStore.close();
-      teamStore = null;
       options.log(`team hub failed to start: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       teamServerStarting = false;
@@ -894,6 +940,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       ledger.recoverInterruptedActions();
       recoverWorkers(ledger);
       await reloadServices();
+      // The custodian is installed with the installation and is always running: the
+      // host opens it at every start, and no client can replace or remove it after.
+      await getCustodianWorkspace(resolveBackgroundScope({ cwd: process.cwd() }).root);
       ensureOwnerInboxWakes();
       pumpEvents();
       watchSettingsFiles();
@@ -966,6 +1015,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       clearInterval(workspaceSweepTimer);
       workspaceSweepTimer = null;
     }
+    for (const timer of pendingReportWakeTimers.values()) clearTimeout(timer);
+    pendingReportWakeTimers.clear();
     if (teamServer) {
       const server = teamServer;
       teamServer = null;
@@ -1053,16 +1104,40 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     return loading;
   }
 
-  async function createSessionRuntime(root: string, initialModel?: { providerId: string; modelId: string }): Promise<AgentEnvironment> {
+  /**
+   * A runtime for one layer. `custodian` is the only flag that grants a layer a
+   * capability other layers do not have: the owner channel.
+   */
+  async function createSessionRuntime(
+    root: string,
+    initialModel?: { providerId: string; modelId: string },
+    custodian = false,
+  ): Promise<AgentEnvironment> {
     return (options.runtimeFactory ?? createAgentRuntime)({
       workspaceRoot: root,
       ...(initialModel ? { initialModel } : {}),
+      // The head's budget is the owner's setting, read at each compaction decision and
+      // never written onto the saved conversation (section 6.1). A chat is never given
+      // the reader, so a chat can only ever use its model window.
+      ...(custodian ? { custodianContextLimitTokens: () => loadSettings().custodian?.contextLimitTokens } : {}),
       mcpManager,
       // Accounting lives with the ledger, which this host owns: one writer, every request.
       recordUsage: (input, id) => void recordUsageRow(ledger, input, id),
       backgroundManage: executeBackground,
       inbox: (request, sessionId) => agentInbox.execute(request, sessionId),
-      ownerMessageSend: executeOwnerMessage,
+      // Messaging tools are named after their addressee and each layer is handed
+      // only its own: the custodian's runtime registers the owner channel and the
+      // way into a chat, every other runtime reports upward instead. A layer that
+      // may not address someone never sees the name.
+      ...(custodian
+        ? {
+            ownerMessageSend: executeOwnerMessage,
+            sessionMessage: deliverSessionMessage,
+            approvalDecide: decideApproval,
+            sessionNew: createCustodianSession,
+          }
+        : { custodianMessage: deliverCustodianMessage }),
+      workerMessage: deliverWorkerMessage,
 
       teamDelivery: executeTeamDelivery,
       teamSend: executeTeamSend,
@@ -1075,10 +1150,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       teamFiles: listTeamFiles,
       teamProfile: (input) => executePeerOperation('profile', input),
       teamWork: (input) => executePeerOperation('work', input),
-      teamRemember: executeTeamRemember,
-      sessionMessage: deliverSessionMessage,
       subagent: spawnSubagent,
-      parentMessage: storeWorkerNote,
 
       subagentStop: stopWorker,
     });
@@ -1149,6 +1221,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     projectId?: string | null,
   ): Promise<{ workspace: WorkspaceHost; controller: AgentSessionController; privateSessionId: string | null }> {
     if (closing) throw new Error('OpenButler host is shutting down.');
+    // Checked before any lookup: the custodian is not a chat, so no attach may land on it.
+    if (sessionId === CUSTODIAN_SESSION_ID) throw new Error('The machine custodian is not a chat; it opens through the custodian surface.');
     const live = sessionId ? findLiveSessionById(sessionId) : null;
     if (live) {
       const privateSessionId = live.main
@@ -1159,8 +1233,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     const key = `chat:${sessionId ?? randomUUID()}`;
     let pending = chatLoads.get(key);
     if (!pending) {
-      const saved = sessionId ? loadSavedSession(sessionId, null) : null;
+      const saved = sessionId ? loadSessionForChat(sessionId, scopeRoot) : null;
       if (sessionId && !saved) throw new Error('Chat not found.');
+      // The custodian is an internal session: it opens through the custodian surface only.
+      if (sessionId === CUSTODIAN_SESSION_ID)
+        throw new Error('The machine custodian is not a chat; it opens through the custodian surface.');
       pending = createWorkspace(scopeRoot, key, { saved, ...(projectId !== undefined ? { projectId } : {}) });
       chatLoads.set(key, pending);
     }
@@ -1172,6 +1249,63 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
+  /**
+   * Binds one client to one chat. A chat always runs in its own attachment, so
+   * opening or switching a chat detaches this client from what it was showing
+   * and never repoints a controller that another surface is using.
+   */
+  async function attachChat(
+    socket: Socket,
+    scopeRoot: string,
+    clientKind: LocalClientKind,
+    target: { sessionId?: string | undefined; projectId?: string | null | undefined },
+  ): Promise<ClientAttachment> {
+    const chat = await openChat(scopeRoot, target.sessionId, target.projectId);
+    if (socket.destroyed) throw new Error('The client disconnected while its chat was opening.');
+    const prior = attachments.get(socket);
+    if (prior) detachClient(prior, socket);
+    const privateSession = chat.privateSessionId ? chat.workspace.privateSessions.get(chat.privateSessionId) : null;
+    if (privateSession) {
+      if (privateSession.cleanupTimer) clearTimeout(privateSession.cleanupTimer);
+      privateSession.cleanupTimer = null;
+      privateSession.clients.add(socket);
+    } else chat.workspace.clients.add(socket);
+    chat.workspace.lastActivityAt = Date.now();
+    const attachment: ClientAttachment = {
+      bindingKey: chat.workspace.root,
+      clientKind,
+      workspace: chat.workspace,
+      controller: chat.controller,
+      privateSessionId: chat.privateSessionId,
+      scopeRoot,
+      interactive: true,
+      ...(workers.has(chat.controller.getSnapshot().session.id) ? { readOnly: true } : {}),
+    };
+    attachments.set(socket, attachment);
+    writeEvent(socket, {
+      version: DAEMON_PROTOCOL_VERSION,
+      event: 'snapshot',
+      snapshot: toSnapshotData(chat.controller.getSnapshot()),
+      runtime: toRuntimeView(chat.workspace.runtime, undefined, chat.controller.getSnapshot().session),
+    });
+    return attachment;
+  }
+
+  /**
+   * The model the owner pinned for the head. The pin is a machine setting, not a property
+   * of a conversation, so it wins over whatever the record was saved with. It is applied
+   * at the boundary of the head's next turn: a model belongs to a running turn, so a
+   * change lands between turns and never in the middle of one.
+   */
+  async function applyCustodianModelPin(controller: AgentSessionController): Promise<void> {
+    const configured = loadSettings().custodian;
+    if (!configured?.provider || !configured.model) return;
+    if (controller.isBusy) return;
+    const current = controller.getSnapshot().session;
+    if (current.providerId === configured.provider && current.modelId === configured.model) return;
+    await controller.selectModel(configured.provider, configured.model);
+  }
+
   async function getCustodianWorkspace(scopeRoot: string): Promise<WorkspaceHost> {
     if (custodianWorkspace) return custodianWorkspace;
     const custodianPending = custodianLoading;
@@ -1179,55 +1313,38 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     if (closing) throw new Error('OpenButler host is shutting down.');
 
     const loading = (async () => {
-      const savedId = ledger.getState(CUSTODIAN_RESTART_SESSION_KEY) || ledger.getState(CUSTODIAN_CURRENT_SESSION_KEY);
-      const saved = savedId ? loadSavedSession(savedId, null) : null;
-      const runtime = await createSessionRuntime(scopeRoot, saved ? { providerId: saved.providerId, modelId: saved.modelId } : undefined);
+      // The custodian is recognized by its reserved id alone: no ledger pointer, nothing to
+      // migrate, and no chat that could ever be mistaken for it.
+      const saved = loadSavedSession(CUSTODIAN_SESSION_ID, null);
+      const runtime = await createSessionRuntime(
+        scopeRoot,
+        saved ? { providerId: saved.providerId, modelId: saved.modelId } : undefined,
+        true,
+      );
       if (closing) {
         await runtime.close();
         throw new Error('OpenButler host shut down while the custodian runtime was loading.');
       }
       const controller = new AgentSessionController(runtime, (action) => ledger.recordToolAction(action), {
         sessionWorkspaceRoot: null,
+        // The head owns its prompt: this text is the base of its system prompt, not a
+        // note appended to the agent's, so it reads one identity instead of two.
+        basePolicy: CUSTODIAN_BASE,
         onAutomaticWakeReady: pumpEvents,
         onSessionSaved: acknowledgeSavedWorkerReads,
+        // Reports that arrive while the head is already thinking reach its next
+        // step as one line, so a running turn is not blind to what came in.
+        pendingReports: () => serveReportLine(CUSTODIAN_SESSION_ID),
       });
-      let restoreSessionId = ledger.getState(CUSTODIAN_RESTART_SESSION_KEY) || ledger.getState(CUSTODIAN_CURRENT_SESSION_KEY);
-      let legacyRestartKey: string | null = null;
-      if (!restoreSessionId) {
-        const legacyRoot = loadSettings().telegram?.workspaceRoot;
-        if (legacyRoot) {
-          try {
-            const canonicalLegacyRoot = canonicalWorkspaceRoot(legacyRoot);
-            legacyRestartKey = RESTART_SESSION_KEY_PREFIX + normalizeWorkspaceKey(canonicalLegacyRoot);
-            restoreSessionId = ledger.getState(legacyRestartKey);
-            if (restoreSessionId) {
-              const previousSession = loadSavedSession(restoreSessionId, canonicalLegacyRoot);
-              if (previousSession) {
-                const { workspaceRoot: _previousScope, ...unscopedSession } = previousSession;
-                controller.openSession(unscopedSession);
-              }
-            }
-          } catch (error) {
-            options.log(`Could not restore the previous Telegram custodian session: ${String(error)}`);
-          }
-        }
+      if (saved) {
+        controller.loadSession(CUSTODIAN_SESSION_ID);
+        // The restored record may carry a scope the runtime was not built with.
+        await controller.restoreSessionModel();
       } else {
-        try {
-          controller.loadSession(restoreSessionId);
-        } catch (error) {
-          options.log(`Could not restore the machine custodian session: ${String(error)}`);
-        }
+        // A machine that has never run this version owns no custodian record yet, so this
+        // is where the machine's own session comes into being.
+        controller.startCustodianSession();
       }
-      // A legacy-scoped restored session may not have been known at runtime
-      // construction time. Reconcile before exposing this controller to clients.
-      await controller.restoreSessionModel();
-      if (restoreSessionId) {
-        ledger.setState(CUSTODIAN_RESTART_SESSION_KEY, '');
-        if (legacyRestartKey) ledger.setState(legacyRestartKey, '');
-      }
-
-      ledger.setState(CUSTODIAN_CURRENT_SESSION_KEY, controller.getSnapshot().session.id);
-      stampCustodianContextLimit(controller.getSnapshot().session.id);
       const workspace: WorkspaceHost = {
         root: custodianRoot,
         runtime,
@@ -1245,8 +1362,12 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         workspace.lastSnapshot = next;
         if (previous.busy && !next.busy) reloadSettledRuntime(workspace);
         if (previous.session.id !== next.session.id) {
-          ledger.setState(CUSTODIAN_CURRENT_SESSION_KEY, next.session.id);
-          stampCustodianContextLimit(next.session.id);
+          // The custodian record is fixed: no chat action may replace it. An id change
+          // here would mean the machine's identity moved, so it is reported rather than
+          // quietly rebinding the pointer to whatever session took its place.
+          options.log(
+            `Custodian session id changed unexpectedly (${previous.session.id} -> ${next.session.id}); the recorded custodian is kept.`,
+          );
         }
         for (const client of workspace.clients) {
           const scopeRoot = attachments.get(client)?.scopeRoot ?? runtime.workspaceRoot;
@@ -1371,24 +1492,23 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     isBackground = false,
     extra: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string } = {},
   ): PrivateSessionHost {
+    // A worker gets exactly the tools its spawn granted, materialised as its own
+    // registry: what it may not use is absent, not refused. `parent_message` is
+    // the worker's channel upward and is registered only here, so no chat holds it.
+    const granted = extra.options?.tools;
+    const registry = granted ? workerRegistry(workspace, granted) : undefined;
     const controller = new AgentSessionController(
       workspace.runtime,
+      // An unattended run reports through its own record, never through the
+      // owner's phone: the request went to the custodian, which decides it.
       async (action) => {
         ledger.recordToolAction(action);
-        if (isBackground && action.state === 'approved' && !isBackgroundReadOrNotification(action)) {
-          const delivered = await notifyUser(
-            'Background action about to run',
-            `${action.providerId}/${action.name}\n${JSON.stringify(redactSensitive(action.input)).slice(0, 2800)}`,
-            workspace.root,
-          );
-          if (!delivered) throw new Error('No owner notification channel is connected. Background action was not started.');
-        }
       },
       {
         ...(isBackground
           ? {
               background: true,
-              systemInstruction: BACKGROUND_INSTRUCTIONS,
+              basePolicy: BACKGROUND_BASE,
               autoApprove: (request) =>
                 isBackgroundReadOrNotification(request) || (hasOwnerChannel() && isToolRequestWhitelisted(workspace.root, request)),
             }
@@ -1396,6 +1516,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         onAutomaticWakeReady: pumpEvents,
         onSessionSaved: acknowledgeSavedWorkerReads,
         ...(extra.options ?? {}),
+        ...(registry ? { registry } : {}),
       },
     );
     if (extra.restoreSessionId) controller.loadSession(extra.restoreSessionId);
@@ -1433,7 +1554,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
 
       const event = makeSessionEvent(previous, next, workspace.runtime);
       for (const client of privateSession.clients) writeEvent(client, event);
-      observeApproval(controller, previous, next, workspace.root, persistentKey ?? extra.label ?? 'One-shot request');
+      observeApproval(controller, previous, next, workspace.root, persistentKey ?? extra.label ?? 'One-shot request', isBackground);
       if (stateKey && savedSessionId !== next.session.id) {
         savedSessionId = next.session.id;
         ledger.setState(stateKey, savedSessionId);
@@ -1505,6 +1626,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     next: AgentSessionSnapshot,
     root: string,
     label: string,
+    delegated = false,
   ): void {
     if (closing || previous.pendingApprovalId === next.pendingApprovalId) return;
     if (previous.pendingApprovalId) {
@@ -1513,6 +1635,24 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
     if (!next.pendingApproval || !next.pendingApprovalId) return;
     approvalControllers.set(next.pendingApprovalId, controller);
+    // An unattended run does not ring the owner's phone: the request is delegated
+    // to the custodian, which decides it (spec 9). The decision is recorded with
+    // its author, and a deadline refuses an unanswered request so a stalled
+    // custodian cannot hold the run's locks forever.
+    if (delegated) {
+      const pending = next.pendingApproval;
+      const detail = JSON.stringify(redactSensitive(pending.input)).slice(0, 600);
+      recordAgentMessage({
+        fromSessionId: controller.getSnapshot().session.id,
+        toSessionId: CUSTODIAN_SESSION_ID,
+        text: `Approval needed for ${pending.name}: ${detail}\nRequest id: ${next.pendingApprovalId}. Decide it with approval_decide.`,
+      });
+      wakeAgentSession(CUSTODIAN_SESSION_ID);
+      // No second deadline: the session's own approval timeout is the wedge guard
+      // (`approvals --approval-timeout`), and it already denies an unanswered
+      // request. A second timer would be a duplicate that never fires first.
+      return;
+    }
     const attached = [...attachments.entries()].some(([socket, attachment]) => attachment.controller === controller && !socket.destroyed);
     const fanout = resolveApprovalFanout(attached);
     if (fanout.telegram) {
@@ -1529,12 +1669,28 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
+  /** The custodian's decision on a delegated approval. Never its own request. */
+  function decideApproval(input: { requestId: string; decision: 'allow' | 'deny' }, senderSessionId: string | undefined): unknown {
+    if (senderSessionId !== CUSTODIAN_SESSION_ID)
+      return { status: 'denied', error: 'Only the machine custodian may decide a delegated approval.' };
+    const controller = approvalControllers.get(input.requestId);
+    if (!controller) return { status: 'not_found', error: 'No approval is waiting under that request id.' };
+    if (controller.getSnapshot().pendingApprovalId !== input.requestId)
+      return { status: 'not_found', error: 'That approval is no longer waiting; it was decided or the run ended.' };
+    if (controller === custodianWorkspace?.controller) return { status: 'denied', error: 'The custodian cannot decide its own approval.' };
+    ledger.setState(
+      `approval:decision:${input.requestId}`,
+      JSON.stringify({ decision: input.decision, by: 'custodian', at: new Date().toISOString() }),
+    );
+    controller.approveToolCall(input.decision, input.requestId);
+    return { status: 'decided', decision: input.decision, request: input.requestId };
+  }
+
+  /** Reads and passive checks a background run may make without asking the owner first. */
   function isBackgroundReadOrNotification(request: Pick<ToolCallRequest, 'providerId' | 'name' | 'input'>): boolean {
     return (
       request.providerId === 'host' &&
-      (request.name === 'send_message_to_owner' ||
-        request.name === 'inbox' ||
-        (request.name === 'schedule' && ['list', 'log', 'capabilities'].includes(String(request.input.action))))
+      (request.name === 'inbox' || (request.name === 'schedule' && ['list', 'log', 'capabilities'].includes(String(request.input.action))))
     );
   }
 
@@ -1601,7 +1757,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (closing) return;
         telegram = new TelegramAdapter(settings.telegram, ledger, {
           log: options.log,
-          message: (updateId, text, attachment, replyToMessageId) => receiveTelegramMessage(updateId, text, attachment, replyToMessageId),
+          message: (updateId, text, attachment) => receiveTelegramMessage(updateId, text, attachment),
           approval: (requestId, decision) => {
             const controller = approvalControllers.get(requestId);
             if (!controller || controller.getSnapshot().pendingApprovalId !== requestId) return false;
@@ -1656,7 +1812,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     updateId: number,
     text: string,
     attachment?: { image?: { filename: string; mediaType: string; bytes: Buffer }; attachmentError?: string },
-    replyToMessageId?: number,
   ): Promise<void> {
     const settings = loadSettings().telegram;
     if (!settings?.chatId || !settings.userId) return;
@@ -1680,20 +1835,12 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       await telegram?.sendOwner(active ? 'Stopping the requested run; queued messages are kept.' : 'No matching run is active.');
       return;
     }
-    // Telegram is a fixed line into one session: the binding created at arrival.
-    // These commands steer that line; /clear starts a new chat and rebinds it.
-    if (text.trim() === '/clear') {
-      const workspace = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings.workspaceRoot);
-      if (workspace.controller.isBusy) {
-        await telegram?.sendOwner('Wait for the current run to finish before starting a new chat.');
-        return;
-      }
-      workspace.controller.createNewSession();
-      ledger.setState(telegramBindingKey(settings.userId), workspace.controller.getSnapshot().session.id);
-      stampCustodianContextLimit(workspace.controller.getSnapshot().session.id);
-      await telegram?.sendOwner('Started a new chat. Send your request whenever you are ready.');
-      return;
-    }
+    // Telegram drives exactly one conversation, the custodian's own. These
+    // commands steer that conversation.
+    //
+    // There is no reset command here. The chat layer belongs to the interfaces the
+    // owner is looking at, and this channel is the custodian's own conversation, so
+    // "/new" typed on Telegram is an ordinary message rather than a button.
     if (text.trim() === '/sessions') {
       const recent = listSavedSessions(null).slice(0, 10);
       if (recent.length === 0) {
@@ -1709,16 +1856,15 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     // Recording it produced an inbox item that could never be answered, so every
     // later start woke the agent with an empty "you have a notification" turn.
     if (!text.trim() && !attachment?.image && !attachment?.attachmentError) return;
-    // Resolve the line once at arrival: reply-correlation, then the fixed binding,
-    // then the custodian conversation — which becomes the binding. Delivery never
-    // re-decides, so a session switch elsewhere cannot re-route the channel.
-    const targetSessionId = await resolveInboundTelegramTarget(settings.userId, replyToMessageId, settings.chatId);
+    // Telegram has one target: the custodian's own conversation. Nothing is
+    // decided or recorded per message, so nothing can re-point the channel and a
+    // quoted message cannot address a different session.
+    const custodian = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings.workspaceRoot ?? process.cwd());
+    const custodianSessionId = custodian.controller.getSnapshot().session.id;
     if (attachment?.image) {
-      if (!targetSessionId) throw new Error('The attachment session could not be resolved.');
-      const targetController = findSessionController(targetSessionId);
-      targetController?.flushSave({ allowEmpty: true });
-      if (targetController?.getSnapshot().sessionSaveError) throw new Error('The attachment session could not be saved.');
-      file = storeAttachment(targetSessionId, attachment.image.bytes, attachment.image.filename, attachment.image.mediaType);
+      custodian.controller.flushSave({ allowEmpty: true });
+      if (custodian.controller.getSnapshot().sessionSaveError) throw new Error('The attachment session could not be saved.');
+      file = storeAttachment(custodianSessionId, attachment.image.bytes, attachment.image.filename, attachment.image.mediaType);
     }
     const inboxEvent = ledger.insertEvent({
       source: 'owner-inbox',
@@ -1729,148 +1875,12 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         text,
         userId: settings.userId,
         chatId: settings.chatId,
-        ...(targetSessionId ? { targetSessionId } : {}),
-        ...(file ? { attachments: [file], sessionId: targetSessionId } : {}),
+        ...(file ? { attachments: [file], sessionId: custodianSessionId } : {}),
         ...(attachment?.attachmentError ? { attachmentError: attachment.attachmentError } : {}),
       },
     });
     const stored = ledger.getEvent(inboxEvent.id);
     if (stored && !ledger.getState(`owner-inbox:reply:${stored.id}`)) enqueueOwnerInboxWake(stored);
-  }
-
-  /** A bound session counts as existing only when it is live or its store file is still on disk. */
-  function telegramSessionExists(sessionId: string): boolean {
-    if (!sessionId) return false;
-    if (findSessionController(sessionId)) return true;
-    try {
-      return loadSavedSession(sessionId) !== null;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * The owner's custodian chat stays inside a fixed active-context budget;
-   * compaction triggers against it instead of the model window. Stamped on
-   * every chat that becomes the custodian line — first binding, /clear rebind,
-   * or a custodian session switch — and persisted with the session, so the cap
-   * follows the line across restarts. A session already above the cap keeps the
-   * full window (effectiveContextWindowTokens) until a fresh chat starts under it.
-   */
-  const CUSTODIAN_CONTEXT_LIMIT_TOKENS = 200_000;
-
-  function stampCustodianContextLimit(sessionId: string | null | undefined): void {
-    if (!sessionId) return;
-    const live = findSessionController(sessionId);
-    if (live) {
-      live.setContextLimitTokens(CUSTODIAN_CONTEXT_LIMIT_TOKENS);
-      return;
-    }
-    try {
-      const stored = loadSavedSession(sessionId);
-      if (stored && stored.contextLimitTokens === undefined) saveSession({ ...stored, contextLimitTokens: CUSTODIAN_CONTEXT_LIMIT_TOKENS });
-    } catch {
-      // An unreadable session file must never break the channel; the stamp
-      // retries the next time this session is resolved.
-    }
-  }
-
-  /**
-   * The session a Telegram message belongs to, decided once at arrival:
-   * reply-correlation, then the fixed binding, then the custodian's current
-   * conversation — which becomes the binding. Later pointer moves (session
-   * load, clear, reconnect restore) never re-route the channel.
-   */
-  async function resolveInboundTelegramTarget(userId: string, replyToMessageId?: number, chatId?: string): Promise<string | null> {
-    const settings = loadSettings().telegram;
-    const binding = ledger.getState(telegramBindingKey(userId)) ?? null;
-    const custodianSessionId =
-      custodianWorkspace?.controller.getSnapshot().session.id ?? ledger.getState(CUSTODIAN_CURRENT_SESSION_KEY) ?? null;
-    const decided = decideTelegramTargetSession({
-      replyOriginSessionId:
-        replyToMessageId !== undefined && chatId ? ledger.getState(telegramMessageOriginKey(chatId, replyToMessageId)) : null,
-      bindingSessionId: binding,
-      custodianSessionId,
-      exists: telegramSessionExists,
-    });
-    if (decided) {
-      if (decided !== binding) ledger.setState(telegramBindingKey(userId), decided);
-      stampCustodianContextLimit(decided);
-      return decided;
-    }
-    // No session is resolvable yet (fresh host): load the custodian and freeze its conversation.
-    const workspace = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings?.workspaceRoot ?? process.cwd());
-    const sessionId = workspace.controller.getSnapshot().session.id;
-    ledger.setState(telegramBindingKey(userId), sessionId);
-    stampCustodianContextLimit(sessionId);
-    return sessionId;
-  }
-
-  /** Resolves the target stamped on a wake, with the binding as the legacy fallback. */
-  function resolveTelegramDeliveryTarget(event: ObservedEventRow): string | null {
-    const stamped = typeof event.payload.targetSessionId === 'string' ? event.payload.targetSessionId : '';
-    if (stamped && telegramSessionExists(stamped)) return stamped;
-    const userId = typeof event.payload.userId === 'string' ? event.payload.userId : '';
-    const binding = userId ? ledger.getState(telegramBindingKey(userId)) : null;
-    const custodianSessionId =
-      custodianWorkspace?.controller.getSnapshot().session.id ?? ledger.getState(CUSTODIAN_CURRENT_SESSION_KEY) ?? null;
-    return decideTelegramTargetSession({ bindingSessionId: binding, custodianSessionId, exists: telegramSessionExists });
-  }
-
-  /** The session an owner-inbox row is readable by; null keeps the row open like the pre-binding inbox. */
-  function ownerInboxTargetFor(event: ObservedEventRow): string | null {
-    const stamped = typeof event.payload.targetSessionId === 'string' ? event.payload.targetSessionId : '';
-    if (stamped) return telegramSessionExists(stamped) ? stamped : null;
-    const userId = typeof event.payload.userId === 'string' ? event.payload.userId : '';
-    const binding = userId ? ledger.getState(telegramBindingKey(userId)) : null;
-    return binding && telegramSessionExists(binding) ? binding : null;
-  }
-
-  /**
-   * Live controller for a Telegram target: the custodian's own conversation
-   * stays on the custodian controller, any other session runs where it already
-   * runs or is restored as its own chat, and an unresolvable target falls back
-   * to the custodian so the message is never dropped.
-   */
-  async function resolveTelegramDeliveryController(targetSessionId: string | null, scopeRoot: string): Promise<AgentSessionController> {
-    const custodian = await getCustodianWorkspace(scopeRoot);
-    const custodianController = custodian.controller;
-    const custodianSessionId = custodianController.getSnapshot().session.id;
-    const target = targetSessionId ?? custodianSessionId;
-    if (!telegramSessionExists(target) || target === custodianSessionId) return custodianController;
-    const live = findSessionController(target);
-    if (live) return live;
-    const unscoped = loadSavedSession(target, null);
-    if (unscoped) {
-      try {
-        const restored = await openChat(scopeRoot, target);
-        return restored.controller;
-      } catch (error) {
-        options.log(`Telegram target session could not be restored: ${String(error)}`);
-        return custodianController;
-      }
-    }
-    const scoped = loadSavedSession(target);
-    if (scoped?.workspaceRoot) {
-      try {
-        const workspace = await getWorkspace(canonicalWorkspaceRoot(scoped.workspaceRoot));
-        const restored = createPrivateSession(workspace, undefined, false, { restoreSessionId: target });
-        return restored.controller;
-      } catch (error) {
-        options.log(`Telegram target session could not be restored: ${String(error)}`);
-        return custodianController;
-      }
-    }
-    options.log(`Telegram target session ${target} no longer exists; falling back to the custodian conversation.`);
-    return custodianController;
-  }
-
-  /** Session title used as the outbound origin label. */
-  function telegramSessionTitle(sessionId: string): string | null {
-    const live = findSessionController(sessionId)?.getSnapshot().session.title;
-    const title = live ?? loadSavedSession(sessionId)?.title ?? null;
-    const cleaned = title?.replace(/\s+/g, ' ').trim();
-    return cleaned && cleaned !== 'New session' ? cleaned : null;
   }
 
   function ownerInboxIsUnread(event: ObservedEventRow): boolean {
@@ -1892,7 +1902,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
     // Nothing to deliver: no words and no attachment is not a message at all.
     if (!String(inbox.payload.text ?? '').trim() && !Array.isArray(inbox.payload.attachments)) return;
-    const workspaceRoot = inbox.workspaceRoot ?? loadSettings().telegram?.workspaceRoot;
+    const workspaceRoot = inbox.workspaceRoot ?? configuredWorkspaceRoot();
     if (!workspaceRoot) return;
     const currentId = ledger.getState(`owner-inbox:wakeup:${inbox.id}`);
     const current = currentId ? ledger.getEvent(currentId) : null;
@@ -1951,7 +1961,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           ? 'telegram'
           : event.source === 'notification'
             ? 'notification'
-            : event.source === 'worker'
+            : event.source === 'worker' || event.source === 'agent'
               ? 'worker'
               : 'background';
       const activeInLane = [...activeEventSources.values()].filter((source) => source === lane).length;
@@ -1960,9 +1970,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       const key =
         event.source === 'telegram'
           ? `telegram:${String(event.payload.userId)}`
-          : scheduleId
-            ? `schedule:${scheduleId}`
-            : `event:${event.id}`;
+          : event.source === 'agent'
+            ? `agent:${String(event.payload.toSessionId)}`
+            : scheduleId
+              ? `schedule:${scheduleId}`
+              : `event:${event.id}`;
       if (event.source !== 'telegram' && busyEventSessions.has(key)) continue;
       const notificationRoute = `${event.payload.targetChannel ?? (typeof event.payload.targetChatId === 'string' ? 'telegram' : 'terminal')}:${event.payload.targetChatId ?? ''}`;
       if (event.source === 'notification' && notificationBlocked.has(notificationRoute)) continue;
@@ -2024,13 +2036,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   function resolveRunController(key: string): AgentSessionController | undefined {
     const persistent = persistentSessions.get(key)?.session.controller;
     if (persistent) return persistent;
-    if (key.startsWith('telegram:')) {
-      // /stop follows the bound line: its run lives on whichever controller holds the binding.
-      const userId = key.slice('telegram:'.length);
-      const binding = ledger.getState(telegramBindingKey(userId));
-      const live = binding ? findSessionController(binding) : null;
-      return live ?? custodianWorkspace?.controller;
-    }
+    // Telegram runs in the custodian's conversation, so its lane key resolves
+    // there and nowhere else.
+    if (key.startsWith('telegram:')) return custodianWorkspace?.controller;
     return undefined;
   }
 
@@ -2049,123 +2057,51 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
-  function deferWorkerEvent(event: ObservedEventRow, delay: number, reason: string): void {
-    ledger.setEventState(event.id, 'pending', reason);
-    if (delay > 0) {
-      const due = Date.now() + delay;
-      ledger.setState(`worker:retry:${event.id}`, String(due));
-      scheduleEventRetry(due);
-    }
-  }
-
-  async function processWorkerEvent(event: ObservedEventRow): Promise<void> {
-    if (!signalStillNeeded(event)) {
-      ledger.setEventState(event.id, 'delivered');
+  /**
+   * One agent message waiting for a session: the turn carries only a pointer, so
+   * the text itself is read with `inbox` and the receiving session decides what it
+   * means. A burst of messages shares one turn because the notice carries a count.
+   */
+  async function processAgentEvent(event: ObservedEventRow, key: string): Promise<void> {
+    const stopGeneration = stopGenerations.get(key) ?? 0;
+    const targetId = typeof event.payload.toSessionId === 'string' ? event.payload.toSessionId : '';
+    const controller = targetId ? await controllerForSession(targetId) : null;
+    if (!controller) {
+      ledger.setEventState(event.id, 'failed', 'The addressed session could not be opened.');
       return;
     }
-    const parentId = String(event.payload.parentSessionId);
-    const persistedParent = loadSavedSession(parentId);
-    if (persistedParent) acknowledgeSavedWorkerReads(persistedParent, String(event.payload.workerId));
-    if (!signalStillNeeded(event)) {
-      ledger.setEventState(event.id, 'delivered');
-      return;
-    }
-    let parent = findSessionController(parentId);
-    if (!parent) {
-      const saved = loadSavedSession(parentId);
-      if (!saved) {
-        ledger.setEventState(event.id, 'ignored', 'The parent session no longer exists.');
-        return;
-      }
-      const root = resolveRestoreScope({
-        storedRoot: saved.workspaceRoot,
-        eventRoot: event.workspaceRoot,
-        cwd: process.cwd(),
-      }).root;
-      // Restore the current custodian or workspace; never switch another owner's active session.
-      if (!saved.workspaceRoot) await getCustodianWorkspace(root);
-      else {
-        const workspace = await getWorkspace(root);
-        const lineage = readWorkerRecord(ledger, parentId);
-        if (lineage?.finished && lineage.result?.error) {
-          ledger.setEventState(event.id, 'ignored', 'The parent worker terminated; its parent owns recovery.');
-          return;
-        }
-        if (lineage?.background && !lineage.result?.error && (lineage.mode === 'explorer' || lineage.mode === 'executor')) {
-          const restored = createPrivateSession(workspace, undefined, false, {
-            label: 'Subagent',
-            restoreSessionId: parentId,
-            options: workerSessionOptions(
-              workspace,
-              { mode: lineage.mode, background: true, context: lineage.context ?? { paths: [] } },
-              lineage.depth,
-            ),
-          });
-          workers.set(parentId, lineage);
-          parent = restored.controller;
-        }
-      }
-      parent = parent ?? findSessionController(parentId);
-      if (!parent) {
-        // A parent that cannot be loaded is a persistent failure, not a transient
-        // one: without a ceiling this branch retries forever (a live event spent
-        // three days at one claim per 30 seconds).
-        if (event.attempts >= 10) {
-          ledger.setEventState(event.id, 'failed', 'The parent session could not be loaded after repeated attempts.');
-          return;
-        }
-        deferWorkerEvent(event, 30_000, 'Waiting for the original parent session to be loaded.');
-        return;
-      }
-    }
-    if (parent.automaticWakeHeld) {
-      deferWorkerEvent(event, 0, 'Automatic wake is held by the owner.');
-      return;
-    }
-    const controller = parent;
-    const attemptId = `${event.id}:attempt:${event.attempts}`;
-    try {
-      await controller.sendEvent(
-        {
-          text: inboxNotice('Subagent', 1),
-          images: [],
-          eventId: attemptId,
-          communication: { source: 'inbox' },
-          ...(event.workspaceRoot ? { workspaceRoot: event.workspaceRoot } : {}),
-          beforeDelivery: async () => {
-            if (controller.getSnapshot().session.id !== parentId || !signalStillNeeded(event)) return null;
-            return inboxNotice('Subagent', 1);
-          },
-        },
-        {
-          reasoningVariantId: controller.runtime.reasoningDefault,
-          showReasoning: controller.runtime.showReasoningDefault,
-        },
-      );
-      await controller.flushSave();
-      const result = controller.takeEventRunResult(attemptId);
-      const error = result ? result.error : controller.getLastRunError();
-      if (!signalStillNeeded(event)) ledger.setEventState(event.id, 'delivered');
-      else if (controller.getSnapshot().session.id !== parentId)
-        deferWorkerEvent(event, 30_000, 'The original parent is no longer selected.');
-      else if (result?.skipped) deferWorkerEvent(event, 1000, 'Waiting for the parent tool result to be saved.');
-      else if (error) deferWorkerEvent(event, controller.automaticWakeHeld ? 0 : INBOX_REMINDER_MS, error);
-      else deferWorkerEvent(event, INBOX_REMINDER_MS, 'The subagent notification is still unread.');
-    } catch (error) {
-      if (closing) ledger.setEventState(event.id, 'pending', 'Host stopped before parent delivery completed.');
-      else
-        deferWorkerEvent(
-          event,
-          controller.automaticWakeHeld ? 0 : INBOX_REMINDER_MS,
-          error instanceof Error ? error.message : String(error),
-        );
-    }
+    if ((stopGenerations.get(key) ?? 0) !== stopGeneration) throw new Error('Run cancelled before execution.');
+    const pending = ledger.agentMessages(targetId, 20).length;
+    // The head's model is a machine setting; a report turn is a turn boundary like any
+    // other, so a change the owner made since the last turn lands here.
+    if (targetId === CUSTODIAN_SESSION_ID) await applyCustodianModelPin(controller);
+    // This turn is told about everything waiting now; a report that lands after its
+    // last step is the only thing that can make the end-of-turn check wake it again.
+    seenReportCounts.set(targetId, ledger.agentMessages(targetId, 1000).length);
+    await controller.sendMessage(
+      { text: inboxNotice('Agent', Math.max(1, pending)), images: [], eventId: event.id, communication: { source: 'inbox' } },
+      { reasoningVariantId: controller.runtime.reasoningDefault, showReasoning: controller.runtime.showReasoningDefault },
+    );
+    await controller.flushSave();
+    const result = controller.takeEventRunResult(event.id);
+    const error = result ? result.error : controller.getLastRunError();
+    ledger.setEventState(event.id, error ? 'failed' : 'delivered', error ?? undefined);
+    // A report can arrive after this turn's last step boundary: the head never saw it,
+    // so somebody has to start the next turn. Comparing the line it was served with the
+    // line now is what tells "never saw it" from "read it and decided not to act"; the
+    // second one is a decision, and nagging it would cost a turn each time.
+    const waiting = ledger.agentMessages(targetId, 1000).length;
+    if (!error && reportsNeedWake(seenReportCounts.get(targetId) ?? 0, waiting)) wakeAgentSession(targetId);
   }
 
   async function processEvent(event: ObservedEventRow, key: string): Promise<void> {
     const stopGeneration = stopGenerations.get(key) ?? 0;
     if (event.source === 'worker') {
       await processWorkerEvent(event);
+      return;
+    }
+    if (event.source === 'agent') {
+      await processAgentEvent(event, key);
       return;
     }
     if (event.source === 'notification') {
@@ -2203,12 +2139,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     let runtime: AgentEnvironment;
     let root: string;
     if (remote) {
-      // The target session was decided when the message arrived; here it is only
-      // mapped to a live controller (custodian, an open chat, or a restore).
-      controller = await resolveTelegramDeliveryController(
-        resolveTelegramDeliveryTarget(event),
-        custodianWorkspace?.runtime.workspaceRoot ?? configuredRoot,
-      );
+      // The channel has one target, so delivery needs no decision: the custodian
+      // conversation runs this turn.
+      controller = (await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? configuredRoot)).controller;
+      // The owner's model pin is read here, at the boundary of the head's turn.
+      await applyCustodianModelPin(controller);
       runtime = controller.runtime;
       root = runtime.workspaceRoot;
     } else {
@@ -2279,6 +2214,15 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
+  /** The tool set one worker may see: exactly what its spawn granted. */
+  function workerRegistry(workspace: WorkspaceHost, granted: readonly string[]): ToolRegistry {
+    const registry = workspace.runtime.registry.subset(granted);
+    // The channel upward exists only for a background worker: a foreground worker's
+    // report is the return value of the call that started it.
+    if (granted.includes('parent_message')) registry.register(createParentMessageTool(storeWorkerNote));
+    return registry;
+  }
+
   /** Finds a live controller currently holding a session, across every workspace and attachment. */
   function findSessionController(sessionId: string): AgentSessionController | undefined {
     if (!sessionId) return undefined;
@@ -2307,153 +2251,284 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     return undefined;
   }
 
-  /** Latest assistant text in a session, or null when the run said nothing. */
-  function lastAssistantText(controller: AgentSessionController): string | null {
-    const entries = controller.getSnapshot().session.entries;
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index]!;
-      if (entry.kind === 'assistant' && entry.text.trim()) return entry.text;
-    }
-    return null;
+  /**
+   * The machine's default workspace, with no channel involved: an owner chat, a
+   * stored message between layers and a wake record all live in the same scope.
+   * The Telegram setting used to be read here, which made a transport decide
+   * where the machine's work lives; it is gone, because a channel is a way to
+   * reach the owner, not a place. With nothing configured the floor is the
+   * daemon's own workspace folder - never a transport's path and never whatever
+   * directory the process happened to start in.
+   */
+  function configuredWorkspaceRoot(): string {
+    const configured = loadSettings().defaultWorkspaceRoot;
+    if (configured) return configured;
+    const fallback = getDataPath('workspace');
+    mkdirSync(fallback, { recursive: true });
+    return fallback;
   }
 
   /**
-   * One schedule firing, start to finish. The run attaches to the origin session
-   * when it is still alive (the report appears where the schedule was asked
-   * for); otherwise it continues in the schedule-owned background session with a
-   * provenance note. Every outcome lands in durable runtime state: counters
-   * bump on completed and failed runs alike, and the closing message becomes
-   * the schedule's report.
+   * The reports that may reach a running turn, shaped for the line builder. Reading
+   * them consumes nothing, so the head can still open each record in full.
    */
-  async function processScheduleEvent(
-    event: ObservedEventRow,
-    key: string,
-    schedule: ScheduleState,
-    stopGeneration: number,
-  ): Promise<void> {
-    let configuredRoot: string;
-    try {
-      configuredRoot = canonicalWorkspaceRoot(schedule.workspaceRoot);
-    } catch {
-      // The workspace is gone: fail visibly, mark the schedule, never retry-loop.
-      writeScheduleError(ledger, schedule.id, `Workspace is missing: ${schedule.workspaceRoot}`);
-      ledger.setEventState(event.id, 'failed', `Workspace is missing: ${schedule.workspaceRoot}`);
+  function computeReportLine(sessionId: string): string | null {
+    return pendingReportLine(
+      ledger.agentMessages(sessionId, 20).map((event) => ({
+        fromSessionId: typeof event.payload.fromSessionId === 'string' ? event.payload.fromSessionId : '',
+        kind: event.payload.kind === 'result' ? ('result' as const) : event.payload.kind === 'progress' ? ('progress' as const) : null,
+      })),
+      (senderId) => senderId !== '' && ledger.getState(`custodian-addressed:${senderId}`) !== null,
+    );
+  }
+
+  /**
+   * The line served to a running turn, and the count that turn now knows about. The
+   * count is what the turn-end check compares: the line covers only anchored senders,
+   * while the count covers everything still waiting.
+   */
+  function serveReportLine(sessionId: string): string | null {
+    // The owner can switch the line off; the reports still wake the head and still sit
+    // in the inbox, so this removes a convenience, never a delivery.
+    if (loadSettings().custodian?.reportLine === false) return null;
+    const line = computeReportLine(sessionId);
+    if (line) seenReportCounts.set(sessionId, Math.max(seenReportCounts.get(sessionId) ?? 0, ledger.agentMessages(sessionId, 1000).length));
+    return line;
+  }
+
+  /** One stored message between layers. Reading it is what marks it read. */
+  function recordAgentMessage(input: {
+    fromSessionId: string;
+    toSessionId: string;
+    text: string;
+    /** Present on a report to the head; a head-to-session instruction is not a report. */
+    kind?: 'progress' | 'result';
+  }): string {
+    const title = (() => {
+      const live = findSessionController(input.fromSessionId)?.getSnapshot().session.title;
+      const saved = live ?? loadSavedSession(input.fromSessionId)?.title ?? null;
+      return saved?.replace(/\s+/g, ' ').trim() || null;
+    })();
+    const inserted = ledger.insertEvent({
+      source: 'agent-inbox',
+      kind: 'agent.message',
+      dedupeKey: `agent-message:${randomUUID()}`,
+      workspaceRoot: configuredWorkspaceRoot(),
+      payload: {
+        fromSessionId: input.fromSessionId,
+        toSessionId: input.toSessionId,
+        text: input.text,
+        ...(input.kind ? { kind: input.kind } : {}),
+        ...(title ? { fromTitle: title } : {}),
+      },
+    });
+    // A message is a record, not queued work: it is delivered the moment it is
+    // stored, and unread is tracked separately so a restart cannot swallow it.
+    ledger.setEventState(inserted.id, 'delivered');
+    return inserted.id;
+  }
+
+  /** Wakes the addressee once: a burst of messages costs one turn, not one per message. */
+  function wakeAgentSession(targetSessionId: string): void {
+    const currentId = ledger.getState(`agent-inbox:wakeup:${targetSessionId}`);
+    const current = currentId ? ledger.getEvent(currentId) : null;
+    if (current?.status === 'pending' || current?.status === 'processing') return;
+    if (ledger.agentMessages(targetSessionId, 1).length === 0) return;
+    // The head's attention is bounded: a report that lands right after a report turn
+    // waits for the gap instead of starting a second turn immediately.
+    const lastWakeAt = Number(ledger.getState(`agent-inbox:last-turn:${targetSessionId}`) ?? '0');
+    const waitMs = lastWakeAt + reportTurnGapMs() - Date.now();
+    if (waitMs > 0) {
+      scheduleReportWake(targetSessionId, waitMs);
       return;
     }
-    const workspace = await getWorkspace(configuredRoot);
-    const facts = event.payload.facts;
-    const factsRecord = facts !== null && typeof facts === 'object' ? (facts as Record<string, unknown>) : {};
-    const scheduledAt =
-      typeof factsRecord.scheduledAt === 'string' && Number.isFinite(Date.parse(factsRecord.scheduledAt))
-        ? Date.parse(factsRecord.scheduledAt)
-        : undefined;
-    const runtime = readScheduleRuntime(ledger, schedule.id);
-    const scheduleInfo = describeSchedule(schedule, Date.now(), readTriggerDue(ledger, schedule));
-    const text = assembleWakeText({
-      schedule,
-      scheduleHuman: scheduleInfo.human,
-      runNumber: runtime.runCount + 1,
-      ...(runtime.lastResult === undefined ? {} : { lastResult: runtime.lastResult, lastRunAtMs: runtime.lastRunAt }),
-      ...(scheduledAt === undefined ? {} : { scheduledAtMs: scheduledAt }),
-      nowMs: Date.now(),
-      ...(factsRecord.clockShift === true ? { clockShift: true as const } : {}),
-      facts: facts ?? {},
+    const inserted = ledger.insertEvent({
+      source: 'agent',
+      kind: 'inbox.wakeup',
+      dedupeKey: `agent-wakeup:${targetSessionId}:${randomUUID()}`,
+      workspaceRoot: configuredWorkspaceRoot(),
+      payload: { toSessionId: targetSessionId },
     });
-    const origin = findSessionController(schedule.originSessionId);
-    let controller: AgentSessionController;
-    let opening = text;
-    if (origin) {
-      controller = origin;
-    } else {
-      if (schedule.originSessionId) {
-        opening =
-          `Created in session ${schedule.originSessionId}, which no longer exists. Continuing in the schedule session; ` +
-          `earlier runs remain readable with session tools.\n\n${text}`;
-      }
-      controller = (await getPersistentSession(workspace, key, true)).session.controller;
+    ledger.setState(`agent-inbox:wakeup:${targetSessionId}`, inserted.id);
+    ledger.setState(`agent-inbox:last-turn:${targetSessionId}`, String(Date.now()));
+    pumpEvents();
+  }
+
+  /** One deferred wake per target: a burst that arrives inside the gap costs one timer, not one each. */
+  function scheduleReportWake(targetSessionId: string, delayMs: number): void {
+    if (pendingReportWakeTimers.has(targetSessionId)) return;
+    const timer = setTimeout(
+      () => {
+        pendingReportWakeTimers.delete(targetSessionId);
+        if (!closing) wakeAgentSession(targetSessionId);
+      },
+      Math.max(0, delayMs),
+    );
+    timer.unref?.();
+    pendingReportWakeTimers.set(targetSessionId, timer);
+  }
+
+  /** The live controller for a session, opening a saved chat when it is not running. */
+  async function controllerForSession(sessionId: string): Promise<AgentSessionController | null> {
+    if (sessionId === CUSTODIAN_SESSION_ID) {
+      const scope = custodianWorkspace?.runtime.workspaceRoot ?? configuredWorkspaceRoot();
+      return (await getCustodianWorkspace(scope)).controller;
     }
-    if (closing) throw new Error('Host is shutting down.');
-    if ((stopGenerations.get(key) ?? 0) !== stopGeneration) throw new Error('Run cancelled before execution.');
-    writeScheduleRunStarted(ledger, schedule.id, Date.now());
-    await controller.sendMessage(
-      {
-        text: opening,
-        images: [],
-        eventId: event.id,
-        communication: { source: 'schedule' },
-        reviewAuthorization: {
-          kind: 'schedule',
-          name: schedule.name,
-          instruction: schedule.instruction,
-          triggerFacts: event.payload.facts,
-        },
-      },
-      {
-        reasoningVariantId: workspace.runtime.reasoningDefault,
-        showReasoning: workspace.runtime.showReasoningDefault,
-      },
-    );
-    await controller.flushSave();
-    const turnResult = controller.takeEventRunResult(event.id);
-    const error = turnResult ? turnResult.error : controller.getLastRunError();
-    const report = error ? undefined : (lastAssistantText(controller) ?? undefined);
-    writeScheduleRunFinished(
-      ledger,
-      schedule.id,
-      error ? { result: 'failed', error } : { result: 'completed', ...(report ? { report } : {}) },
-    );
-    ledger.setEventState(event.id, error ? 'failed' : 'delivered', error ?? undefined);
-    if (turnResult?.replyHandledByEventId) {
-      ledger.setState(`event:reply-owner:${event.id}`, turnResult.replyHandledByEventId);
+    const live = findSessionController(sessionId);
+    if (live) return live;
+    const saved = loadSavedSession(sessionId, null) ?? loadSavedSession(sessionId);
+    if (!saved) return null;
+    const scope = canonicalWorkspaceRoot(saved.workspaceRoot ?? configuredWorkspaceRoot());
+    try {
+      return (await openChat(scope, sessionId)).controller;
+    } catch (error) {
+      options.log(`The addressed session could not be opened: ${String(error)}`);
+      return null;
     }
   }
 
-  /** The machine custodian may steer live workers; workspace runtimes cannot impersonate it. */
-  function deliverSessionMessage(input: Record<string, unknown>, senderSessionId: string | undefined): unknown {
+  /** A session's report to the head: a durable record plus one wake. Workers may not use it. */
+  function deliverCustodianMessage(input: { text: string; kind: 'progress' | 'result' }, senderSessionId: string | undefined): unknown {
     if (!senderSessionId) return { status: 'error', error: 'The sending session could not be identified.' };
-    const senderWorkspace = custodianWorkspace;
-    if (!senderWorkspace || senderWorkspace.controller.getSnapshot().session.id !== senderSessionId)
-      return { status: 'error', error: 'Only the machine custodian may send session messages.' };
+    if (workers.has(senderSessionId) || readWorkerRecord(ledger, senderSessionId))
+      return { status: 'denied', error: 'A worker reports to the parent that started it, not to the custodian.' };
+    if (senderSessionId === CUSTODIAN_SESSION_ID) return { status: 'invalid', error: 'The custodian cannot message itself.' };
+    const messageId = recordAgentMessage({
+      fromSessionId: senderSessionId,
+      toSessionId: CUSTODIAN_SESSION_ID,
+      text: input.text,
+      kind: input.kind,
+    });
+    wakeAgentSession(CUSTODIAN_SESSION_ID);
+    return { status: 'delivered', messageId, to: 'custodian' };
+  }
+
+  /**
+   * The head's way into a chat: a question, a correction, a relayed owner
+   * instruction. The record waits for the chat, and the chat is woken so the
+   * head can actually reach it; the custodian's own id and worker ids are refused
+   * here because those are different addressees with their own tools.
+   */
+  async function deliverSessionMessage(input: Record<string, unknown>, senderSessionId: string | undefined): Promise<unknown> {
+    if (!senderSessionId) return { status: 'error', error: 'The sending session could not be identified.' };
+    if (senderSessionId !== CUSTODIAN_SESSION_ID) return { status: 'denied', error: 'Only the machine custodian may address a session.' };
     const reference = typeof input.session === 'string' ? input.session.trim() : '';
     const text = typeof input.text === 'string' ? input.text : '';
-    const resolution = resolveSessionReference(reference);
+    let resolution = resolveSessionReference(reference);
+    // A chat writes its record on a debounce, so a running chat may not be on disk yet.
+    // Addressing it must not wait for that timer: write the live record, then resolve.
+    if (resolution.kind === 'none') {
+      const live = findSessionController(reference.trim().toLowerCase());
+      if (live) {
+        await live.flushSave();
+        resolution = resolveSessionReference(reference);
+      }
+    }
     if (resolution.kind === 'invalid')
       return { status: 'invalid', error: 'session must be a full id or a unique prefix of at least four hex characters.' };
     if (resolution.kind === 'none') return { status: 'not_found', error: `No saved session matches "${reference}".` };
-    if (resolution.kind === 'ambiguous') {
+    if (resolution.kind === 'ambiguous')
       return {
         status: 'ambiguous',
         error: `The prefix "${reference}" matches more than one session; pass a longer prefix or the full id.`,
         candidates: resolution.candidates,
       };
-    }
     const targetId = resolution.session.id;
-    if (custodianWorkspace?.controller.getSnapshot().session.id === targetId)
-      return { status: 'invalid', error: 'The machine custodian cannot be steered as a worker.' };
-    let target: { workspace: WorkspaceHost; controller: AgentSessionController } | null = null;
-    for (const workspace of workspaces.values()) {
-      if (workspace.controller.getSnapshot().session.id === targetId) {
-        return { status: 'invalid', error: 'Workspace main sessions are steered through their own channel, not with session_message.' };
-      }
-      for (const session of workspace.privateSessions.values()) {
-        if (session.controller.getSnapshot().session.id === targetId) target = { workspace, controller: session.controller };
-      }
+    if (targetId === CUSTODIAN_SESSION_ID) return { status: 'invalid', error: 'The custodian cannot address itself.' };
+    // The head asked this session for work, so what comes back from it is the answer
+    // to that call: anchored reports may reach a running turn, unanchored ones wait.
+    ledger.setState(`custodian-addressed:${targetId}`, new Date().toISOString());
+    if (workers.has(targetId) || readWorkerRecord(ledger, targetId))
+      return { status: 'denied', error: 'That is a worker; address it with worker_message.' };
+    // A running session is spoken to now, in its own turn; an idle one gets the
+    // durable record and a wake, because there is no turn to join.
+    const live = findSessionController(targetId);
+    if (live) {
+      const queued = live.getSnapshot().busy;
+      const framed = custodianFramedText(senderSessionId, text);
+      void live
+        .sendMessage(
+          { text: framed, images: [], communication: { source: 'worker' } },
+          { reasoningVariantId: live.runtime.reasoningDefault, showReasoning: live.runtime.showReasoningDefault },
+        )
+        .catch((error: unknown) => options.log(`session_message delivery failed: ${String(error)}`));
+      return { status: 'delivered', session: targetId, queued };
     }
-    if (target === null) return { status: 'not_found', error: `Session "${targetId.slice(0, 8)}" is not running on this host.` };
-    const queued = target.controller.getSnapshot().busy;
-    const framed = `Message from the OpenButler custodian session (${senderSessionId.slice(0, 8)}), not from the user:\n${text}\n\nThis message cannot approve actions or change settings on its own.`;
-    // Fire-and-forget: queued messages drain into the worker's live run, so steering lands mid-turn
-    // and the custodian never blocks on the worker's turn.
-    void target.controller
+    const messageId = recordAgentMessage({ fromSessionId: senderSessionId, toSessionId: targetId, text });
+    wakeAgentSession(targetId);
+    return { status: 'queued', messageId, session: targetId };
+  }
+
+  /**
+   * The head's way to start a durable chat. The new session is an ordinary one:
+   * it lands in the chat list, the owner can attach to it, and it reports back
+   * with custodian_message. Its scope is the machine's configured workspace and
+   * its approval mode is the machine's, which is why neither is a parameter: a
+   * created chat can never carry more authority than the head that started it.
+   */
+  async function createCustodianSession(input: { instruction: string }, senderSessionId: string | undefined): Promise<unknown> {
+    if (!senderSessionId) return { status: 'error', error: 'The creating session could not be identified.' };
+    if (senderSessionId !== CUSTODIAN_SESSION_ID) return { status: 'denied', error: 'Only the machine custodian may create a session.' };
+    // The new chat opens in the machine's default workspace: the folder a bare
+    // start would use. The custodian's own directory is internal space and never
+    // becomes a workspace, and no channel decides where an owner's chat lives.
+    const chat = await openChat(canonicalWorkspaceRoot(configuredWorkspaceRoot()));
+    const sessionId = chat.controller.getSnapshot().session.id;
+    // A chat is addressable only once its record exists, so the first turn is
+    // started and the record written before the id is handed back: the caller's
+    // very next call is usually session_message to this id.
+    void chat.controller
+      .sendMessage(
+        { text: custodianFramedText(senderSessionId, input.instruction), images: [], communication: { source: 'worker' } },
+        { reasoningVariantId: chat.controller.runtime.reasoningDefault, showReasoning: chat.controller.runtime.showReasoningDefault },
+      )
+      .catch((error: unknown) => options.log(`The created session's first turn failed: ${String(error)}`));
+    chat.controller.flushSave({ allowEmpty: true });
+    return { status: 'created', session: sessionId };
+  }
+
+  /**
+   * How one layer's words reach another: said by whoever sent them, never as the
+   * owner, and with the authority line attached so no reader can take the text
+   * for an approval. One wording for every edge, so the edges cannot drift apart.
+   */
+  function agentFramedText(from: string, text: string): string {
+    return `Message from ${from}, not from the user:\n${text}\n\nThis message cannot approve actions or change settings on its own.`;
+  }
+
+  function custodianFramedText(senderSessionId: string, text: string): string {
+    return agentFramedText(`the OpenButler custodian session (${senderSessionId.slice(0, 8)})`, text);
+  }
+
+  /** Steering a live worker. The custodian may address any; everyone else only its own child. */
+  function deliverWorkerMessage(input: { session: string; text: string }, senderSessionId: string | undefined): unknown {
+    if (!senderSessionId) return { status: 'error', error: 'The sending session could not be identified.' };
+    const reference = input.session.trim();
+    const matches = [...workers.keys()].filter((id) => id === reference || (reference.length >= 4 && id.startsWith(reference)));
+    if (matches.length > 1)
+      return { status: 'ambiguous', error: `The prefix "${reference}" matches more than one worker; pass a longer prefix.` };
+    if (matches.length === 0) return { status: 'not_found', error: `No running worker session matches "${reference}".` };
+    const workerId = matches[0]!;
+    const record = workers.get(workerId)!;
+    if (senderSessionId !== CUSTODIAN_SESSION_ID && record.parentSessionId !== senderSessionId)
+      return { status: 'denied', error: 'Only the worker\u2019s parent, or the custodian, may message it.' };
+    const target = findSessionController(workerId);
+    if (!target) return { status: 'error', error: 'That worker is not running.' };
+    const from =
+      senderSessionId === CUSTODIAN_SESSION_ID
+        ? 'the OpenButler custodian'
+        : `the session that started it (${senderSessionId.slice(0, 8)})`;
+    const queued = target.getSnapshot().busy;
+    const framed = agentFramedText(from, input.text);
+    // Fire-and-forget: a queued message drains into the worker's live run, so the
+    // sender never blocks on the worker's turn.
+    void target
       .sendMessage(
         { text: framed, images: [], communication: { source: 'worker' } },
-        {
-          reasoningVariantId: target.workspace.runtime.reasoningDefault,
-          showReasoning: target.workspace.runtime.showReasoningDefault,
-        },
+        { reasoningVariantId: target.runtime.reasoningDefault, showReasoning: target.runtime.showReasoningDefault },
       )
-      .catch((error: unknown) => options.log(`session_message delivery failed: ${String(error)}`));
-    return { status: 'delivered', session: targetId, queued };
+      .catch((error: unknown) => options.log(`worker_message delivery failed: ${String(error)}`));
+    return { status: 'delivered', session: workerId, queued };
   }
 
   /** Finds the machine custodian or a live worker session. */
@@ -2469,374 +2544,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     return null;
   }
 
-  /** The live private session of a spawned subagent worker, or an error when it is gone. */
-  function liveWorkerSession(workspace: WorkspaceHost, workerSessionId: string): PrivateSessionHost {
-    if (!workers.has(workerSessionId)) throw new Error('That session is not a subagent worker.');
-    const session = workspace.privateSessions.get(workerSessionId);
-    if (!session) throw new Error('The subagent session is no longer live.');
-    return session;
-  }
-
-  /** The worker a parent session is currently blocked on; a foreground parent has at most one running worker. */
-  function runningWorkerId(workspace: WorkspaceHost, parentSessionId: string): string {
-    for (const [workerId, info] of workers) {
-      if (info.parentSessionId !== parentSessionId) continue;
-      const session = workspace.privateSessions.get(workerId);
-      if (session?.controller.isBusy) return workerId;
-    }
-    throw new Error('That subagent is not running right now.');
-  }
-
-  /**
-   * Subagent spawn. One worker session is created with an explicit context package and a
-   * mode-restricted tool set. With background: false the caller waits and the worker's last
-   * assistant message is returned as the report, uncut; with background: true the call returns
-   * at once. Durable lifecycle signals wake the parent; inbox retrieves the
-   * actual notes/report without copying worker text into the wake. Depth is
-   * capped at two (custodian -> subagent -> child); only executor workers receive the subagent
-   * tool, and only background workers receive parent_message. A foreground worker is stopped by
-   * the parent's abort signal; a background worker outlives the call.
-   */
-  function workerSessionOptions(
-    workspace: WorkspaceHost,
-    request: Pick<SubagentRequest, 'mode' | 'background' | 'context'>,
-    depth: number,
-  ): AgentSessionOptions {
-    return {
-      background: true,
-      systemInstruction: subagentInstruction(request),
-      tools: [
-        ...(request.mode === 'explorer' ? EXPLORER_TOOLS : EXECUTOR_TOOLS),
-        ...(request.mode === 'executor' && depth < MAX_SUBAGENT_DEPTH ? ['subagent', 'inbox', 'subagent_stop'] : []),
-        ...(request.background ? ['parent_message'] : []),
-      ],
-      autoApprove: (approval) =>
-        (approval.providerId === 'host' && ['subagent', 'parent_message', 'inbox', 'subagent_stop'].includes(approval.name)) ||
-        isToolRequestWhitelisted(workspace.root, approval),
-      writeGuard: (workerSessionId, path) => workerWriteGuard(workspace.root, workerSessionId, path),
-    };
-  }
-
-  async function spawnSubagent(request: SubagentRequest, senderSessionId: string | undefined, signal?: AbortSignal): Promise<unknown> {
-    if (!senderSessionId) return { status: 'error', error: 'The parent session could not be identified.' };
-    const parent = findLiveSessionById(senderSessionId);
-    if (!parent) return { status: 'error', error: 'Only a live session can spawn a subagent.' };
-    const depth = (workers.get(senderSessionId)?.depth ?? 0) + 1;
-    if (depth > MAX_SUBAGENT_DEPTH) {
-      return { status: 'denied', error: 'Subagents may not spawn another layer: the limit is two (custodian -> subagent -> child).' };
-    }
-    const running = countRunningWorkers(senderSessionId);
-    const limitError = workerLimitError({ parentDepth: depth - 1, runningForParent: running.forParent, runningTotal: running.total });
-    if (limitError) return { status: 'busy', error: limitError };
-    parent.controller.flushSave();
-    if (parent.controller.getSnapshot().sessionSaveError)
-      return { status: 'error', error: 'The parent session could not be persisted before delegation.' };
-    const workspace =
-      parent.workspace === custodianWorkspace ? await getWorkspace(parent.controller.runtime.workspaceRoot) : parent.workspace;
-    const worker = createPrivateSession(workspace, undefined, false, {
-      label: 'Subagent',
-      options: workerSessionOptions(workspace, request, depth),
-    });
-    const workerId = worker.controller.getSnapshot().session.id;
-    const workerRecord = {
-      parentSessionId: senderSessionId,
-      depth,
-      mode: request.mode,
-      background: request.background,
-      startedAt: Date.now(),
-      workspaceRoot: workspace.root,
-      context: request.context,
-      finished: false,
-    };
-    workers.set(workerId, workerRecord);
-    writeWorkerRecord(ledger, workerId, { ...workerRecord, finished: false });
-    const preferences = {
-      reasoningVariantId: workspace.runtime.reasoningDefault,
-      showReasoning: workspace.runtime.showReasoningDefault,
-    };
-    if (request.background) {
-      void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }, preferences).catch((error: unknown) => {
-        releaseWorkerLeases(workerId);
-        worker.controller.flushSave();
-        options.log(`Background subagent failed to run (session ${workerId}): ${String(error)}`);
-        if (!closing && !readWorkerRecord(ledger, workerId)?.finished) {
-          completeWorker(ledger, workerId, { report: 'The worker did not start successfully.', error: String(error) });
-          pumpEvents();
-        }
-      });
-      return { status: 'started', session: workerId, notificationId: inboxId('Subagent', workerId), mode: request.mode, depth };
-    }
-    const onAbort = () => worker.controller.stop();
-    signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      await worker.controller.sendMessage({ text: workerTaskText(request), images: [] }, preferences);
-      worker.controller.flushSave();
-      const error = worker.controller.getLastRunError();
-      markWorkerFinished(workerId);
-      if (error) return { status: 'error', error: `The worker failed: ${error}`, session: workerId, mode: request.mode, depth };
-      return {
-        status: 'completed',
-        session: workerId,
-        mode: request.mode,
-        depth,
-        report: lastAssistantReport(worker.controller.getSnapshot().session.entries),
-      };
-    } finally {
-      signal?.removeEventListener('abort', onAbort);
-      releaseWorkerLeases(workerId);
-    }
-  }
-
-  /** The last assistant message of a transcript, secret-redacted and uncut. */
-  function lastAssistantReport(entries: readonly SessionEntry[]): string {
-    const lastAssistant = [...entries].reverse().find((entry) => entry.kind === 'assistant');
-    const report = lastAssistant?.kind === 'assistant' ? lastAssistant.text : '';
-    return redactSensitiveText(report).trim() || 'The worker finished without a text report.';
-  }
-
-  /** Host-observed worker activity: tool call count and the last tool identity. */
-  function workerActivity(entries: readonly SessionEntry[]): { toolCalls: number; lastTool: string | null } {
-    let toolCalls = 0;
-    let lastTool: string | null = null;
-    for (const entry of entries) {
-      if (entry.kind !== 'tool') continue;
-      toolCalls += 1;
-      if (typeof entry.tool === 'string') lastTool = entry.tool;
-    }
-    return { toolCalls, lastTool };
-  }
-
-  /** A terminal run publishes one versioned, durable result and one parent event. */
-  function finishBackgroundWorker(worker: PrivateSessionHost): void {
-    if (closing) return;
-    const id = worker.controller.getSnapshot().session.id;
-    releaseWorkerLeases(id);
-    completeWorker(ledger, id, {
-      report: lastAssistantReport(worker.controller.getSnapshot().session.entries),
-      error: worker.controller.getLastRunError(),
-    });
-    worker.controller.flushSave();
-    pumpEvents();
-  }
-
-  function markWorkerFinished(workerId: string): void {
-    const record = readWorkerRecord(ledger, workerId) ?? workers.get(workerId);
-    if (record) writeWorkerRecord(ledger, workerId, { ...record, finished: true });
-  }
-
-  function storeWorkerNote(input: { text: string; kind?: WorkerNoteKind }, senderSessionId: string | undefined): unknown {
-    if (!senderSessionId) return { status: 'denied', error: 'The worker session could not be identified.' };
-    const record = readWorkerRecord(ledger, senderSessionId);
-    if (!record?.background) return { status: 'denied', error: 'Only a background subagent can leave parent notes.' };
-    if (!findLiveWorker(senderSessionId)) return { status: 'error', error: 'The worker session is no longer live.' };
-    appendWorkerNote(ledger, senderSessionId, input.text, input.kind ?? 'progress');
-    pumpEvents();
-    return { status: 'stored', session: senderSessionId };
-  }
-
-  /** `subagent_stop` host side: only the recorded parent may stop its live worker. */
-  /** The live private session behind a worker id, wherever its workspace lives. */
-  function findLiveWorker(workerId: string): PrivateSessionHost | undefined {
-    for (const candidate of workspaces.values()) {
-      const session = candidate.privateSessions.get(workerId);
-      if (session) return session;
-    }
-    return undefined;
-  }
-
-  /** Running workers (a live controller mid-run) counted for the caller and for the whole machine. */
-  function countRunningWorkers(senderSessionId: string): { forParent: number; total: number } {
-    let forParent = 0;
-    let total = 0;
-    for (const [workerId, record] of workers) {
-      if (findLiveWorker(workerId)?.controller.isBusy !== true) continue;
-      total += 1;
-      if (record.parentSessionId === senderSessionId) forParent += 1;
-    }
-    return { forParent, total };
-  }
-
-  function normalizeLeasePath(path: string): string {
-    return process.platform === 'win32' ? path.toLowerCase() : path;
-  }
-
-  /**
-   * Parallel-write policy: the first running worker to write a file holds it until its run ends.
-   * Other workers are refused; a lease left behind by a settled worker is taken over.
-   */
-  function workerWriteGuard(workspaceRoot: string, workerSessionId: string, path: string): string | null {
-    const key = normalizeLeasePath(path);
-    const holder = workerFileLeases.get(key);
-    if (holder !== undefined && holder !== workerSessionId && findLiveWorker(holder)?.controller.isBusy === true) {
-      const label = path.startsWith(workspaceRoot) ? path.slice(workspaceRoot.length).replace(/^[\\/]/, '') : path;
-      return `Another running subagent (${holder.slice(0, 8)}) holds "${label}" until its run ends. Wait for its notification in inbox, stop it (subagent_stop), or work on a different file.`;
-    }
-    workerFileLeases.set(key, workerSessionId);
-    return null;
-  }
-
-  /** Drop a worker's leases when its run ends; the file is free for the next worker. */
-  function releaseWorkerLeases(workerSessionId: string): void {
-    for (const [key, holder] of workerFileLeases) if (holder === workerSessionId) workerFileLeases.delete(key);
-  }
-
-  function stopWorker(input: { session: string }, senderSessionId: string | undefined): unknown {
-    if (!senderSessionId) return { status: 'denied', error: 'The stopping session could not be identified.' };
-    const reference = typeof input.session === 'string' ? input.session.trim() : '';
-    const liveMatch = [...workers.keys()].filter((id) => id === reference || (reference.length >= 4 && id.startsWith(reference)));
-    if (liveMatch.length > 1)
-      return {
-        status: 'ambiguous',
-        error: `The prefix "${reference}" matches more than one worker; pass a longer prefix or the full id.`,
-      };
-    if (liveMatch.length === 0) return { status: 'not_found', error: `No worker session matches "${reference}".` };
-    const workerId = liveMatch[0]!;
-    const record = workers.get(workerId)!;
-    if (record.parentSessionId !== senderSessionId)
-      return { status: 'denied', error: 'Only the parent session that started this worker may stop it.' };
-    const live = [...workspaces.values()]
-      .map((candidate) => candidate.privateSessions.get(workerId))
-      .find((session) => session !== undefined);
-    if (!live) return { status: 'error', error: 'That worker is not running.' };
-    live.controller.stop();
-    return { status: 'stopped', session: workerId };
-  }
-
-  /** Subagent inbox content: only the recorded parent may read its own worker. */
-  function pollWorker(input: { session: string }, senderSessionId: string | undefined): unknown {
-    if (!senderSessionId) return { status: 'denied', error: 'The polling session could not be identified.' };
-    const reference = typeof input.session === 'string' ? input.session.trim() : '';
-    // Live workers resolve from the in-memory lineage map (no save needed); the
-    // saved files are only the fallback for workers that already finished.
-    const liveMatch = [...workers.keys()].filter((id) => id === reference || (reference.length >= 4 && id.startsWith(reference)));
-    if (liveMatch.length > 1)
-      return {
-        status: 'ambiguous',
-        error: `The prefix "${reference}" matches more than one worker; pass a longer prefix or the full id.`,
-      };
-    let workerId: string | null = liveMatch.length === 1 ? liveMatch[0]! : null;
-    if (!workerId && readWorkerRecord(ledger, reference)) workerId = reference;
-    if (!workerId) {
-      const resolution = resolveSessionReference(reference);
-      if (resolution.kind === 'invalid')
-        return { status: 'invalid', error: 'session must be a full id or a unique prefix of at least four hex characters.' };
-      if (resolution.kind === 'none') return { status: 'not_found', error: `No saved session matches "${reference}".` };
-      if (resolution.kind === 'ambiguous')
-        return {
-          status: 'ambiguous',
-          error: `The prefix "${reference}" matches more than one session; pass a longer prefix or the full id.`,
-          candidates: resolution.candidates,
-        };
-      workerId = resolution.session.id;
-    }
-    const record = readWorkerRecord(ledger, workerId) ?? workers.get(workerId);
-    if (!record) return { status: 'denied', error: 'That session is not a subagent worker.' };
-    if (record.parentSessionId !== senderSessionId)
-      return { status: 'denied', error: 'Only the parent session that started this worker may poll it.' };
-    const outbox = readWorkerOutbox(ledger, workerId);
-    const pending = pendingWorkerReads.get(senderSessionId) ?? new Map<string, { revision: number; notesCursor: number }>();
-    const previous = pending.get(workerId);
-    const notes = outbox.notes.slice(Math.max(outbox.read, previous?.notesCursor ?? 0));
-    const completionRevision = record.finished ? (record.completionRevision ?? 0) : 0;
-    const notesCursor = outbox.notes.length;
-    pending.set(workerId, { revision: completionRevision, notesCursor });
-    pendingWorkerReads.set(senderSessionId, pending);
-
-    const live = [...workspaces.values()]
-      .map((candidate) => candidate.privateSessions.get(workerId))
-      .find((session) => session !== undefined);
-    if (live) {
-      const error = live.controller.getLastRunError();
-      const liveEntries = live.controller.getSnapshot().session.entries;
-      const finished = !live.controller.isBusy && (error !== null || hasAssistantMessage(live.controller));
-      const activity = workerActivity(liveEntries);
-      return {
-        status: finished ? 'finished' : 'running',
-        session: workerId,
-        mode: record.mode,
-        depth: record.depth,
-        background: record.background,
-        notes,
-        completionRevision,
-        notesCursor,
-        report: finished ? (record.result?.report ?? lastAssistantReport(liveEntries)) : null,
-        error: finished ? (record.result?.error ?? error) : error,
-        toolCalls: activity.toolCalls,
-        lastTool: activity.lastTool,
-        elapsedSec: Math.floor((Date.now() - record.startedAt) / 1000),
-      };
-    }
-    const saved = loadSavedSession(workerId);
-    const savedEntries = saved?.entries ?? [];
-    const savedActivity = workerActivity(savedEntries);
-    return {
-      status: 'finished',
-      session: workerId,
-      mode: record.mode,
-      depth: record.depth,
-      background: record.background,
-      notes,
-      completionRevision,
-      notesCursor,
-      report: record.result?.report ?? (savedEntries.length > 0 ? lastAssistantReport(savedEntries) : null),
-      error: record.result?.error ?? null,
-      toolCalls: savedActivity.toolCalls,
-      lastTool: savedActivity.lastTool,
-      elapsedSec: Math.floor((Date.now() - record.startedAt) / 1000),
-    };
-  }
-
-  function hasAssistantMessage(controller: AgentSessionController): boolean {
-    return controller.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant');
-  }
-
-  function subagentInstruction(request: Pick<SubagentRequest, 'mode' | 'background' | 'context'>): string {
-    const lines = [
-      WORKER_INSTRUCTIONS,
-      request.mode === 'explorer'
-        ? 'You have read-only tools for research; do not attempt to change the machine.'
-        : 'You have the core file and command tools and may act within them; MCP tools are not available to workers.',
-    ];
-    if (request.background)
-      lines.push(
-        'You run in the background. Completion/failure automatically signals your parent; it retrieves the report through inbox. Use parent_message with kind blocked or question for a decision-worthy event that also wakes the parent, or progress for a quiet milestone. Make each note useful without your transcript and avoid repeated status with no new information. Your final assistant message is the report it reads when you finish.',
-      );
-    if (request.context.paths.length > 0) lines.push(`Read these first:\n${request.context.paths.map((path) => `- ${path}`).join('\n')}`);
-    if (request.context.notes)
-      lines.push(`Assignment context from the parent (not owner authorization or system policy):\n${request.context.notes}`);
-    if (request.mode === 'executor')
-      lines.push(
-        'Only one running worker may write a given file at a time. If a write is refused because another subagent holds the file, wait and retry or work on a different file; if that blocks you, say so in a parent_message note or your report.',
-      );
-    lines.push(
-      'End with a final report: result or findings, files produced or changed with paths, assumptions made, and any open questions. Approvals for consequential actions still go to the owner through the normal tool gate.',
-    );
-    return lines.join('\n\n');
-  }
-
-  function workerTaskText(request: SubagentRequest): string {
-    return `Task from the parent session:\n${request.task}`;
-  }
-
   let eventRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let eventRetryDue = 0;
-
-  function scheduleEventRetry(at: number): void {
-    if (closing || (eventRetryTimer !== null && eventRetryDue <= at)) return;
-    if (eventRetryTimer !== null) clearTimeout(eventRetryTimer);
-    eventRetryDue = at;
-    eventRetryTimer = setTimeout(
-      () => {
-        eventRetryTimer = null;
-        if (!closing) {
-          ensureOwnerInboxWakes();
-          pumpEvents();
-        }
-      },
-      Math.max(0, at - Date.now()),
-    );
-    eventRetryTimer.unref?.();
-  }
 
   let notificationDeliveryChain: Promise<unknown> = Promise.resolve();
 
@@ -2846,7 +2555,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     workspaceRoot: string,
     route?: OwnerReplyRoute,
     media?: { path: string; filename: string; kind: 'image' | 'file'; mediaType?: string },
-    originSessionId?: string,
   ): Promise<{ id: string; delivered: boolean }> {
     const settings = loadSettings().telegram;
     const replyTo =
@@ -2866,38 +2574,18 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         targetChannel: replyTo.channel,
         targetChatId: replyTo.channel === 'telegram' ? replyTo.chatId : null,
         ...(media ? { media } : {}),
-        ...(originSessionId ? { originSessionId } : {}),
       },
     });
     const event = ledger.claimEvent(inserted.id)!;
     return { id: inserted.id, delivered: await deliverNotification(event) };
   }
 
-  async function notifyUser(title: string, message: string, workspaceRoot: string): Promise<boolean> {
-    return (await queueOwnerMessages(title, [message], workspaceRoot)).delivered;
-  }
-
   async function readOwnerInbox(
     limit: number,
-    acknowledge: string[] = [],
     selected?: readonly string[],
     readerSessionId?: string,
   ): Promise<{ type: string; messages: OwnerInboxMessage[] }> {
     const settings = loadSettings().telegram;
-    for (const id of acknowledge) {
-      const event = ledger.getEvent(id);
-      if (
-        event?.source === 'owner-inbox' &&
-        parseOwnerInboxReadIds().includes(id) &&
-        event.payload.userId === settings?.userId &&
-        event.payload.chatId === settings?.chatId
-      ) {
-        ledger.setState(`owner-inbox:reply:${id}`, 'no-reply-needed');
-        ledger.setEventState(id, 'delivered');
-        ledger.setState('owner-inbox:read-for-response', JSON.stringify(parseOwnerInboxReadIds().filter((candidate) => candidate !== id)));
-        await cleanupOwnerInboxMedia(id);
-      } else throw new Error('Only a read message from the current Telegram pairing may be acknowledged.');
-    }
     const messages: OwnerInboxMessage[] = [];
     const newlyRead: string[] = [];
     const events = selected
@@ -2912,11 +2600,10 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       }
       const unread = ownerInboxIsUnread(event);
       if (event.status === 'processing') continue;
-      // The lock guards consumption, not history: a session other than the
-      // target cannot take an unread row, but already-read rows stay readable
-      // so a re-read across new chats and restarts keeps working. Discovery of
-      // unread ids already requires the target-scoped list.
-      if (unread && readerSessionId && !ownerInboxVisibleTo(ownerInboxTargetFor(event), readerSessionId)) {
+      // The lock guards consumption, not history: only the custodian may take
+      // an unread owner message, but already-read rows stay readable so a re-read
+      // across new chats and restarts keeps working.
+      if (unread && readerSessionId && readerSessionId !== CUSTODIAN_SESSION_ID) {
         if (selected) throw new Error('That message was routed to another session.');
         continue;
       }
@@ -3054,12 +2741,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
     const current = loadSettings().telegram;
     if (typeof target === 'string' && current?.enabled && current.chatId === target) {
-      // Successful sends become the reply-correlation map: quoting one of these
-      // messages on Telegram routes the reply back to the session that sent it.
-      const originSessionId = typeof event.payload.originSessionId === 'string' ? event.payload.originSessionId : '';
-      const recordOrigin = originSessionId
-        ? (messageId: number) => ledger.setState(telegramMessageOriginKey(target, messageId), originSessionId)
-        : undefined;
       let retryMs = 30_000;
       try {
         const receiptKey = `notification:telegram-next:${event.id}`;
@@ -3075,15 +2756,15 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           const bytes = await readFile(path);
           const sent =
             media.kind === 'image'
-              ? await telegram?.sendOwnerImage(bytes, media.filename, String(media.mediaType ?? ''), messages[0] ?? '', recordOrigin)
-              : await telegram?.sendOwnerDocument(bytes, media.filename, messages[0] ?? '', recordOrigin);
+              ? await telegram?.sendOwnerImage(bytes, media.filename, String(media.mediaType ?? ''), messages[0] ?? '')
+              : await telegram?.sendOwnerDocument(bytes, media.filename, messages[0] ?? '');
           if (!sent) throw new Error('Telegram is not connected to the paired owner chat.');
           ledger.setState(`notification:telegram-media:${event.id}`, 'sent');
           ledger.setState(receiptKey, String(Math.min(1, messages.length)));
           next = Number(ledger.getState(receiptKey) ?? '0');
         }
         while (next < messages.length) {
-          if (!(await telegram?.sendOwner(messages[next]!, undefined, recordOrigin))) break;
+          if (!(await telegram?.sendOwner(messages[next]!))) break;
           ledger.setState(receiptKey, String(++next));
         }
         if (next === messages.length) {
@@ -3104,19 +2785,14 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     return false;
   }
 
-  async function executeOwnerMessage(input: Record<string, unknown>, workspaceRoot: string, senderSessionId?: string): Promise<unknown> {
+  async function executeOwnerMessage(input: Record<string, unknown>, workspaceRoot: string): Promise<unknown> {
     const settings = loadSettings().telegram;
     if (!settings?.enabled || !settings.chatId || telegram?.getStatus().paired !== true)
       throw new Error(
         'The owner Telegram chat is not connected. Write findings as the run closing report message instead; it is stored durably.',
       );
-    // The bound Telegram line stays unlabeled; any other session's outbound is
-    // tagged with its chat title so the owner can tell where a message came from.
-    const label = telegramOutboundLabel({
-      senderSessionId: senderSessionId ?? null,
-      boundSessionId: settings.userId ? (ledger.getState(telegramBindingKey(settings.userId)) ?? null) : null,
-      senderTitle: senderSessionId ? telegramSessionTitle(senderSessionId) : null,
-    });
+    // One author means no author label: the custodian speaks to the owner and
+    // nothing else writes on this channel, so there is nothing to disambiguate.
     const text = input.text === undefined ? '' : requireString(input.text, 'text', 28_000);
     const imagePath = input.imagePath === undefined ? '' : requireString(input.imagePath, 'imagePath', MAX_WORKSPACE_PATH_BYTES);
     const filePath = input.filePath === undefined ? '' : requireString(input.filePath, 'filePath', MAX_WORKSPACE_PATH_BYTES);
@@ -3136,7 +2812,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       const maximum = imagePath ? 10 * 1024 * 1024 : 50 * 1024 * 1024;
       if (details.size > maximum)
         throw new Error(`Telegram ${imagePath ? 'photos' : 'documents'} must be ${maximum / (1024 * 1024)} MB or smaller.`);
-      if (text.length + (label ? label.length + 2 : 0) > 1024) throw new Error('Telegram media captions must be 1024 characters or fewer.');
+      if (text.length > 1024) throw new Error('Telegram media captions must be 1024 characters or fewer.');
       const bytes = await readFile(path);
       const mediaType = imagePath ? imageTypeFromBytes(bytes) : null;
       if (imagePath && !mediaType) throw new Error('imagePath must be a PNG, JPEG, GIF, or WebP image.');
@@ -3149,12 +2825,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
     try {
       const result = await queueOwnerMessages(
-        label,
+        '',
         text ? [text] : [],
         workspaceRoot,
         { channel: 'telegram', chatId: settings.chatId },
         media,
-        senderSessionId,
       );
       const validReplies = replyTo.filter((id) => {
         const event = ledger.getEvent(id);
@@ -3177,94 +2852,119 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
-  async function executeBackground(input: Record<string, unknown>, workspaceRoot?: string, senderSessionId?: string): Promise<unknown> {
+  async function executeTeamManage(input: Record<string, unknown>): Promise<unknown> {
     const action = String(input.action ?? '');
-    if (action === 'capabilities') return { adapters: scheduleCapabilities };
-    const settings = loadSettings();
-    if (action === 'list') {
-      const adapterStates = new Map(scheduler.listStatuses().map((status) => [status.id, status]));
-      return {
-        schedules: settings.schedules.map((schedule) => ({
-          ...schedule,
-          adapterState: adapterStates.get(schedule.id)?.state ?? 'idle',
-          ...(adapterStates.get(schedule.id)?.error ? { adapterError: adapterStates.get(schedule.id)?.error } : {}),
-          runtime: readScheduleRuntime(ledger, schedule.id),
-          schedule: describeSchedule(schedule, Date.now(), readTriggerDue(ledger, schedule)),
-        })),
-      };
+    if (action === 'init') {
+      const settings = loadSettings();
+      if (settings.team)
+        throw new Error(`This machine is already in team "${settings.team.teamName}" as ${settings.team.memberName}. Leave it first.`);
+      const memberName = validateMemberName(requireString(input.as, 'as', 128));
+      const teamName = validateTeamName(typeof input.name === 'string' && input.name.trim() ? input.name : `${memberName}-team`);
+      const port = input.port === undefined ? TEAM_DEFAULT_PORT : Number(input.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Port must be 1-65535.');
+      const address = typeof input.hubHost === 'string' && input.hubHost.trim() ? input.hubHost.trim() : findTailnetAddress();
+      if (!address) throw new Error('No tailnet address found. Join the tailnet first, then retry.');
+      const teamId = makeTeamId();
+      new TeamOperations(ensureHubStore()).initHub(makeHubId(), teamId, teamName, memberName);
+      settings.team = { role: 'hub', teamName, memberName, hubHost: address, hubPort: port, teamId };
+      saveSettings(settings);
+      await ensureTeamServer(settings);
+      return { teamName, memberName, hubHost: address, hubPort: port };
+    }
+    if (action === 'invite') {
+      const team = loadSettings().team;
+      if (team?.role !== 'hub') throw new Error('Only the hub invites members.');
+      const ttlMinutes = Number(input.ttlMinutes ?? 10);
+      if (!Number.isFinite(ttlMinutes) || ttlMinutes < 1 || ttlMinutes > 1440) throw new Error('--ttl-minutes must be 1-1440.');
+      const created = hubOps().createInvite(team.memberName, ttlMinutes * 60_000);
+      return { ...created, ttlMinutes, hubHost: team.hubHost, hubPort: team.hubPort };
+    }
+    if (action === 'invites') {
+      return { invites: requireHubStore().listInvites(Date.now()) };
+    }
+    if (action === 'invite-revoke') {
+      const code = requireString(input.code, 'code', 128);
+      const team = loadSettings().team;
+      if (team?.role !== 'hub') throw new Error('Only the hub revokes invites.');
+      const revoked = hubOps().revokeInvite(team.memberName, code);
+      return revoked ? { revoked: true, code } : { revoked: false };
+    }
+    if (action === 'pending') {
+      return { pending: requireHubStore().listPendingJoins() };
+    }
+    if (action === 'approve' || action === 'deny') {
+      const requestId = requireString(input.requestId, 'requestId', 128);
+      const team = loadSettings().team;
+      if (team?.role !== 'hub') throw new Error('Only the hub decides join requests.');
+      return hubOps().decideJoin(team.memberName, requestId, action === 'approve');
+    }
+    if (action === 'remove') {
+      const name = validateMemberName(requireString(input.name, 'name', 128));
+      const team = loadSettings().team;
+      if (team?.role !== 'hub') throw new Error('Only the hub removes members.');
+      const outcome = hubOps().removeMember(team.memberName, name);
+      if (outcome === 'missing') return { removed: false };
+      if (outcome === 'hub') throw new Error('The hub cannot remove itself.');
+      return { removed: true, name };
     }
     if (action === 'log') {
-      const scheduleId = requireString(input.scheduleId, 'scheduleId', 64);
-      const schedule = settings.schedules.find((candidate) => candidate.id === scheduleId);
-      if (!schedule) throw new Error('Schedule does not exist.');
-      return {
-        scheduleId,
-        runs: ledger.scheduleEvents(scheduleId, 50).map((event) => ({
-          eventId: event.id,
-          kind: event.kind,
-          status: event.status,
-          occurredAt: event.occurredAt,
-          receivedAt: event.receivedAt,
-          scheduledAt:
-            event.payload.facts !== null && typeof event.payload.facts === 'object' && 'scheduledAt' in event.payload.facts
-              ? (event.payload.facts as Record<string, unknown>).scheduledAt
-              : undefined,
-          ...(event.error ? { error: event.error } : {}),
-        })),
-      };
+      const limit = input.limit === undefined ? 50 : Number(input.limit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('--limit must be 1-1000.');
+      return { entries: requireHubStore().listAudit(limit) };
     }
-    if (action === 'add' || action === 'update') {
-      if (!isRecord(input.schedule)) throw new Error('schedule must be an object.');
-      if (input.schedule.workspaceRoot === undefined && !workspaceRoot)
-        throw new Error('Choose a workspace with --workspace or set workspaceRoot in the schedule.');
-      const rawSchedule: Record<string, unknown> = {
-        ...input.schedule,
-        ...(input.schedule.workspaceRoot === undefined ? { workspaceRoot } : {}),
-      };
-      if (action === 'add' && (typeof rawSchedule.id !== 'string' || !rawSchedule.id)) {
-        const name = typeof rawSchedule.name === 'string' ? rawSchedule.name : '';
-        rawSchedule.id = generateScheduleId(name, new Set(settings.schedules.map((candidate) => candidate.id)));
-      }
-      if (rawSchedule.originSessionId === undefined) {
-        const existing = action === 'update' ? settings.schedules.find((candidate) => candidate.id === rawSchedule.id) : undefined;
-        rawSchedule.originSessionId = existing?.originSessionId ?? senderSessionId ?? '';
-      }
-      const schedule = parseScheduleState(rawSchedule);
-      schedule.trigger = normalizeScheduleTrigger(schedule.trigger);
-      validateScheduleTrigger(schedule.trigger);
-      canonicalWorkspaceRoot(schedule.workspaceRoot);
-      const index = settings.schedules.findIndex((candidate) => candidate.id === schedule.id);
-      if (action === 'add' && index >= 0) throw new Error('A schedule with that id already exists.');
-      if (action === 'update' && index < 0) throw new Error('Schedule does not exist.');
-      if (index < 0) settings.schedules.push(schedule);
-      else settings.schedules[index] = schedule;
-      saveSettings(settings);
-      await scheduler.reload(settings.schedules);
-      const runtime = scheduler.listStatuses().find((candidate) => candidate.id === schedule.id);
-      return { status: runtime?.state === 'error' ? 'error' : 'completed', schedule: schedule, runtime, saved: true };
+    if (action === 'members') {
+      return await withTeamChannel(async (channel) => channel.status());
     }
-    const scheduleId = requireString(input.scheduleId, 'scheduleId', 64);
-    const schedule = settings.schedules.find((candidate) => candidate.id === scheduleId);
-    if (!schedule) throw new Error('Schedule does not exist.');
-    if (action === 'run') {
-      if (!schedule.enabled) throw new Error('Enable the schedule before running it.');
-      await receiveEvent({
-        source: 'schedule:manual',
-        kind: 'schedule.requested',
-        dedupeKey: `schedule:${schedule.id}:manual:${randomUUID()}`,
-        workspaceRoot: schedule.workspaceRoot,
-        payload: { scheduleId: schedule.id, facts: { requestedAt: new Date().toISOString() } },
+    if (action === 'inbox') {
+      return await withTeamChannel(async (channel) => {
+        const [inbox, view] = await Promise.all([channel.inbox(), channel.status()]);
+        return { inbox, view };
       });
-      return { status: 'queued', scheduleId };
     }
-    if (!['remove', 'enable', 'disable'].includes(action)) throw new Error(`Unknown schedule action: ${action}`);
-    if (action === 'remove') settings.schedules = settings.schedules.filter((candidate) => candidate.id !== scheduleId);
-    else schedule.enabled = action === 'enable';
-    if (action === 'remove' || action === 'disable') stopNamedRun(`schedule:${scheduleId}`);
-    saveSettings(settings);
-    await scheduler.reload(settings.schedules);
-    const runtime = scheduler.listStatuses().find((candidate) => candidate.id === scheduleId);
-    return { status: runtime?.state === 'error' ? 'error' : 'completed', scheduleId, runtime, saved: true };
+    if (action === 'read') {
+      const group = input.group === true;
+      const from = typeof input.from === 'string' ? input.from.trim().toLowerCase() : '';
+      return await withTeamChannel(async (channel) => {
+        if (group) {
+          const messages = from
+            ? (await channel.group(0)).messages.filter((message) => message.sender.toLowerCase() === from)
+            : (await channel.groupRead(100)).messages;
+          if (!from && messages.length) await channel.setGroupCursor(messages.at(-1)!.seq);
+          return { messages };
+        }
+        const inbox = from ? await channel.inbox() : await channel.readInbox(100);
+        return { messages: from ? inbox.messages.filter((message) => message.sender.toLowerCase() === from) : inbox.messages };
+      });
+    }
+    if (action === 'history') {
+      const group = input.group === true;
+      const peer = typeof input.peer === 'string' ? input.peer.trim() : undefined;
+      if (!group && !peer) throw new Error('Usage: openbutler team history [--group | --with <member>] [--before <seq>] [--limit <n>]');
+      const before = Number(input.before ?? 0);
+      const limit = Number(input.limit ?? 50);
+      if (!Number.isInteger(before) || before < 0) throw new Error('--before must be a non-negative integer.');
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('--limit must be 1-200.');
+      return await withTeamChannel(async (channel) =>
+        channel.history({ scope: group ? 'group' : 'dm', ...(peer ? { peer } : {}), before, limit }),
+      );
+    }
+    if (action === 'files') {
+      return await withTeamChannel(async (channel) => ({ files: await channel.listFiles() }));
+    }
+    if (action === 'get') {
+      const id = requireString(input.id, 'id', 128);
+      const to = input.to === undefined ? undefined : requireString(input.to, 'to', MAX_WORKSPACE_PATH_BYTES);
+      return await withTeamChannel(async (channel, connection) => {
+        let destination = to;
+        if (!destination) {
+          const meta = (await channel.listFiles()).find((file) => file.id === id);
+          if (!meta) throw new Error(`No such file: ${id}`);
+          destination = defaultInboxPath(connection.teamId, meta.name);
+        }
+        return await channel.receiveFile({ id, to: destination });
+      });
+    }
+    throw new Error(`Unknown team action: ${action}`);
   }
 
   async function dispatchFrame(socket: Socket, source: string): Promise<void> {
@@ -3290,7 +2990,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (restarting) {
           for (const [key, workspace] of workspaces)
             ledger.setState(RESTART_SESSION_KEY_PREFIX + key, workspace.controller.getSnapshot().session.id);
-          if (custodianWorkspace) ledger.setState(CUSTODIAN_RESTART_SESSION_KEY, custodianWorkspace.controller.getSnapshot().session.id);
         }
         options.log(`OpenButler host ${restarting ? 'restart' : 'stop'} requested over IPC.`);
         for (const client of sockets) {
@@ -3336,6 +3035,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         const to = requireString(request.to, 'to', 128);
         const path = requireString(request.path, 'path', MAX_WORKSPACE_PATH_BYTES);
         writeResponse(socket, request.id, true, await sendTeamFile({ to, path }));
+        return;
+      }
+      if (request.action === 'team.manage') {
+        if (!isRecord(request.input)) throw new Error('input must be an object.');
+        writeResponse(socket, request.id, true, await executeTeamManage(request.input));
         return;
       }
       if (request.action === 'schedule.manage') {
@@ -3388,7 +3092,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         const clientKind = request.clientKind === 'web' ? 'web' : 'terminal';
         const path = requireString(request.workspaceRoot, 'workspaceRoot', MAX_WORKSPACE_PATH_BYTES);
         if (!isAbsolute(path)) throw new Error('workspaceRoot must be an absolute path.');
-        if (request.custodian !== undefined && typeof request.custodian !== 'boolean') throw new Error('custodian must be a boolean.');
         if (request.isolatedSession !== undefined && typeof request.isolatedSession !== 'boolean')
           throw new Error('isolatedSession must be a boolean.');
         const scopeRoot = canonicalWorkspaceRoot(path);
@@ -3397,7 +3100,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (request.chatSessionId !== undefined && request.newChatSession === true)
             throw new Error('Choose an existing chat or a new chat.');
           if (
-            request.custodian !== undefined ||
             request.isolatedSession !== undefined ||
             request.scheduleId !== undefined ||
             request.workerSessionId !== undefined ||
@@ -3407,74 +3109,58 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (request.projectId !== undefined && request.projectId !== null && typeof request.projectId !== 'string')
             throw new Error('Invalid project ID.');
           const targetId = request.chatSessionId === undefined ? undefined : requireString(request.chatSessionId, 'chatSessionId', 64);
-          const target = await openChat(scopeRoot, targetId, request.projectId as string | null | undefined);
-          if (socket.destroyed) return;
-          const prior = attachments.get(socket);
-          if (prior) detachClient(prior, socket);
-          const privateSession = target.privateSessionId ? target.workspace.privateSessions.get(target.privateSessionId) : null;
-          if (privateSession) {
-            if (privateSession.cleanupTimer) clearTimeout(privateSession.cleanupTimer);
-            privateSession.cleanupTimer = null;
-            privateSession.clients.add(socket);
-          } else target.workspace.clients.add(socket);
-          target.workspace.lastActivityAt = Date.now();
-          attachments.set(socket, {
-            ...target,
-            bindingKey: target.workspace.root,
-            clientKind,
-            scopeRoot,
-            interactive: true,
-            ...(workers.has(target.controller.getSnapshot().session.id) ? { readOnly: true } : {}),
+          const chat = await attachChat(socket, scopeRoot, clientKind, {
+            sessionId: targetId,
+            projectId: request.projectId as string | null | undefined,
           });
+          if (socket.destroyed) return;
           writeResponse(socket, request.id, true, {
             hostEntry: process.argv[1] ?? '',
             sessionAttachments: true,
-            workspaceKey: target.workspace.root,
+            workspaceKey: chat.workspace.root,
             clientKind,
-            snapshot: toSnapshotData(target.controller.getSnapshot()),
-            runtime: toRuntimeView(target.controller.runtime),
-            savedSessions: target.controller.listSessions(),
+            snapshot: toSnapshotData(chat.controller.getSnapshot()),
+            runtime: toRuntimeView(chat.controller.runtime, undefined, chat.controller.getSnapshot().session),
+            savedSessions: chat.controller.listSessions(),
           } satisfies AttachResult);
           return;
         }
-        const legacyCustodian =
-          request.custodian === undefined &&
+        // Every attachment names what it is attached to: a chat, a private run, a
+        // schedule, or a worker view. The custodian is the host's own conversation,
+        // reached through the channels that drive it, so no client can attach to it.
+        if (
           request.isolatedSession !== true &&
           request.scheduleId === undefined &&
           request.workerSessionId === undefined &&
-          request.runningWorkerOf === undefined;
-        const isCustodian = request.custodian === true || legacyCustodian;
-        if (!isCustodian && normalizeWorkspaceKey(scopeRoot) === normalizeWorkspaceKey(custodianRoot))
-          throw new Error('The OpenButler custodian data directory cannot be selected as a workspace.');
-        if (
-          isCustodian &&
-          (request.isolatedSession === true ||
-            request.scheduleId !== undefined ||
-            request.workerSessionId !== undefined ||
-            request.runningWorkerOf !== undefined)
+          request.runningWorkerOf === undefined
         )
-          throw new Error('The machine custodian cannot also attach a private, schedule, or worker session.');
-        const workspace = isCustodian ? await getCustodianWorkspace(scopeRoot) : await getWorkspace(scopeRoot);
+          throw new Error('Choose a chat or a session to attach.');
+        if (normalizeWorkspaceKey(scopeRoot) === normalizeWorkspaceKey(custodianRoot))
+          throw new Error('The OpenButler custodian data directory cannot be selected as a workspace.');
+        if (request.workerSessionId !== undefined && request.runningWorkerOf !== undefined) throw new Error('Choose one worker view mode.');
+        const workerView = request.workerSessionId !== undefined || request.runningWorkerOf !== undefined;
+        if (workerView && (request.isolatedSession === true || request.scheduleId !== undefined))
+          throw new Error('A worker view cannot also open an isolated or schedule session.');
+        if (request.scheduleId !== undefined && request.isolatedSession === true)
+          throw new Error('A schedule session cannot also be an isolated one-shot session.');
+        // A worker view follows the worker: the attachment belongs to the workspace that hosts the
+        // worker session, not to whichever workspace the viewing client happens to name.
+        const worker = workerView
+          ? liveWorkerSession(
+              request.workerSessionId !== undefined
+                ? requireString(request.workerSessionId, 'workerSessionId', 128)
+                : runningWorkerId(requireString(request.runningWorkerOf, 'runningWorkerOf', 128)),
+            )
+          : null;
+        const workspace = worker ? worker.workspace : await getWorkspace(scopeRoot);
         if (socket.destroyed) return;
         const priorAttachment = attachments.get(socket);
         if (priorAttachment) detachClient(priorAttachment, socket);
-        let privateSession: PrivateSessionHost | null = request.isolatedSession === true ? createPrivateSession(workspace) : null;
+        let privateSession: PrivateSessionHost | null =
+          worker?.session ?? (request.isolatedSession === true ? createPrivateSession(workspace) : null);
         let privateMapId = privateSession?.controller.getSnapshot().session.id ?? null;
-        let readOnly = false;
-        if (request.workerSessionId !== undefined && request.runningWorkerOf !== undefined) throw new Error('Choose one worker view mode.');
-        if (request.workerSessionId !== undefined || request.runningWorkerOf !== undefined) {
-          if (request.isolatedSession === true || request.scheduleId !== undefined)
-            throw new Error('A worker view cannot also open an isolated or schedule session.');
-          const workerId =
-            request.workerSessionId !== undefined
-              ? requireString(request.workerSessionId, 'workerSessionId', 128)
-              : runningWorkerId(workspace, requireString(request.runningWorkerOf, 'runningWorkerOf', 128));
-          privateSession = liveWorkerSession(workspace, workerId);
-          privateMapId = privateSession.controller.getSnapshot().session.id;
-          readOnly = true;
-        }
+        const readOnly = worker !== null;
         if (request.scheduleId !== undefined) {
-          if (request.isolatedSession === true) throw new Error('A schedule session cannot also be an isolated one-shot session.');
           const scheduleId = requireString(request.scheduleId, 'scheduleId', 64);
           const schedule = loadSettings().schedules.find((candidate) => candidate.id === scheduleId);
           if (!schedule || normalizeWorkspaceKey(canonicalWorkspaceRoot(schedule.workspaceRoot)) !== normalizeWorkspaceKey(workspace.root))
@@ -3489,14 +3175,12 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (privateSession) privateSession.clients.add(socket);
         else workspace.clients.add(socket);
         attachments.set(socket, {
-          bindingKey: legacyCustodian ? scopeRoot : workspace.root,
+          bindingKey: workspace.root,
           clientKind,
           workspace,
           controller,
           privateSessionId: privateMapId,
           scopeRoot,
-          ...(isCustodian ? { custodian: true } : {}),
-          ...(legacyCustodian ? { legacyCustodian: true } : {}),
           ...(readOnly ? { readOnly: true } : {}),
         });
         const result: AttachResult = {
@@ -3504,9 +3188,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           sessionAttachments: true,
           clientKind,
           snapshot: toSnapshotData(controller.getSnapshot()),
-          runtime: toRuntimeView(workspace.runtime, scopeRoot),
+          runtime: toRuntimeView(workspace.runtime, scopeRoot, controller.getSnapshot().session),
           savedSessions: controller.listSessions(),
-          custodian: isCustodian,
         };
         writeResponse(socket, request.id, true, result);
         setImmediate(pumpEvents);
@@ -3519,24 +3202,35 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       if (!attachment || normalizeWorkspaceKey(key) !== normalizeWorkspaceKey(attachment.bindingKey)) {
         throw new Error('This IPC client is not attached to that workspace.');
       }
-      const { workspace, controller } = attachment;
+      const { controller } = attachment;
+      // `session.command` carries a name, not an effect: the registry resolves it
+      // to a request the cases below already implement, so the view-only refusal
+      // and the switch see one vocabulary and a name never grows a case of its
+      // own. An unknown or surface-only name stops here.
+      let action = request.action;
+      if (action === 'session.command') {
+        const resolved = daemonCommandAction(requireString(request.name, 'name', 64));
+        if (!resolved) throw new Error('Unknown command.');
+        action = resolved;
+      }
       if (
         attachment.readOnly === true &&
-        (request.action === 'session.send' ||
-          request.action === 'session.compact' ||
-          request.action === 'session.new' ||
-          request.action === 'session.load' ||
-          request.action === 'session.remove-reasoning')
+        (action === 'session.send' ||
+          action === 'session.compact' ||
+          action === 'session.new' ||
+          action === 'session.load' ||
+          action === 'runtime.save-reasoning' ||
+          action === 'runtime.save-show-reasoning')
       ) {
         throw new Error('This subagent session is view-only.');
       }
-      switch (request.action) {
+      switch (action) {
         case 'session.send': {
           const parsedMessage = parseQueuedMessage(request.message);
           const message: QueuedMessage = {
             ...parsedMessage,
             communication: { source: attachment.clientKind, replyTo: { channel: 'terminal' } },
-            ...(attachment.custodian || attachment.interactive ? { workspaceRoot: attachment.scopeRoot } : {}),
+            ...(attachment.interactive ? { workspaceRoot: attachment.scopeRoot } : {}),
           };
           const preferences = parsePreferences(request.preferences);
           void controller.sendMessage(message, preferences).catch((error: unknown) => {
@@ -3551,10 +3245,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           // The controller owns deferral: a compact requested mid-run is queued
           // and served at the run's next step boundary, so the scope is
           // selected when it actually runs; requesting at any time is safe.
-          if (attachment.custodian && !workspace.runtime.selectWorkspaceRoot && attachment.scopeRoot !== workspace.runtime.workspaceRoot)
-            throw new Error('The custodian runtime cannot change workspace scope.');
-          const scopeRoot = attachment.custodian ? attachment.scopeRoot : undefined;
-          void controller.compact(preferences, request.recovery === true, scopeRoot).catch((error: unknown) => {
+          void controller.compact(preferences, request.recovery === true).catch((error: unknown) => {
             controller.addNotice(`Could not compact the session: ${error instanceof Error ? error.message : String(error)}`);
           });
           writeResponse(socket, request.id, true, { accepted: true });
@@ -3619,72 +3310,34 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
             writeResponse(socket, request.id, true, currentSnapshot.session);
             return;
           }
-          if (attachment.interactive) throw new Error('Open another chat attachment instead of replacing this chat.');
-          if (controller.isBusy) throw new Error('Wait for the current run before switching sessions.');
-          const targetWorkspace = findLiveSessionById(sessionId)?.workspace ?? workspace;
-          const activePrivate = [...targetWorkspace.privateSessions.entries()].find(
-            ([, session]) => session.controller.getSnapshot().session.id === sessionId,
-          );
-          const activeController =
-            targetWorkspace.controller.getSnapshot().session.id === sessionId ? targetWorkspace.controller : activePrivate?.[1].controller;
-          if (activeController) {
-            detachClient(attachment, socket);
-            if (activePrivate) {
-              const session = activePrivate[1];
-              if (session.cleanupTimer !== null) {
-                clearTimeout(session.cleanupTimer);
-                session.cleanupTimer = null;
-              }
-              session.clients.add(socket);
-            } else targetWorkspace.clients.add(socket);
-            attachments.set(socket, {
-              bindingKey: attachment.bindingKey,
-              clientKind: attachment.clientKind,
-              workspace: targetWorkspace,
-              controller: activeController,
-              privateSessionId: activePrivate?.[0] ?? null,
-              scopeRoot: attachment.scopeRoot,
-              ...(attachment.legacyCustodian ? { legacyCustodian: true } : {}),
-              ...(targetWorkspace === custodianWorkspace && !activePrivate ? { custodian: true } : {}),
-              ...(workers.has(sessionId) ? { readOnly: true } : {}),
-            });
-            const snapshot = activeController.getSnapshot();
-            writeEvent(socket, {
-              version: DAEMON_PROTOCOL_VERSION,
-              event: 'snapshot',
-              snapshot: toSnapshotData(snapshot),
-              runtime: toRuntimeView(targetWorkspace.runtime, activePrivate ? targetWorkspace.root : attachment.scopeRoot),
-            });
-            writeResponse(socket, request.id, true, snapshot.session);
-            return;
-          }
-          const session = controller.loadSession(sessionId);
-          if (session) await controller.restoreSessionModel();
-          pumpEvents();
-          writeResponse(socket, request.id, true, session ? stripConversation(session) : null);
+          if (sessionId === CUSTODIAN_SESSION_ID)
+            throw new Error("The machine custodian is the host's own conversation; it is not a chat to open.");
+          if (controller.isBusy) throw new Error('Wait for the current run before switching chats.');
+          const chat = await attachChat(socket, attachment.scopeRoot, attachment.clientKind, { sessionId });
+          if (socket.destroyed) return;
+          writeResponse(socket, request.id, true, chat.controller.getSnapshot().session);
           return;
         }
         case 'session.select-project': {
-          if (!attachment.custodian && !attachment.interactive) throw new Error('Project selection requires an interactive chat.');
+          if (!attachment.interactive) throw new Error('Project selection requires an interactive chat.');
           if (request.projectId !== null && typeof request.projectId !== 'string') throw new Error('Invalid project ID.');
           controller.selectProject(request.projectId as string | null, requireString(request.sessionId, 'sessionId', 64));
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         }
-        case 'session.new':
-          if (attachment.interactive) throw new Error('Open a new chat attachment instead of replacing this chat.');
-          if (controller.isBusy) throw new Error('Wait for the current run before creating a new session.');
+        case 'session.new': {
+          if (controller.isBusy) throw new Error('Wait for the current run before creating a new chat.');
           if (request.projectId !== undefined && request.projectId !== null && typeof request.projectId !== 'string')
             throw new Error('Invalid project ID.');
-          await controller.createNewSession(request.projectId as string | null | undefined);
+          await attachChat(socket, attachment.scopeRoot, attachment.clientKind, {
+            projectId: request.projectId as string | null | undefined,
+          });
+          if (socket.destroyed) return;
           writeResponse(socket, request.id, true, { accepted: true });
           return;
+        }
         case 'session.add-entry':
           controller.addEntry(parseSessionEntry(request.entry));
-          writeResponse(socket, request.id, true, { accepted: true });
-          return;
-        case 'session.remove-reasoning':
-          controller.removeReasoningEntries();
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         case 'session.flush':
@@ -3693,14 +3346,15 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           return;
         case 'runtime.save-reasoning': {
           const variantId = requireString(request.variantId, 'variantId', 256);
-          workspace.runtime.saveReasoningPreference(variantId);
+          // Session-scoped by design: the effort recorded here belongs to this
+          // chat, persists with it and never becomes a machine-wide setting.
+          controller.setReasoningPreference(variantId);
           writeResponse(socket, request.id, true, { saved: true });
           return;
         }
         case 'runtime.save-show-reasoning': {
           if (typeof request.visible !== 'boolean') throw new Error('visible must be a boolean.');
-          workspace.runtime.saveShowReasoningPreference(request.visible);
-          workspace.runtime.showReasoningDefault = request.visible;
+          controller.setShowReasoningPreference(request.visible);
           writeResponse(socket, request.id, true, { saved: true });
           return;
         }
@@ -3732,7 +3386,7 @@ function makeSessionEvent(
 ): DaemonEvent {
   const previousId = previous.session.id;
   const currentSnapshot = toSnapshotData(next);
-  const runtimeView = toRuntimeView(runtime, workspaceRoot);
+  const runtimeView = toRuntimeView(runtime, workspaceRoot, next.session);
   if (previousId !== next.session.id) {
     return { version: DAEMON_PROTOCOL_VERSION, event: 'snapshot', snapshot: currentSnapshot, runtime: runtimeView };
   }
@@ -3841,29 +3495,33 @@ function stripSessionEntries(snapshot: AgentSessionSnapshot): Omit<AgentSessionS
   return session;
 }
 
-function stripConversation(
-  session: NonNullable<ReturnType<AgentSessionController['loadSession']>>,
-): Omit<typeof session, 'conversation' | 'conversationArchive'> {
-  const { conversation: _conversation, conversationArchive: _archive, ...view } = session;
-  return view;
-}
-
-function toRuntimeView(runtime: AgentEnvironment, workspaceRoot = runtime.workspaceRoot): RuntimeViewData {
+export function toRuntimeView(
+  runtime: AgentEnvironment,
+  workspaceRoot = runtime.workspaceRoot,
+  session?: Pick<SavedSession, 'providerId' | 'modelId'> &
+    Partial<Pick<SavedSession, 'reasoning' | 'showReasoning' | 'contextWindowTokens'>>,
+): RuntimeViewData {
+  // The session is the authority for what THIS chat runs with. The shared
+  // runtime may still be bound to another session's model until the next turn
+  // boundary, and a picker or header must answer with this chat's own choice.
+  const providerId = session?.providerId ?? runtime.providerId;
+  const modelId = session?.modelId ?? runtime.modelId;
+  const active = providerId === runtime.providerId && modelId === runtime.modelId;
   return {
     supportsSessionAttachments: true,
     supportsProjects: Boolean(runtime.selectWorkspaceRoot),
     workspaceRoot,
-    modelName: runtime.modelName,
-    providerName: runtime.providerName,
-    providerId: runtime.providerId,
-    modelId: runtime.modelId,
-    contextWindowTokens: runtime.contextWindowTokens,
+    modelName: active ? runtime.modelName : resolveModelName(providerId, modelId),
+    providerName: active ? runtime.providerName : resolveProviderName(providerId),
+    providerId,
+    modelId,
+    contextWindowTokens: active ? runtime.contextWindowTokens : (session?.contextWindowTokens ?? null),
     supportsVision: runtime.supportsVision,
     reasoningVariants: runtime.reasoningVariants,
     reasoningMetadataSource: runtime.reasoningMetadataSource,
     reasoningSupport: runtime.reasoningSupport,
-    reasoningDefault: runtime.reasoningDefault,
-    showReasoningDefault: runtime.showReasoningDefault,
+    reasoningDefault: session?.reasoning ?? runtime.reasoningDefault,
+    showReasoningDefault: session?.showReasoning ?? runtime.showReasoningDefault,
     reasoningTitles: runtime.reasoningTitles === true,
     approvalMode: runtime.approvalMode ?? 'workspace',
   };

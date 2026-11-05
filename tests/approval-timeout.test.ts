@@ -84,11 +84,11 @@ describe('approval outcomes at the registry', () => {
     expect(shouldStop()).toBe(false);
   });
 
-  it('still stops the run on an explicit human decline', async () => {
+  it('still stops the run on an explicit decline', async () => {
     const { entry, shouldStop } = await buildModelTool(async () => false);
     const output = (await entry.execute({}, { toolCallId: 'call-1' })) as Record<string, unknown>;
     // The run's timing rides beside the tool's own answer; it never replaces it.
-    expect(output).toMatchObject({ status: 'denied', error: 'The user declined this tool call. It was not run.' });
+    expect(output).toMatchObject({ status: 'denied', error: 'The approval was declined. The tool call was not run.' });
     expect(typeof output.openbutlerTiming).toBe('string');
     expect(shouldStop()).toBe(true);
   });

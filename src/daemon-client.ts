@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { getDataPath } from './paths.js';
 import { canonicalScopeRoot } from './workspace-origin.js';
 import { DaemonFrameDecoder } from './daemon-frames.js';
 import { createConnection, type Socket } from 'node:net';
@@ -24,7 +23,7 @@ import {
   type SessionEntriesPatch,
   type SessionSnapshotData,
 } from './daemon-protocol.js';
-import type { SessionEntry, SessionSummary, NoticeTone } from './session-store.js';
+import { listSavedSessions, type SessionEntry, type SessionSummary, type NoticeTone } from './session-store.js';
 import { LocalNoticeList, LOCAL_NOTICE_TTL_MS, MAX_LOCAL_NOTICES } from './local-notices.js';
 import type { ApprovalMode } from './settings.js';
 import { LOCAL_CLIENT_KINDS, type LocalClientKind } from './communication.js';
@@ -37,12 +36,11 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
-type AttachOptions = {
+export type AttachOptions = {
   chatSessionId?: string;
   newChatSession?: boolean;
   projectId?: string | null;
   clientKind?: LocalClientKind;
-  custodian?: boolean;
   isolatedSession?: boolean;
   scheduleId?: string;
   /** Attach view-only to one live subagent worker session. */
@@ -51,7 +49,20 @@ type AttachOptions = {
   runningWorkerOf?: string;
 };
 
-export async function connectDaemonSession(workspacePath: string, options: AttachOptions = {}): Promise<AgentSessionClient> {
+/**
+ * What a surface opens when it starts: the chat the owner left off in, or a
+ * new one when this workspace has no chat yet. The custodian is the host's own
+ * conversation, reached through the channels that drive it, so no surface
+ * attaches to it.
+ */
+export function resumeChatAttach(clientKind: LocalClientKind): AttachOptions {
+  // Chats belong to the machine, not to one folder: every surface resumes the same list,
+  // and a chat's own project decides where it runs. The custodian is never in this list.
+  const resumed = listSavedSessions(null)[0];
+  return resumed ? { clientKind, chatSessionId: resumed.id } : { clientKind, newChatSession: true };
+}
+
+export async function connectDaemonSession(workspacePath: string, options: AttachOptions): Promise<AgentSessionClient> {
   const workspaceRoot = canonicalScopeRoot(workspacePath);
   const socket = await connectSocket();
   const client = new DaemonSessionClient(socket, workspaceRoot, options);
@@ -97,8 +108,7 @@ class DaemonSessionClient implements AgentSessionClient {
     private readonly workspaceRoot: string,
     private attachOptions: AttachOptions = {},
   ) {
-    const identityRoot = this.attachOptions.custodian === true ? getDataPath('custodian') : workspaceRoot;
-    this.workspaceKey = process.platform === 'win32' ? identityRoot.toLocaleLowerCase('en-US') : identityRoot;
+    this.workspaceKey = process.platform === 'win32' ? workspaceRoot.toLocaleLowerCase('en-US') : workspaceRoot;
     this.runtime = {
       workspaceRoot,
       modelName: 'Connecting…',
@@ -162,7 +172,6 @@ class DaemonSessionClient implements AgentSessionClient {
     const result = await this.request<AttachResult>('attach', {
       workspaceRoot: this.workspaceRoot,
       clientKind: options.clientKind ?? 'terminal',
-      ...(options.custodian ? { custodian: true } : {}),
       ...(options.chatSessionId ? { chatSessionId: options.chatSessionId } : {}),
       ...(options.newChatSession ? { newChatSession: true } : {}),
       ...(options.projectId !== undefined ? { projectId: options.projectId } : {}),
@@ -173,6 +182,10 @@ class DaemonSessionClient implements AgentSessionClient {
     });
     if (!isAttachResult(result)) throw new Error('The OpenButler host returned an invalid session attachment.');
     this.hostEntry = typeof result.hostEntry === 'string' && result.hostEntry ? result.hostEntry : null;
+    // A host that cannot even identify a web client is older than one that cannot open chats, so
+    // it is reported first: the owner should see the cause, not the first symptom of it.
+    if (options.clientKind === 'web' && result.clientKind !== 'web')
+      throw new Error('Restart the OpenButler host to identify web messages correctly: openbutler restart');
     if ((options.chatSessionId || options.newChatSession) && result.sessionAttachments !== true)
       throw new Error('Restart the OpenButler host to enable independent chats. The current run has been kept running.');
     if (options.chatSessionId || options.newChatSession) {
@@ -185,12 +198,6 @@ class DaemonSessionClient implements AgentSessionClient {
       const { newChatSession: _newChat, projectId: _project, ...rest } = options;
       this.attachOptions = { ...rest, chatSessionId: result.snapshot.session.id };
     }
-    if (options.clientKind === 'web' && result.clientKind !== 'web')
-      throw new Error('Restart the OpenButler host to identify web messages correctly: openbutler restart');
-    if (options.custodian && result.custodian !== true)
-      throw new Error(
-        'The running OpenButler host predates the machine-wide custodian update. Run `openbutler restart` to load the installed code.',
-      );
     this.applyRuntime(result.runtime);
     this.savedSessions = result.savedSessions;
     const fresh = snapshotFromData(result.snapshot);
@@ -257,6 +264,12 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.submit('session.compact', { preferences, ...(recovery ? { recovery: true } : {}) });
   }
 
+  // The host resolves the name against the shared command registry, so this
+  // client never decides what a name means; failures land as a session notice.
+  command(name: string, payload: Record<string, unknown> = {}): Promise<void> {
+    return this.submit('session.command', { name, ...payload });
+  }
+
   selectModel(providerId: string, modelId: string): Promise<void> {
     return this.request('session.select-model', { providerId, modelId }).then(() => undefined);
   }
@@ -269,6 +282,8 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.request<SessionSummary[]>('session.list');
   }
 
+  // A client holds one attachment at a time; the host opens the requested chat
+  // as its own attachment, so this never moves another surface's controller.
   loadSession(id: string): Promise<AgentSessionView | null> {
     return this.request<AgentSessionView | null>('session.load', { sessionId: id });
   }
@@ -279,10 +294,6 @@ class DaemonSessionClient implements AgentSessionClient {
 
   selectProject(projectId: string | null, sessionId: string): Promise<void> {
     return this.request('session.select-project', { projectId, sessionId }).then(() => undefined);
-  }
-
-  removeReasoningEntries(): void {
-    void this.request('session.remove-reasoning').catch((error: unknown) => this.addLocalNotice(error));
   }
 
   flushSave(): Promise<void> {
@@ -606,7 +617,6 @@ function isAttachResult(value: unknown): value is AttachResult {
     isSessionSnapshotData(value.snapshot) &&
     isRuntimeViewData(value.runtime) &&
     Array.isArray(value.savedSessions) &&
-    (value.custodian === undefined || typeof value.custodian === 'boolean') &&
     (value.clientKind === undefined || LOCAL_CLIENT_KINDS.some((kind) => kind === value.clientKind))
   );
 }

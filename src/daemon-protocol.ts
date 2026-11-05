@@ -83,6 +83,4 @@ export interface AttachResult {
   snapshot: SessionSnapshotData;
   runtime: RuntimeViewData;
   savedSessions: SessionSummary[];
-  /** Present on hosts that support the machine-wide custodian identity. */
-  custodian?: boolean;
 }
