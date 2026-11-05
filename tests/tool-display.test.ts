@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatToolResult, toolDisplayCommand, toolDisplayInput, toolPreviewCommand } from '../src/agent-session.js';
-import { toolEntryCommand, toolEntryDetails } from '../src/tool-display.js';
+import { toolEntryCommand, toolEntryDetails, toolEntryInput } from '../src/tool-display.js';
 
 const host = (name: string, input: Record<string, unknown> = {}) => ({ providerId: 'host', name, input });
 const display = (name: string, value: unknown) => formatToolResult({ providerId: 'host', name }, value).text;
@@ -75,6 +75,38 @@ describe('tool display commands', () => {
   it('falls back to a bounded input summary for unknown tools', () => {
     expect(toolDisplayCommand(host('mystery', { a: 1 }))).toBe('host/mystery {"a":1}');
     expect(toolDisplayCommand({ providerId: 'mcp', name: 'thing', input: { x: 'y' } })).toBe('mcp/thing {"x":"y"}');
+  });
+});
+
+describe('tool entry input (expanded tool row)', () => {
+  it('shows the built-in headline plus every field it did not print', () => {
+    expect(toolEntryInput({ tool: 'host:file_read', input: { path: 'a/b.ts', offset: 10, limit: 3, lineNumbers: true } })).toBe(
+      'Read a/b.ts:10-12 · { "lineNumbers": true }',
+    );
+    expect(toolEntryInput({ tool: 'host:grep', input: { pattern: 'todo', path: 'src', regex: true, max_results: 40 } })).toBe(
+      'Grep todo in src · { "regex": true, "max_results": 40 }',
+    );
+    expect(toolEntryInput({ tool: 'host:file_write', input: { path: 'a.ts', content: 'first\n'.repeat(300) + 'TAIL' } })).toContain('TAIL');
+  });
+
+  it('keeps execute_command raw and surfaces extras beside it', () => {
+    expect(toolEntryInput({ tool: 'host:execute_command', input: { command: 'npm run check' } })).toBe('npm run check');
+    expect(toolEntryInput({ tool: 'host:execute_command', input: { command: 'npm run check', cwd: 'C:\\repo', timeout: 30 } })).toBe(
+      'npm run check · { "cwd": "C:\\\\repo", "timeout": 30 }',
+    );
+  });
+
+  it('falls back to the complete generic render for MCP and unknown tools', () => {
+    const input = { url: 'https://example.com', headers: { 'x-token': 's3cret' }, retries: 1_000_000 };
+    const rendered = toolEntryInput({ tool: 'mcp-x:y', input });
+    expect(rendered).toContain('"url"');
+    expect(rendered).toContain('"x-token"');
+    expect(rendered).toContain('"retries": 1000000');
+  });
+
+  it('never trims large built-in payloads from the line', () => {
+    const command = 'echo ' + 'argument '.repeat(50).trim();
+    expect(toolEntryInput({ tool: 'host:execute_command', input: { command } })).toBe(command);
   });
 });
 

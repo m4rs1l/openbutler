@@ -1,4 +1,5 @@
 /** Presentation only: tool inputs are stored once, in full. */
+import { formatToolInput } from './tool-input.js';
 export const DEFAULT_SESSION_LIST_LIMIT = 20;
 
 export interface ToolEntryDisplay {
@@ -20,6 +21,51 @@ export function toolEntryCommand(entry: ToolEntryDisplay): string {
 
 export function toolEntryDetails(entry: ToolEntryDisplay): string {
   return entry.input ? JSON.stringify(entry.input, null, 2) : entry.command || entry.tool || 'tool';
+}
+
+/** Keys each built-in's human display covers, so the faithful tail never repeats them. */
+const BUILTIN_SHOWN: Record<string, readonly string[]> = {
+  inbox: ['action', 'source'],
+  execute_command: ['command'],
+  file_read: ['path', 'offset', 'limit'],
+  file_write: ['path'],
+  file_edit: ['path'],
+  glob: ['pattern', 'path'],
+  grep: ['pattern', 'path'],
+  question: ['question', 'options'],
+  memory_search: ['query'],
+  session_list: ['scope', 'limit'],
+  session_search: ['query'],
+  session_read: ['session', 'offset', 'limit'],
+  session_message: ['session', 'text'],
+  parent_message: ['text'],
+  subagent: ['mode', 'task'],
+  subagent_poll: ['session'],
+  subagent_stop: ['session'],
+  schedule: ['action', 'scheduleId'],
+  mcp_manage: ['action', 'serverId'],
+};
+
+/**
+ * The expanded tool row's one-line truth: the curated headline, plus whatever it
+ * did not show — always, in full. Built-ins get their curated line; everything
+ * else (MCP, server-provided, future tools) falls back to the complete generic
+ * render, so no input is ever hidden or trimmed on this surface.
+ */
+export function toolEntryInput(entry: ToolEntryDisplay): string {
+  if (!entry.input) return entry.command || entry.tool || 'tool';
+  if (!entry.tool) return formatToolInput(entry.input);
+  const colon = entry.tool.indexOf(':');
+  const providerId = entry.tool.slice(0, colon);
+  const name = entry.tool.slice(colon + 1);
+  const shown = providerId === 'host' ? BUILTIN_SHOWN[name] : undefined;
+  if (shown === undefined) return formatToolInput(entry.input);
+  const headline = toolDisplayCommand({ providerId, name, input: entry.input });
+  const wanted = new Set(shown);
+  const rest = Object.entries(entry.input).filter(([key]) => !wanted.has(key));
+  if (rest.length === 0) return headline;
+  const rendered = formatToolInput(Object.fromEntries(rest));
+  return `${headline} · ${rendered}`;
 }
 
 export function toolDisplayCommand(request: { providerId: string; name: string; input: Record<string, unknown>; title?: string }): string {
@@ -60,18 +106,14 @@ export function toolDisplayCommand(request: { providerId: string; name: string; 
         return `Grep ${input.pattern}${source}`;
       }
       case 'question': {
-        const question = clipOneLine(input.question, 80);
+        const question = typeof input.question === 'string' ? singleLine(input.question) : undefined;
         if (question === undefined) break;
         const options = Array.isArray(input.options) ? input.options.filter((option): option is string => typeof option === 'string') : [];
-        const shown = options
-          .map((option) => clipOneLine(option, 24))
-          .filter((option): option is string => option !== undefined)
-          .join(' · ')
-          .slice(0, 60);
+        const shown = options.map((option) => singleLine(option)).filter((option) => option !== undefined).join(' · ');
         return shown ? `Ask "${question}" [${shown}]` : `Ask "${question}"`;
       }
       case 'memory_search': {
-        const query = clipOneLine(input.query, 60);
+        const query = typeof input.query === 'string' ? singleLine(input.query) : undefined;
         if (query === undefined) break;
         return `Search memory "${query}"`;
       }
@@ -81,7 +123,7 @@ export function toolDisplayCommand(request: { providerId: string; name: string; 
         return `Sessions ${scope} · ${limit}`;
       }
       case 'session_search': {
-        const query = clipOneLine(input.query, 60);
+        const query = typeof input.query === 'string' ? singleLine(input.query) : undefined;
         if (query === undefined) break;
         return `Search sessions "${query}"`;
       }
@@ -96,18 +138,18 @@ export function toolDisplayCommand(request: { providerId: string; name: string; 
       }
       case 'session_message': {
         if (typeof input.session !== 'string' || !input.session) break;
-        const text = clipOneLine(input.text, 60);
+        const text = typeof input.text === 'string' ? singleLine(input.text) : undefined;
         return text === undefined ? `Message ${input.session.slice(0, 8)}` : `Message ${input.session.slice(0, 8)} "${text}"`;
       }
       case 'parent_message': {
-        const text = clipOneLine(input.text, 80);
+        const text = typeof input.text === 'string' ? singleLine(input.text) : undefined;
         if (text === undefined) break;
         return `Note "${text}"`;
       }
       case 'subagent': {
         const mode = input.mode === 'explorer' ? 'explorer' : 'executor';
-        const task = typeof input.task === 'string' ? input.task.replace(/\s+/g, ' ').trim() : '';
-        return `subagent ${mode}${task ? ` · ${task.length > 140 ? `${task.slice(0, 140)}…` : task}` : ''}`;
+        const task = typeof input.task === 'string' ? singleLine(input.task) : '';
+        return `subagent ${mode}${task ? ` · ${task}` : ''}`;
       }
       case 'subagent_poll': {
         if (typeof input.session !== 'string' || !input.session) break;
@@ -135,9 +177,8 @@ function displayInputSummary(input: Record<string, unknown>): string {
   return summary.length > 300 ? `${summary.slice(0, 300)}…` : summary;
 }
 
-function clipOneLine(value: unknown, maxChars: number): string | undefined {
+function singleLine(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const single = value.replace(/\s+/g, ' ').trim();
-  if (!single) return undefined;
-  return single.length > maxChars ? `${single.slice(0, maxChars)}…` : single;
+  return single.length === 0 ? undefined : single;
 }
