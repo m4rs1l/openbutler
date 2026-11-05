@@ -6,17 +6,29 @@ import type { ToolDefinition } from './registry.js';
 import { classifyTrustedPath, trustedRootsFor } from '../workspace-scope.js';
 import { DEFAULT_TOOL_TIMEOUT_SECONDS, runWithToolTimeout, ToolTimeoutError } from './timeout.js';
 import { openToolOutput, TOOL_OUTPUT_COMMAND_CHARS, TOOL_OUTPUT_MAX_FILE_BYTES, toolOutputNotice } from '../tool-output.js';
+import { loadSettings } from '../settings.js';
+import { resolveShell, type ResolvedShell } from './shell.js';
 
 const MAX_COMMAND_CHARS = 10_000;
 /** Inline preview kept in the result; everything past it streams to disk. */
 const MAX_OUTPUT_CHARS = TOOL_OUTPUT_COMMAND_CHARS;
 
+/** The shell line in the tool description; a broken setting never breaks the tool. */
+function configuredShellLabel(): string {
+  try {
+    return resolveShell(loadSettings().commandShell).label;
+  } catch {
+    return 'unavailable';
+  }
+}
+
 export function createExecuteCommandTool(startDirectory: string): ToolDefinition {
   const workspaceRoot = canonicalPath(startDirectory);
+  const shellLabel = configuredShellLabel();
   return {
     providerId: 'host',
     name: 'execute_command',
-    description: `Run a shell command in the active workspace (${workspaceRoot}) by default. Use cwd for another directory. Shell commands can create, replace, and append to files independently of file_write, including files already read or written in this session. After a command that edits a file, file_read.sha256 reports its current on-disk hash. Out-of-workspace working directories and common explicit paths use the configured permission mode.`,
+    description: `Run a shell command in the active workspace (${workspaceRoot}) by default. Use cwd for another directory. Shell: ${shellLabel}. Shell commands can create, replace, and append to files independently of file_write, including files already read or written in this session. After a command that edits a file, file_read.sha256 reports its current on-disk hash. Out-of-workspace working directories and common explicit paths use the configured permission mode.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -167,14 +179,27 @@ function cleanSpillFile(path: string): void {
 }
 
 function runShell(command: string, cwd: string, signal?: AbortSignal, sessionId?: string): Promise<unknown> {
+  let shell: ResolvedShell;
+  try {
+    shell = resolveShell(loadSettings().commandShell);
+  } catch (error) {
+    // A broken commandShell explains itself; it never silently swaps shells.
+    return Promise.resolve({
+      status: 'failed',
+      exitCode: null,
+      stdout: '',
+      stderr: '',
+      error: `Shell configuration: ${error instanceof Error ? error.message : String(error)}`,
+      truncated: false,
+    });
+  }
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve({ status: 'cancelled', exitCode: null, stdout: '', stderr: '', error: 'Command was stopped by the user.', truncated: false });
       return;
     }
     const windows = process.platform === 'win32';
-    const executable = windows ? 'powershell.exe' : '/bin/sh';
-    const args = windows ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command] : ['-c', command];
+    const args = [...shell.launcherArgs, command];
     let stdout = '';
     let stderr = '';
     let truncated = false;
@@ -211,7 +236,7 @@ function runShell(command: string, cwd: string, signal?: AbortSignal, sessionId?
       return overflow ? next.slice(0, MAX_OUTPUT_CHARS) : next;
     };
 
-    const child = spawn(executable, args, {
+    const child = spawn(shell.executable, args, {
       cwd,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
