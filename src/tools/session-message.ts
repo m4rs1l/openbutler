@@ -11,11 +11,12 @@ const sessionMessageEffect = {
 const MAX_SESSION_MESSAGE_CHARS = 2_000;
 
 /**
- * The write side of the session tools (P3): the machine custodian can steer a live worker
- * with a short text message. The rules are enforced by the host, not here: only a
- * machine custodian session may send, the receiver must be a live worker
- * session, and the receiver is told the message comes from another OpenButler session
- * that can never approve anything on its own.
+ * The custodian's way into a chat: it asks a question, steers, or relays an owner
+ * instruction. The name is the addressee - a session - and only the custodian
+ * runtime is given this tool, so no chat and no worker holds it. The host
+ * decides which sessions exist and refuses the custodian's own id; the receiver
+ * is told the text comes from another OpenButler agent that can never approve an
+ * action or change a setting.
  */
 export function createSessionMessageTool(
   send: (input: Record<string, unknown>, senderSessionId: string | undefined) => Promise<unknown> | unknown,
@@ -23,7 +24,7 @@ export function createSessionMessageTool(
   return {
     providerId: 'host',
     name: 'session_message',
-    description: `Send a short text message into another running OpenButler session on this machine (steering). Only the machine custodian may send, only to live worker sessions such as scheduled runs; worker-to-worker messages are refused. The receiver sees the text as a message from another OpenButler session, never from the user, and it can never approve actions or change settings by itself. Use it to redirect or correct work in progress; read the worker first with session_read when its state is unclear. Text only, at most ${MAX_SESSION_MESSAGE_CHARS} characters.`,
+    description: `Send a short text message into a chat on this machine: a question, a correction, or an owner instruction the custodian is relaying. The session id is the chat's id; the chat is woken if it is idle, and the text lands in its own conversation. The receiver sees the text as a message from the OpenButler custodian, never from the owner, and it can never approve actions or change settings by itself. Read the session first with session_read when its state is unclear. Text only, at most ${MAX_SESSION_MESSAGE_CHARS} characters.`,
     inputSchema: {
       type: 'object',
       properties: {
