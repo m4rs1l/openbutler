@@ -14,16 +14,17 @@ openbutler web --port 45278 --hostname 0.0.0.0 --dir <existing-directory>
 
 Defaults are port 45278, loopback host 127.0.0.1 and the launch directory for web's
 workspace. `--dir` is web scope, not a substitute for installing the application.
-Plain `openbutler web` starts/attaches the background host, launches the web server as
-a tracked background process and returns. A loopback bind prints a hint that
-another device needs `--hostname 0.0.0.0`; a wildcard bind prints the network
-warning instead. Pairing is explicit: `openbutler web --pair` runs a pairing session
+Plain `openbutler web` starts the server in the background and prints its address;
+it attaches to an already-running host and fails if none is running. A loopback
+bind prints a hint that another device needs `--hostname 0.0.0.0`; a wildcard bind
+prints the network warning instead. Paired browsers
+reconnect on their own. Pairing is explicit: `openbutler web --pair` runs a pairing session
 in that terminal and prints a one-time pairing URL. Enter produces a fresh URL;
 Ctrl+C stops that session. If a tracked server already runs, `--pair` stops it
 first to take over the same port, so an already-paired browser keeps its cookie
 while a new device pairs. `openbutler restart` recycles the tracked web server
-together with the host, preserving its port, hostname and workspace;
-`openbutler stop` stops both.
+together with the host when both are running, preserving its port, hostname and
+workspace; `openbutler stop` stops both.
 
 Open the printed URL in the intended browser. Pair tokens expire after five
 minutes and are consumed on use. Pairing establishes an HttpOnly session cookie.
@@ -61,14 +62,15 @@ openbutler daemon install --web --hostname 0.0.0.0 --port 45278 --dir <existing-
 ```
 
 The same command works on Windows, macOS and Linux: OpenButler writes that
-platform's own per-user startup entry, and the entry starts the host and then
-the web server with the saved binding. `openbutler daemon status` shows the
-saved `Web at login` address. Re-run `daemon install --web` with new flags to
-change it; plain `daemon install` preserves an existing web entry, and
-`openbutler daemon install --no-web` removes web from login startup. Login
-startup is not a substitute for a system service on a headless server: the
-user session must exist. Environment variables and data root must match the
-intended host instance.
+platform's own per-user startup entries, and the two entries are independent —
+the host service starts `daemon run`, the web client starts `web --serve` with
+the saved binding. Starting the host alone leaves the browser client off.
+`openbutler daemon status` shows the saved `Web client at login` address. Re-run
+`daemon install --web` with new flags to change it; plain `daemon install`
+preserves an existing web entry, and `openbutler daemon install --no-web`
+removes web from login startup. Login startup is not a substitute for a system
+service on a headless server: the user session must exist. Environment variables
+and data root must match the intended host instance.
 
 ## Browser controls
 

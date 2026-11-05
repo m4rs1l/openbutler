@@ -65,10 +65,10 @@ openbutler web [--port <1-65535>] [--hostname <address>] [--dir <directory>] [--
 
 `daemon` defaults to status. `daemon run` is the internal child-process entry,
 not the normal user launch. Install/uninstall here manage startup registration;
-`install --web` also starts the browser server at login with the saved port,
-hostname and workspace, and plain `install` keeps an existing web entry.
-`--no-web` removes web from login startup. The same startup mechanism is used
-on Windows, macOS and Linux. Program removal is below. `restart` accepts no
+`install --web` also registers the separate browser client at login with the
+saved port, hostname and workspace, and plain `install` keeps an existing web
+entry. `--no-web` removes web from login startup. The same startup mechanism is
+used on Windows, macOS and Linux. Program removal is below. `restart` accepts no
 positional task/scope argument.
 [Environment](environment.md), [web](web.md).
 
@@ -182,6 +182,23 @@ and [maintenance](maintenance.md).
 TUI: `/help`, `/clear`, `/settings`, `/permissions`, `/reasoning`, `/thinking`,
 `/compact`, `/stop`, `/models`, `/provider`, `/session`, `/skills`, `/exit`.
 Terminal controls depend on current overlay and emulator; see its footer/help.
+
+`/provider` accepts arguments on every channel (TUI, web, Telegram), and the host
+handles them without the agent interpreting the text:
+
+```text
+/provider add <id> --url <endpoint> [--npm <package>] --model <id>...
+    [--payload <json>] [--context <tokens>] [--output <tokens>] [--effort <level,...>]
+/provider list
+/provider check <id>[/<model>] [--ping]
+/provider remove <id>
+```
+
+`--url` is the base endpoint without a `/chat/completions` suffix. `--context` and
+`--output` write that model's `modelSpecs` entry and `--effort` its reasoning
+efforts; `--payload` writes the provider-wide payload, so per-model payload needs
+a settings edit. `--ping` sends one tiny real request and therefore spends tokens.
+Field semantics: [configuration](configuration.md).
 
 Web: sidebar chat/search/projects; composer model/reasoning/approval controls,
 attachments, context, dictation, send/queue/Stop; queue Steer/remove/copy; duration

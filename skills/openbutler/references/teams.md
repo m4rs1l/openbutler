@@ -20,6 +20,11 @@ openbutler team join-status <hub-address> <request-id>
 openbutler team status
 ```
 
+Hub store commands (`init`, invite/approve/deny, inbox/read on the hub) go through
+the running background host — start it with `openbutler daemon start` first. They
+do not open `team.db` from the CLI, and `team say` / `dm` / `send-file` never
+start a host as a side effect.
+
 Initialize on the intended hub, create an invite there, join from the member,
 review/approve the request on the hub and inspect membership on both. Discover
 actual tailnet addresses and listen port; do not infer them from a machine name.

@@ -56,7 +56,7 @@ older host after updating OpenButler itself.
 | `approvalMode` | `workspace`, `auto-review`, `full-access` |
 | `autoReviewTimeoutSeconds` | Reviewer deadline; CLI accepts 5-600, default 15 |
 | `autoReviewProvider`, `autoReviewModel` | Optional separate reviewer pair |
-| `approvalTimeoutSeconds` | Human approval deadline; CLI accepts 5-600, default 60 |
+| `approvalTimeoutSeconds` | Human approval deadline; CLI accepts 5-600, default 120 |
 | `mcpServers` | Global server definitions; [MCP](mcp.md) |
 | `schedules` | Durable instructions and triggers; [schedules](tasks-schedules.md) |
 | `defaultWorkspaceRoot` | Scope for later bare launches, not custodian identity |
@@ -74,9 +74,45 @@ upstream. `routing` is an explicit provider-wide default; a model's `modelRoutin
 entry replaces it completely (an empty mapping disables that default for the
 model). These rules also apply to the permission reviewer.
 
-`modelSpecs.<model>` records facts the catalog does not carry: `name`, `context`,
-`output`, `reasoning.efforts` and `payload`. Its `name` is the first choice when
-that model is named anywhere, and `payload` merges into requests for it.
+`modelSpecs.<model>` records facts settings may supply for a model: `name`,
+`context`, `output`, `reasoning.efforts` and `payload` - those five keys and
+nothing else, so an unknown key fails validation instead of being ignored. Its
+`name` is the first choice when that model is named anywhere.
+
+`context` is the token window compaction works against, and an explicit value is
+authoritative: it wins over the catalog. It therefore both fills a model the
+catalog does not describe and caps a model below its advertised window - on a 1M
+model, `context: 500000` is the window compaction uses. The number is not checked
+against the model locally; a wrong limit surfaces as the model's own request
+error the first time a request crosses it. With no explicit value the catalog
+limit applies; with neither, automatic compaction stops with an error instead of
+guessing. Settings, catalog and the running session are separate states, so
+confirm the window on the session's context meter before reporting it applied.
+`output` does not share this rule yet: a catalog value still wins there.
+
+`payload` is spread onto the top-level request body, so it carries provider
+parameters (`reasoning_effort`, `enable_thinking`, `temperature`), never message
+content - a `messages` key there would replace the conversation. Provider-level
+`payload` applies to every model of that provider; a model's own entry is merged
+after it and wins on the same key. `/provider add --payload` writes the
+provider-wide value, so per-model payload is a settings edit.
+
+```yaml
+providers:
+  local-endpoint:
+    url: "http://127.0.0.1:8000/v1"
+    npm: "@ai-sdk/openai-compatible"
+    payload:
+      temperature: 0.2
+    modelSpecs:
+      example-model:
+        context: 131072
+        output: 8192
+        reasoning:
+          efforts: [low, high]
+        payload:
+          reasoning_effort: low
+```
 
 ```yaml
 providers:

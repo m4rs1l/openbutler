@@ -44,24 +44,23 @@ custom service managers must supply the intended environment themselves.
 | `telegram reset` | Remove channel configuration |
 | `telegram reset --remove-env` | Also remove managed token environment value |
 
-The bot offers `/start`, `/approvals`, `/stop`, `/clear`, `/sessions`.
+The bot offers `/start`, `/approvals`, `/stop`, `/sessions`.
 `/approvals` reissues pending approval controls; `/stop` stops current work and
-preserves queued input; `/stop <schedule-id>` targets a schedule run. `/clear`
-starts a new conversation and rebinds the line to it; `/sessions` lists recent
-choices. The UI can provide live draft/stop and approval controls. Exact
+preserves queued input; `/stop <schedule-id>` targets a schedule run; `/sessions`
+lists recent choices. There is no reset command on this channel: chats belong to
+the interfaces the owner is looking at, so `/new` and `/clear` are ordinary text
+here. The UI can provide live draft/stop and approval controls. Exact
 availability depends on current channel/runtime state, not just the configured
 tokenEnv name.
 
-## Inbound routing: the fixed Telegram line
+## Inbound routing: one target
 
-The paired chat is one fixed line. The first inbound message freezes its target
-session under `telegram:binding:<userId>`; every later message resolves in a
-fixed order — a reply quote goes to the session that sent the quoted message,
-otherwise the binding, with the custodian conversation as the first-use fallback
-that becomes the binding. The resolved target stamps onto the stored event, and
-delivery goes to that session's live controller or restores it when it is not
-open. Session switches, host restarts and reconnects never re-route the channel;
-`/clear` is the explicit move and rebinds the line.
+The paired chat has exactly one target: the custodian conversation. Nothing is
+decided per message, so no binding row and no reply-correlation row is written,
+and a quoted message cannot address a different session. Legacy
+`telegram:binding:<userId>` and `telegram:message:<chatId>:<messageId>` rows from
+older builds stay unread. Session switches, host restarts and reconnects cannot
+re-point the channel because there is nothing to point.
 
 Incoming Telegram owner messages are authenticated and persisted as owner-inbox
 events. Host notification text points to the inbox; the agent reads actual
@@ -69,18 +68,17 @@ messages with `inbox`, not by treating a short pointer as the full user request.
 
 ## Outbound delivery
 
-The current `send_message_to_owner` tool sends intentional outbound messages to
+The `send_message_to_owner` tool — present only in the custodian runtime — sends intentional outbound messages to
 the paired **Telegram** chat; it does not send to the terminal. Inputs are
 `text`, optional `imagePath` or `filePath`, and `replyTo` as an array of original
 owner inbox message ids. There is no current `channel: auto|terminal|telegram`
 input in that tool. Ordinary assistant text and tool activity are not automatically
 forwarded as Telegram replies.
 
-Any session may send. The bound line sends bare; a message from another session
-is prefixed with its `[session title]` so the owner can tell which chat answered.
-Each successful send records its Telegram message id against the sending session,
-so a Telegram reply quoting one of those messages routes back to that session
-instead of the line.
+The custodian owns this channel. Outbound text carries no sender label and no
+message id is recorded for reply correlation: with one target there is nothing to
+disambiguate. Which runtimes may call the tool is a separate authority decision,
+not a property of the message.
 
 ```json
 {"text":"The requested inspection is complete.","replyTo":["<owner-message-id>"]}
@@ -112,17 +110,15 @@ Tool operations:
 {"action":"read","ids":["<notification-id>"]}
 ```
 
-```json
-{"action":"acknowledge","ids":["<notification-id>"]}
-```
-
 List returns source counts and notification ids without content; use source names
-returned there, such as Telegram, Team and Subagent. Read opens selected ids or
-the next unread page; limit is 1-20 and offset is zero-based. Original message ids
-for source replies and notification ids for acknowledgement are not interchangeable.
+returned there, such as Telegram, Team, Subagent and Agent. Read opens selected ids
+or the next unread page; limit is 1-20 and offset is zero-based. Original message
+ids used for replies and notification ids used for opening are not interchangeable.
 
-Reading removes a notification from the pending inbox without deleting its
-history. Read notifications do not repeat, including after a new chat or restart.
+Opening is the only consumption step: reading removes a notification from the
+pending inbox without deleting its history, and there is no separate
+acknowledgement call. Read notifications do not repeat, including after a new chat
+or restart.
 Telegram rows are scoped to the line's target session: other sessions see no
 Telegram items and cannot consume an unread one, while already-read history
 stays readable from any owner session.

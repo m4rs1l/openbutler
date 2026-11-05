@@ -7,8 +7,9 @@ Related: [tasks](tasks-schedules.md), [inbox](telegram-inbox.md), [tools](tools.
 
 A worker is a bounded local agent session started by a parent. A team peer is
 another machine. A saved session is searchable history and need not be live.
-`subagent` starts a worker; `session_message` reaches a live worker from its owning
-custodian; `session_read` only reads saved history. None is a new recurring schedule.
+`subagent` starts a worker; `worker_message` steers a live worker from its parent or
+the custodian, and a worker reports upward with `parent_message`; `session_read` only
+reads saved history. None is a new recurring schedule.
 
 ## Start a worker
 
@@ -67,10 +68,11 @@ work whose lifetime should not be tied to that wait.
 
 ## Message or stop a worker
 
-`session_message` takes `session` and `text`; it is for live worker steering, not
+`worker_message` takes `session` and `text`; it is for live worker steering, not
 arbitrary saved conversations or a separate machine's custodian. The host checks
 the live worker target and relationship and frames the input as a parent/custodian
-message. It is not a new human permission grant.
+message. It is not a new human permission grant. `session_message` is the head's
+tool for a chat, not for a worker.
 
 `subagent_stop {"session":"<worker-id-or-prefix>"}` stops a worker under the
 owning parent's scope. A stop request does not erase a saved report or undo a file

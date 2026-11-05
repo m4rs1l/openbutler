@@ -67,7 +67,11 @@ when an anchor/match is stale; a rejection is not an applied change.
 | `session_list` | Optional `scope`, `limit` |
 | `session_search` | `query`; optional `scope`, `include_outputs`, `limit`, `offset` |
 | `session_read` | `session`; optional `offset` or `around`, and `limit` |
-| `session_message` | `session`, `text` for an eligible live worker |
+| `custodian_message` | `text`; a session's report to the machine custodian (session runtimes only) |
+| `session_message` | `session`, `text`; the custodian's way into a chat (custodian runtime only) |
+| `worker_message` | `session`, `text`; steering a live worker (custodian: any worker; others: only one they spawned) |
+| `approval_decide` | `requestId`, `decision` allow/deny; decides an approval an unattended run is waiting for (custodian runtime only) |
+| `session_new` | `instruction`; starts a durable chat in the machine's default workspace and returns its id (custodian runtime only) |
 
 Scopes exposed by session list/search are workspace or all. A full id or unique
 hex prefix identifies saved sessions; ambiguous prefixes return candidates.
@@ -81,11 +85,11 @@ See [memory/context](memory-context.md) and [sessions](terminal-sessions.md).
 | Tool | Inputs and role |
 | --- | --- |
 | `question` | `question`, optional `options`; interactive clarification, may be unavailable in worker/background context |
-| `inbox` | `action` list/read/acknowledge; optional source/ids/limit/offset |
-| `send_message_to_owner` | Text and/or one imagePath/filePath; optional replyTo array; explicit Telegram delivery |
+| `inbox` | `action` list/read; optional source/ids/limit/offset. Opening a notification is what consumes it |
+| `send_message_to_owner` | Text and/or one imagePath/filePath; optional replyTo array; explicit Telegram delivery. Custodian runtime only: chats and workers are not offered the tool at all |
 | `schedule` | action, optional scheduleId or schedule definition |
 | `subagent` | task, mode, background; optional context paths/notes |
-| `parent_message` | text, optional kind progress/blocked/question |
+| `parent_message` | text, optional kind progress/blocked/question; worker runtimes only, the channel upward |
 | `subagent_stop` | session id/prefix |
 | `mcp_manage` | action; serverId/config as appropriate |
 

@@ -143,7 +143,11 @@ embedding model, and deleting the index does not restore deleted Markdown.
 
 ## Context, compaction and archives
 
-Context limits come from the selected model. As context approaches its limit,
+Context limits come from the selected model unless settings pin an explicit
+`modelSpecs.<model>.context`, which wins over the catalog. The custodian line
+additionally compacts against its own fixed budget instead of the model window
+(200000 tokens as shipped; a settings override is planned for it). As context
+approaches its limit,
 the host can run compaction: a model-generated continuation checkpoint covers
 older context while recent dialogue/tool results remain available. Full older
 conversation data is retained in the session archive. `/compact` requests it

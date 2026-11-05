@@ -87,6 +87,10 @@ the settled provider/model. Effective limits include context/output, tool callin
 vision and model-specific reasoning variants. Catalog metadata and actual provider
 acceptance are different evidence.
 
+An uncatalogued model has no known limits or reasoning variants until
+`modelSpecs` supplies them, and its `context` is required before compaction can
+run. [configuration](configuration.md)
+
 If a provider rejects image input, the runtime can disable image input and remove
 unsupported image payloads while retaining text/archive. Inspect that error rather
 than repeating the same unsupported request.
@@ -109,6 +113,7 @@ is configured through [permissions](configuration.md).
 | Package load error | Adapter name, package installation and runtime log |
 | Tools rejected | Server protocol and actual tool support |
 | Context exceeded | Effective limit and compaction result |
+| Compaction refuses to run | `providers.<id>.modelSpecs.<model>.context` missing for an uncatalogued model |
 | Reasoning ignored | Effective variant and provider/adapter support |
 
 Listing/configuration is not a successful generation. A real request verifies
