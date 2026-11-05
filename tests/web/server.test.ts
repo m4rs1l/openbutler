@@ -15,7 +15,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
-vi.mock('../../src/daemon-client.js', () => ({ connectDaemonSession: vi.fn() }));
+// The web server opens the chat the owner left off in, like the terminal, so the daemon client
+// is asked which chat that is before it connects.
+vi.mock('../../src/daemon-client.js', () => ({
+  connectDaemonSession: vi.fn(),
+  resumeChatAttach: vi.fn(() => ({ clientKind: 'web', chatSessionId: 'session-a' })),
+}));
 const settingsMocks = vi.hoisted(() => ({ saveSettings: vi.fn() }));
 vi.mock('../../src/settings.js', () => ({
   getSettingsPath: () => join(process.env.OPENBUTLER_DATA_DIR!, 'settings.yaml'),
@@ -153,6 +158,7 @@ beforeEach(async () => {
     queuedMessageCount: 0,
   } as AgentSessionSnapshot;
   Object.assign(client.runtime, { providerId: 'local', modelId: 'model-a' });
+  actors.set('session-a', client);
   vi.mocked(connectDaemonSession).mockImplementation(async (_path, options) =>
     options?.newChatSession
       ? actor('new-session')
@@ -428,7 +434,7 @@ describe('browser session controls', () => {
     expect(send).toHaveBeenCalledWith({ text: 'Hello', images: [] }, expect.anything());
   });
   it('declares web identity on the connection and ignores identity in the HTTP message body', async () => {
-    expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', { clientKind: 'web' });
+    expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', { clientKind: 'web', chatSessionId: 'session-a' });
     const response = await post('/api/message', {
       text: 'Browser message',
       sessionId: 'session-a',
@@ -532,12 +538,22 @@ describe('browser session controls', () => {
     expect((await post('/api/providers', { providerId: 'not-a-provider-xyz', apiKey: 'k' })).status).toBe(400);
     expect(settingsMocks.saveSettings).not.toHaveBeenCalled();
   });
-  it('refuses to activate a model the provider does not offer', async () => {
-    // The catalog knows nothing about this provider, so an unknown id must not
-    // become a settings entry that later fails at model creation.
+  it('activates a model id the catalog does not list', async () => {
+    // A local server serves whatever is loaded and models.dev lists hosted
+    // providers late, so a typed id is the operator's statement about the
+    // endpoint. The catalog drives the browse list, not this write.
+    settingsMocks.saveSettings.mockClear();
     const response = await post('/api/models/active', { providerId: 'local', modelId: 'not-in-catalog', active: true });
-    expect(response.status).toBe(400);
-    expect(settingsMocks.saveSettings).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(settingsMocks.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providers: expect.objectContaining({
+          local: expect.objectContaining({ models: ['model-a', 'model-b', 'not-in-catalog'] }),
+        }),
+      }),
+    );
+    // An id that cannot name anything is still refused.
+    expect((await post('/api/models/active', { providerId: 'local', modelId: '   ', active: true })).status).toBe(400);
   });
   it('exposes the reviewer settings and revokes a remembered permission', async () => {
     const info = (await (await fetch(`${server.url}/api/approvals`, { headers: { cookie } })).json()) as Record<string, unknown>;

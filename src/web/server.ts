@@ -22,7 +22,7 @@ import { modelPresentation, resolveModelName, resolveProviderName, type ModelCat
 import { watchSettingsFiles } from '../settings-watch.js';
 import { addProviderKeys } from '../provider/keys.js';
 import { verifyAttachmentPath } from '../attachments.js';
-import { connectDaemonSession } from '../daemon-client.js';
+import { connectDaemonSession, resumeChatAttach } from '../daemon-client.js';
 import { getDaemonStatus, hostVintage, hostVintageMismatchWarning } from '../daemon.js';
 import type { AgentSessionClient, AgentSessionSnapshot } from '../agent-session.js';
 import { ActivityLedger } from '../activity-ledger.js';
@@ -32,12 +32,36 @@ import { forgetRememberedPermission, listRememberedPermissions } from '../tool-p
 import { bucketUsage, bucketUsageByHour, groupHoursByDay, summarizeUsage } from '../usage/report.js';
 import { readMemorySnapshot } from '../memory-view.js';
 import { readLogRecords } from '../cli/logs.js';
-import { createProject, listProjects, projectFolder, ProjectInputError, resolveProjectSelection } from '../projects/store.js';
+import { commandFor, daemonCommandAction } from '../commands/registry.js';
+import {
+  createProject,
+  listProjects,
+  projectFolder,
+  ProjectInputError,
+  resolveProjectSelection,
+  updateProject,
+} from '../projects/store.js';
 import { pickProjectFolder } from './folder-picker.js';
 import { attachTerminalServer } from './terminal-server.js';
 import { readWorkspaceFiles, readWorkspaceFileTree, WorkspaceFilesError } from './files.js';
 import { WebSessions, SessionRequestError } from './sessions.js';
 import { BoundedSseWriter } from './sse-output.js';
+import { resolveShell } from '../tools/shell.js';
+
+/** Selectable shells for the current platform; detection itself stays runtime-only. */
+const SHELL_OPTIONS: string[] =
+  process.platform === 'win32' ? ['auto', 'pwsh', 'powershell', 'cmd', 'git-bash', 'wsl'] : ['auto', 'bash', 'zsh', 'sh'];
+
+/** The configured shell plus how it resolves right now (resolved is null when it cannot). */
+function commandShellState(): { value: string; resolved: string | null; options: string[]; error: string | null } {
+  const settings = loadSettings();
+  const value = settings.commandShell ?? 'auto';
+  try {
+    return { value, resolved: resolveShell(settings.commandShell).label, options: SHELL_OPTIONS, error: null };
+  } catch (error) {
+    return { value, resolved: null, options: SHELL_OPTIONS, error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 /** Outside the Windows ephemeral range so the port stays free between runs. */
 export function modelCatalogRows(): ModelCatalogRow[] {
@@ -133,6 +157,17 @@ interface SseClient {
   /** When this stream last carried a byte, so a close can say how silent it was. */
   lastWriteAt: number;
 }
+
+/**
+ * The host-backed side of `POST /api/command`: the browser sends a command
+ * name and the host resolves it against the shared registry, so a surface never
+ * restates what a name means. It is optional the way `manageQueuedMessage` is —
+ * a client without a host behind it cannot carry a command out, and the route
+ * says so instead of guessing at the effect itself.
+ */
+type CommandCapableClient = AgentSessionClient & {
+  command?: (name: string, payload: Record<string, unknown>) => Promise<void>;
+};
 
 function constantTimeEquals(a: string, b: string): boolean {
   const left = Buffer.from(a);
@@ -253,7 +288,9 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
   // running across rebuilds.
   const currentBuildId = () => readBuildId(assetsDir);
   const startedAt = Date.now();
-  const client: AgentSessionClient = await connectDaemonSession(options.workspaceRoot, { clientKind: 'web' });
+  // The web server is a chat client like the terminal: it opens the chat the
+  // owner left off in, and the custodian stays the host's own conversation.
+  const client: AgentSessionClient = await connectDaemonSession(options.workspaceRoot, resumeChatAttach('web'));
   const sessions = new WebSessions(client, options.workspaceRoot);
 
   // A paired browser must stay paired across restarts: the owner's phone and
@@ -550,6 +587,10 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     if (url.pathname === '/api/projects' && req.method === 'POST') {
       return sendJson(res, 201, createProject(JSON.parse(await readBody(req, 65536))));
     }
+    if (url.pathname === '/api/projects/update' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req, 65536)) as { id?: unknown; name?: unknown; folders?: unknown };
+      return sendJson(res, 200, updateProject(body.id, body));
+    }
     if (url.pathname === '/api/project-folders' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req, 65536)) as { path?: unknown };
       return sendJson(res, 200, { path: projectFolder(body.path) });
@@ -693,7 +734,30 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         modelId: client.runtime.modelId,
         contextWindowTokens: client.runtime.contextWindowTokens ?? null,
         hostEntry: client.hostEntry ? `${hostVintage(client.hostEntry)} · ${client.hostEntry}` : null,
+        shell: commandShellState().resolved,
       });
+    }
+
+    if (url.pathname === '/api/command-shell' && req.method === 'GET') {
+      return sendJson(res, 200, commandShellState());
+    }
+
+    if (url.pathname === '/api/command-shell' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}') as { value?: unknown };
+      if (typeof body.value !== 'string') return sendJson(res, 400, { error: 'Choose a shell.' });
+      const value = body.value.trim();
+      if (value !== '' && value !== 'auto') {
+        try {
+          resolveShell(value); // reject unknown presets and missing executables before saving
+        } catch (error) {
+          return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const settings = loadSettings();
+      if (value === '' || value === 'auto') delete settings.commandShell;
+      else settings.commandShell = value;
+      saveSettings(settings);
+      return sendJson(res, 200, commandShellState());
     }
 
     if (url.pathname === '/api/logs' && req.method === 'GET') {
@@ -784,12 +848,14 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         models = body.active ? catalog : [];
       } else {
         if (typeof body.modelId !== 'string') return sendJson(res, 400, { error: 'Choose a model.' });
-        // A custom provider declares its own models: the catalog cannot be the
-        // authority for an endpoint it has never seen.
-        const custom = Boolean(provider.npm);
-        if (body.active && !custom && !catalog.includes(body.modelId) && !known.includes(body.modelId))
-          return sendJson(res, 400, { error: 'That model is not in the catalog.' });
-        models = body.active ? [...new Set([...known, body.modelId])] : known.filter((modelId) => modelId !== body.modelId);
+        // An explicit id is the operator's statement about the endpoint, and the
+        // catalog is never its authority: a local server (LM Studio, Ollama)
+        // serves whatever is loaded, and models.dev lists a hosted provider's
+        // models late or not at all. The catalog drives the browse list; it does
+        // not gate a typed id, which only has to be a usable id.
+        const modelId = body.modelId.trim();
+        if (!modelId || /\s/.test(modelId)) return sendJson(res, 400, { error: 'Model ids cannot be empty or contain spaces.' });
+        models = body.active ? [...new Set([...known, modelId])] : known.filter((id) => id !== modelId);
       }
       settings.providers[body.providerId] = { ...provider, models };
       saveSettings(settings);
@@ -1176,6 +1242,39 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const body = JSON.parse((await readBody(req)) || '{}') as { holdQueue?: boolean; sessionId?: unknown };
       if (body.sessionId !== client.getSnapshot().session.id) return sendJson(res, 409, { error: 'Choose the chat to stop.' });
       client.stop(body.holdQueue === false ? { keepQueue: true } : { keepQueue: true, holdQueue: true });
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (url.pathname === '/api/command' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}') as {
+        name?: unknown;
+        sessionId?: unknown;
+        keepQueue?: unknown;
+        holdQueue?: unknown;
+      };
+      if (body.sessionId !== client.getSnapshot().session.id)
+        return sendJson(res, 409, { error: 'Choose the chat to run the command in.' });
+      // The registry is the only authority on a name: a command this surface
+      // does not offer, or one whose effect is not a host request, never
+      // reaches the daemon.
+      if (typeof body.name !== 'string' || !commandFor(body.name, 'web') || !daemonCommandAction(body.name))
+        return sendJson(res, 400, { error: 'Unknown command.' });
+      const commands = client as CommandCapableClient;
+      if (!commands.command) return sendJson(res, 409, { error: 'Commands require an updated host.' });
+      const payload: Record<string, unknown> = {};
+      // A compaction carries turn preferences, and they belong to this session's
+      // runtime rather than to the browser: the host builds them exactly as
+      // `/api/message` does, so a client cannot pick the effort a summary runs
+      // with. The host is authoritative for what a command means and how it runs.
+      if (daemonCommandAction(body.name) === 'session.compact') {
+        payload.preferences = {
+          reasoningVariantId: client.runtime.reasoningDefault ?? 'default',
+          showReasoning: client.runtime.showReasoningDefault,
+        };
+      }
+      if (body.keepQueue !== undefined) payload.keepQueue = body.keepQueue;
+      if (body.holdQueue !== undefined) payload.holdQueue = body.holdQueue;
+      await commands.command(body.name, payload);
       return sendJson(res, 200, { ok: true });
     }
 
