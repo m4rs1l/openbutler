@@ -189,6 +189,26 @@ describe('one extensible agent inbox', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it('opens a notification named by id when the model cannot send an array', async () => {
+    const execute = vi.fn(async () => ({ status: 'ok' }));
+    const tool = createInboxTool(execute);
+    // A model that cannot produce an array still has to reach the notification:
+    // the id travels as a plain string, and a string in the array slot is read
+    // the same way. One lost array must not leave a notification unreadable.
+    await tool.execute({ action: 'read', id: 'AH2SFY' }, undefined, { sessionId: 'parent' });
+    expect(execute).toHaveBeenCalledWith({ action: 'read', ids: ['AH2SFY'] }, 'parent');
+    await tool.execute({ action: 'read', ids: 'AH2SFY' }, undefined, { sessionId: 'parent' });
+    expect(execute).toHaveBeenLastCalledWith({ action: 'read', ids: ['AH2SFY'] }, 'parent');
+    await tool.execute({ action: 'read', id: 'AH2SFY,BG3TGZ' }, undefined, { sessionId: 'parent' });
+    expect(execute).toHaveBeenLastCalledWith({ action: 'read', ids: ['AH2SFY', 'BG3TGZ'] }, 'parent');
+    await tool.execute({ action: 'read', id: 'AH2SFY, BG3TGZ' }, undefined, { sessionId: 'parent' });
+    expect(execute).toHaveBeenLastCalledWith({ action: 'read', ids: ['AH2SFY', 'BG3TGZ'] }, 'parent');
+    // Reading still needs a name, and a list still needs none.
+    expect(await tool.execute({ action: 'read' })).toMatchObject({ status: 'invalid' });
+    await tool.execute({ action: 'list' }, undefined, { sessionId: 'parent' });
+    expect(execute).toHaveBeenLastCalledWith({ action: 'list' }, 'parent');
+  });
+
   it('preserves mixed source content while promoting only authenticated owner messages', () => {
     const output = {
       type: 'inbox',
