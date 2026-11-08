@@ -109,7 +109,10 @@ export function toolDisplayCommand(request: { providerId: string; name: string; 
         const question = typeof input.question === 'string' ? singleLine(input.question) : undefined;
         if (question === undefined) break;
         const options = Array.isArray(input.options) ? input.options.filter((option): option is string => typeof option === 'string') : [];
-        const shown = options.map((option) => singleLine(option)).filter((option) => option !== undefined).join(' · ');
+        const shown = options
+          .map((option) => singleLine(option))
+          .filter((option) => option !== undefined)
+          .join(' · ');
         return shown ? `Ask "${question}" [${shown}]` : `Ask "${question}"`;
       }
       case 'memory_search': {

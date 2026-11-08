@@ -231,12 +231,7 @@ export function turnInterrupted(turn: Turn): boolean {
  * ended interrupted - the failure detail lives inside the disclosure, and folding
  * it would hide the one thing the reader came back to look at.
  */
-export function workDetailsOpen(
-  expanded: boolean | null,
-  live: boolean,
-  turn: Turn,
-  detailsContainUserMessage: boolean,
-): boolean {
+export function workDetailsOpen(expanded: boolean | null, live: boolean, turn: Turn, detailsContainUserMessage: boolean): boolean {
   if (expanded !== null) return expanded;
   return live || turn.user === null || turnInterrupted(turn) || detailsContainUserMessage;
 }
