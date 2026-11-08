@@ -66,17 +66,17 @@ beforeEach(async () => {
   const catalog = await import('../src/provider/catalog.js');
   catalog.writeCatalogSnapshot(
     {
-      vercel: {
+      fixture: {
         npm: '@ai-sdk/gateway',
-        models: { mimo: { tool_call: true, limit: { context: 100_000 } } },
+        models: { modelx: { tool_call: true, limit: { context: 100_000 } } },
       },
     },
     new Date().toISOString(),
   );
   const store = settings.defaultSettings();
-  store.providers.vercel = { enabled: true, keys: ['fixture-a'], models: ['mimo'] };
-  store.defaultProvider = 'vercel';
-  store.defaultModel = 'mimo';
+  store.providers.fixture = { enabled: true, keys: ['fixture-a'], models: ['modelx'] };
+  store.defaultProvider = 'fixture';
+  store.defaultModel = 'modelx';
   settings.saveSettings(store);
   runtime = await (await import('../src/agent-runtime.js')).createAgentRuntime({ workspaceRoot: directory });
 });
@@ -105,7 +105,7 @@ describe('runtime reasoningTitles flag', () => {
     settings.saveSettings(latest);
     await runtime.selectModel('custom', 'claude-x');
     expect(runtime.reasoningTitles).toBe(true);
-    await runtime.selectModel('vercel', 'mimo');
+    await runtime.selectModel('fixture', 'modelx');
     expect(runtime.reasoningTitles).toBe(false);
   });
 });

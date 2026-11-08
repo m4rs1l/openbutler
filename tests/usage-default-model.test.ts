@@ -7,12 +7,12 @@ function settings(defaultProvider = '', defaultModel = ''): SettingsStore {
   return {
     defaultProvider,
     defaultModel,
-    providerOrder: ['vercel', 'ghost'],
+    providerOrder: ['fixture', 'ghost'],
     approvalMode: 'workspace',
     schedules: [],
     mcpServers: {},
     providers: {
-      vercel: { enabled: true, npm: '@ai-sdk/gateway', url: 'https://gateway.example/v1', keys: ['k'] },
+      fixture: { enabled: true, npm: '@ai-sdk/gateway', url: 'https://gateway.example/v1', keys: ['k'] },
       ghost: { enabled: false, npm: '@ai-sdk/gateway', url: 'https://ghost.example/v1', keys: ['k'] },
     },
   };
@@ -29,40 +29,40 @@ const untouchedLedger = {
 describe('pickMostUsedModel', () => {
   it('ranks by request count with recency breaking ties', () => {
     const rows = [
-      row('vercel', 'mimo', 1_000),
-      row('vercel', 'mimo', 2_000),
-      row('vercel', 'mimo', 3_000),
-      row('vercel', 'flash', 4_000),
-      row('vercel', 'flash', 5_000),
-      row('vercel', 'flash', 9_000),
+      row('fixture', 'modelx', 1_000),
+      row('fixture', 'modelx', 2_000),
+      row('fixture', 'modelx', 3_000),
+      row('fixture', 'flash', 4_000),
+      row('fixture', 'flash', 5_000),
+      row('fixture', 'flash', 9_000),
     ];
-    expect(pickMostUsedModel(settings(), rows)).toEqual({ providerId: 'vercel', modelId: 'flash', requests: 3 });
+    expect(pickMostUsedModel(settings(), rows)).toEqual({ providerId: 'fixture', modelId: 'flash', requests: 3 });
   });
 
   it('skips disabled providers and unknown entries', () => {
     const rows = [
       row('ghost', 'dead-model', 9_000),
-      row('vercel', 'mimo', 1_000),
+      row('fixture', 'modelx', 1_000),
       row('ghost', 'dead-model', 8_000),
       row('ghost', 'dead-model', 7_000),
     ];
-    expect(pickMostUsedModel(settings(), rows)).toEqual({ providerId: 'vercel', modelId: 'mimo', requests: 1 });
+    expect(pickMostUsedModel(settings(), rows)).toEqual({ providerId: 'fixture', modelId: 'modelx', requests: 1 });
     expect(pickMostUsedModel(settings(), [])).toBeNull();
-    expect(pickMostUsedModel(settings('vercel', 'mimo'), [])).toBeNull();
+    expect(pickMostUsedModel(settings('fixture', 'modelx'), [])).toBeNull();
   });
 });
 
 describe('resolveDefaultModel', () => {
   it('returns an explicit default without touching usage', () => {
-    const choice = resolveDefaultModel(settings('vercel', 'mimo'), untouchedLedger);
-    expect(choice).toEqual({ providerId: 'vercel', modelId: 'mimo', source: 'settings' });
+    const choice = resolveDefaultModel(settings('fixture', 'modelx'), untouchedLedger);
+    expect(choice).toEqual({ providerId: 'fixture', modelId: 'modelx', source: 'settings' });
   });
 
   it('falls back to usage when no explicit default exists', () => {
-    const ledger = { usageRows: () => [row('vercel', 'mimo', 1_000), row('vercel', 'mimo', 2_000)] };
+    const ledger = { usageRows: () => [row('fixture', 'modelx', 1_000), row('fixture', 'modelx', 2_000)] };
     expect(resolveDefaultModel(settings(), ledger)).toEqual({
-      providerId: 'vercel',
-      modelId: 'mimo',
+      providerId: 'fixture',
+      modelId: 'modelx',
       source: 'usage',
       requests: 2,
     });

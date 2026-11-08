@@ -16,6 +16,8 @@ import {
   type QueuedMessage,
 } from './agent-session.js';
 import { createAgentRuntime } from './agent-runtime.js';
+import type { ModelRole } from './model-roles.js';
+import { bindRoleModelView } from './session-model-binding.js';
 import {
   canonicalScopeRoot as canonicalWorkspaceRoot,
   resolveBackgroundScope,
@@ -24,6 +26,7 @@ import {
 import { createMcpConnectionManager } from './tools/mcp.js';
 import { CATALOG_FILENAMES } from './provider/catalog.js';
 import { resolveModelName, resolveProviderName } from './provider/model-presentation.js';
+import { resolveReasoningVariant, type ReasoningVariant } from './provider/registry.js';
 import { resolveProjectSelection } from './projects/store.js';
 import { recordUsage as recordUsageRow } from './usage/recorder.js';
 import {
@@ -1115,6 +1118,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   ): Promise<AgentEnvironment> {
     return (options.runtimeFactory ?? createAgentRuntime)({
       workspaceRoot: root,
+      // The runtime's role decides the starting model when no conversation
+      // model was saved: custodian settings for the head, agent settings for a chat.
+      role: custodian ? 'custodian' : 'agent',
       ...(initialModel ? { initialModel } : {}),
       // The head's budget is the owner's setting, read at each compaction decision and
       // never written onto the saved conversation (section 6.1). A chat is never given
@@ -1486,19 +1492,31 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
   }
 
-  function createPrivateSession(
+  async function createPrivateSession(
     workspace: WorkspaceHost,
     persistentKey?: string,
     isBackground = false,
-    extra: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string } = {},
-  ): PrivateSessionHost {
+    extra: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string; modelRole?: ModelRole } = {},
+  ): Promise<PrivateSessionHost> {
     // A worker gets exactly the tools its spawn granted, materialised as its own
     // registry: what it may not use is absent, not refused. `parent_message` is
     // the worker's channel upward and is registered only here, so no chat holds it.
     const granted = extra.options?.tools;
     const registry = granted ? workerRegistry(workspace, granted) : undefined;
+    // The role's model binds as this session's own view over the shared runtime.
+    // No role, no assignment, or an unbuilt target all mean the same thing: the
+    // session runs on the runtime's model, exactly as every private session
+    // did before roles existed.
+    let runtime: AgentEnvironment = workspace.runtime;
+    if (extra.modelRole) {
+      try {
+        runtime = (await bindRoleModelView(extra.modelRole, workspace.runtime)) ?? workspace.runtime;
+      } catch (error) {
+        options.log(`Role model '${extra.modelRole}' failed to bind, running on the conversation model: ${String(error)}`);
+      }
+    }
     const controller = new AgentSessionController(
-      workspace.runtime,
+      runtime,
       // An unattended run reports through its own record, never through the
       // owner's phone: the request went to the custodian, which decides it.
       async (action) => {
@@ -1614,7 +1632,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       await existing.session.controller.close();
       existing.workspace.privateSessions.delete(existing.mapId);
     }
-    const session = createPrivateSession(workspace, key, isBackground);
+    // Unattended runs (background tasks and schedule observers) share the
+    // background role; an assignment lets the owner price them on another model.
+    const session = await createPrivateSession(workspace, key, isBackground, { modelRole: 'background' });
     const mapId = session.controller.getSnapshot().session.id;
     persistentSessions.set(key, { workspace, session, mapId });
     return { session, mapId };
@@ -3144,22 +3164,54 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (request.scheduleId !== undefined && request.isolatedSession === true)
           throw new Error('A schedule session cannot also be an isolated one-shot session.');
         // A worker view follows the worker: the attachment belongs to the workspace that hosts the
-        // worker session, not to whichever workspace the viewing client happens to name.
+        // worker session, not to whichever workspace the viewing client happens to name. A settled worker whose live
+        // session is gone (evicted after settling, or the host restarted) still opens from the saved
+        // transcript — always view-only — because the saved record is the worker's own session on this
+        // machine and the ledger is its provenance. A running view stays strict: if no worker of this
+        // parent is running right now, that is the answer.
+        const workerViewId =
+          workerView && request.workerSessionId !== undefined ? requireString(request.workerSessionId, 'workerSessionId', 128) : null;
         const worker = workerView
-          ? liveWorkerSession(
-              request.workerSessionId !== undefined
-                ? requireString(request.workerSessionId, 'workerSessionId', 128)
-                : runningWorkerId(requireString(request.runningWorkerOf, 'runningWorkerOf', 128)),
-            )
+          ? workerViewId !== null
+            ? (() => {
+                try {
+                  return liveWorkerSession(workerViewId);
+                } catch {
+                  // The live session is gone; fall back to the saved transcript below.
+                  return null;
+                }
+              })()
+            : liveWorkerSession(runningWorkerId(requireString(request.runningWorkerOf, 'runningWorkerOf', 128)))
           : null;
-        const workspace = worker ? worker.workspace : await getWorkspace(scopeRoot);
+        let savedWorker: ReturnType<typeof loadSavedSession> = null;
+        if (workerViewId !== null && worker === null) {
+          // Ledger-backed provenance: only a session this machine once recorded as a worker may open here.
+          if (readWorkerRecord(ledger, workerViewId) === null) throw new Error('That session is not a subagent worker.');
+          const saved = loadSavedSession(workerViewId);
+          if (!saved) throw new Error('The saved worker session is no longer available.');
+          savedWorker = saved;
+        }
+        const workspace = worker
+          ? worker.workspace
+          : savedWorker
+            ? await getWorkspace(savedWorker.workspaceRoot ?? scopeRoot)
+            : await getWorkspace(scopeRoot);
         if (socket.destroyed) return;
         const priorAttachment = attachments.get(socket);
         if (priorAttachment) detachClient(priorAttachment, socket);
         let privateSession: PrivateSessionHost | null =
-          worker?.session ?? (request.isolatedSession === true ? createPrivateSession(workspace) : null);
+          worker?.session ??
+          (savedWorker
+            ? await createPrivateSession(workspace, undefined, false, {
+                label: 'Subagent',
+                restoreSessionId: savedWorker.id,
+                modelRole: 'worker',
+              })
+            : request.isolatedSession === true
+              ? await createPrivateSession(workspace)
+              : null);
         let privateMapId = privateSession?.controller.getSnapshot().session.id ?? null;
-        const readOnly = worker !== null;
+        const readOnly = worker !== null || savedWorker !== null;
         if (request.scheduleId !== undefined) {
           const scheduleId = requireString(request.scheduleId, 'scheduleId', 64);
           const schedule = loadSettings().schedules.find((candidate) => candidate.id === scheduleId);
@@ -3499,7 +3551,7 @@ export function toRuntimeView(
   runtime: AgentEnvironment,
   workspaceRoot = runtime.workspaceRoot,
   session?: Pick<SavedSession, 'providerId' | 'modelId'> &
-    Partial<Pick<SavedSession, 'reasoning' | 'showReasoning' | 'contextWindowTokens'>>,
+    Partial<Pick<SavedSession, 'reasoning' | 'showReasoning' | 'contextWindowTokens' | 'reasoningVariants'>>,
 ): RuntimeViewData {
   // The session is the authority for what THIS chat runs with. The shared
   // runtime may still be bound to another session's model until the next turn
@@ -3507,6 +3559,28 @@ export function toRuntimeView(
   const providerId = session?.providerId ?? runtime.providerId;
   const modelId = session?.modelId ?? runtime.modelId;
   const active = providerId === runtime.providerId && modelId === runtime.modelId;
+  // Effort levels belong to a model, not to a runtime. While the runtime is
+  // bound to this chat's model its list is this chat's list; while another chat
+  // holds the binding, the levels recorded with this chat's model are. A view
+  // only ever carries id and label, so the runtime's own providerOptions are not
+  // needed here - they belong to whichever runtime builds the actual request.
+  const recorded: ReadonlyArray<{ id: string; label: string }> = session?.reasoningVariants ?? runtime.reasoningVariants;
+  const reasoningVariants: ReasoningVariant[] = active
+    ? runtime.reasoningVariants
+    : recorded.map(({ id, label }) => ({ id, label, providerOptions: {} }));
+  // A recorded effort the shown model no longer offers must not be reported as
+  // the selection: the picker would offer a value that cannot be chosen again.
+  // But that check needs a list known to belong to this chat's model. Without one
+  // the runtime's list is another chat's, and demoting an explicit choice against
+  // it would silently hand back the machine default.
+  const preferredEffort = session?.reasoning ?? runtime.reasoningDefault;
+  const listIsOurs = active || session?.reasoningVariants !== undefined;
+  const reasoningDefault =
+    !listIsOurs && session?.reasoning !== undefined
+      ? session.reasoning
+      : reasoningVariants.some((variant) => variant.id === preferredEffort)
+        ? preferredEffort
+        : resolveReasoningVariant(reasoningVariants, preferredEffort).id;
   return {
     supportsSessionAttachments: true,
     supportsProjects: Boolean(runtime.selectWorkspaceRoot),
@@ -3517,10 +3591,10 @@ export function toRuntimeView(
     modelId,
     contextWindowTokens: active ? runtime.contextWindowTokens : (session?.contextWindowTokens ?? null),
     supportsVision: runtime.supportsVision,
-    reasoningVariants: runtime.reasoningVariants,
+    reasoningVariants,
     reasoningMetadataSource: runtime.reasoningMetadataSource,
     reasoningSupport: runtime.reasoningSupport,
-    reasoningDefault: session?.reasoning ?? runtime.reasoningDefault,
+    reasoningDefault,
     showReasoningDefault: session?.showReasoning ?? runtime.showReasoningDefault,
     reasoningTitles: runtime.reasoningTitles === true,
     approvalMode: runtime.approvalMode ?? 'workspace',

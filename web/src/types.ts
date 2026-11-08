@@ -277,3 +277,10 @@ export interface ApprovalsInfo {
   /** Active models the reviewer may be set to. */
   models: Array<{ providerId: string; modelId: string; name: string }>;
 }
+
+/** The default model plus every role assignment; null on a role means follow the default. */
+export interface ModelRolesInfo {
+  default: { providerId: string; modelId: string; source: 'settings' | 'usage' | 'role'; requests?: number } | null;
+  roles: Record<string, { providerId: string; modelId: string } | null>;
+  models: Array<{ providerId: string; modelId: string; name: string }>;
+}

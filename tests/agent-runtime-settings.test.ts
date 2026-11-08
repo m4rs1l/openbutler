@@ -66,22 +66,22 @@ beforeEach(async () => {
   const catalog = await import('../src/provider/catalog.js');
   catalog.writeCatalogSnapshot(
     {
-      vercel: {
+      fixture: {
         npm: '@ai-sdk/gateway',
-        models: { mimo: { tool_call: true, limit: { context: 100_000 } }, minimax: { tool_call: true, limit: { context: 100_000 } } },
+        models: { modelx: { tool_call: true, limit: { context: 100_000 } }, minimax: { tool_call: true, limit: { context: 100_000 } } },
       },
     },
     new Date().toISOString(),
   );
   const store = settings.defaultSettings();
-  store.providers.vercel = {
+  store.providers.fixture = {
     enabled: true,
     keys: ['fixture-a'],
-    models: ['mimo', 'minimax'],
-    modelRouting: { mimo: { only: ['deepinfra'] } },
+    models: ['modelx', 'minimax'],
+    modelRouting: { modelx: { only: ['deepinfra'] } },
   };
-  store.defaultProvider = 'vercel';
-  store.defaultModel = 'mimo';
+  store.defaultProvider = 'fixture';
+  store.defaultModel = 'modelx';
   settings.saveSettings(store);
   runtime = await (await import('../src/agent-runtime.js')).createAgentRuntime({ workspaceRoot: directory });
 });
@@ -95,10 +95,10 @@ describe('live runtime settings', () => {
     const catalog = await import('../src/provider/catalog.js');
     catalog.writeCatalogSnapshot(
       {
-        vercel: {
+        fixture: {
           npm: '@ai-sdk/gateway',
           models: {
-            mimo: { limit: { context: 100_000 } },
+            modelx: { limit: { context: 100_000 } },
             minimax: { limit: { context: 100_000 } },
           },
         },
@@ -109,9 +109,9 @@ describe('live runtime settings', () => {
     const fetcher = vi.fn<typeof fetch>(() => new Promise(() => {}));
     globalThis.fetch = fetcher;
     try {
-      await runtime.restoreModel!('vercel', 'minimax');
+      await runtime.restoreModel!('fixture', 'minimax');
       expect(runtime.modelId).toBe('minimax');
-      expect(settings.loadSettings().defaultModel).toBe('mimo');
+      expect(settings.loadSettings().defaultModel).toBe('modelx');
       expect(fetcher).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = savedFetch;
@@ -237,13 +237,13 @@ describe('live runtime settings', () => {
 
   it('lets an explicit modelSpecs context win over the catalog window in both directions', async () => {
     const overridden = settings.loadSettings();
-    overridden.providers.vercel!.modelSpecs = { mimo: { context: 500_000 } };
+    overridden.providers.fixture!.modelSpecs = { modelx: { context: 500_000 } };
     settings.saveSettings(overridden);
     await runtime.reloadSettings!();
     // The catalog still reports 100000 for this model; the explicit value wins.
     expect(runtime.contextWindowTokens).toBe(500_000);
 
-    await runtime.selectModel('vercel', 'minimax');
+    await runtime.selectModel('fixture', 'minimax');
     // No explicit window for this model, so the catalog limit applies again.
     expect(runtime.contextWindowTokens).toBe(100_000);
   });
@@ -252,10 +252,10 @@ describe('live runtime settings', () => {
     const catalog = await import('../src/provider/catalog.js');
     catalog.writeCatalogSnapshot(
       {
-        vercel: {
+        fixture: {
           npm: '@ai-sdk/gateway',
           models: {
-            mimo: { tool_call: true, limit: { context: 100_000, output: 32_768 } },
+            modelx: { tool_call: true, limit: { context: 100_000, output: 32_768 } },
             minimax: { tool_call: true, limit: { context: 100_000, output: 32_768 } },
           },
         },
@@ -265,7 +265,7 @@ describe('live runtime settings', () => {
     // Settings names only the window: output still falls back to the catalog
     // instead of reversing the priority (the 2026-11-03 divergence bug).
     const windowOnly = settings.loadSettings();
-    windowOnly.providers.vercel!.modelSpecs = { mimo: { context: 500_000 } };
+    windowOnly.providers.fixture!.modelSpecs = { modelx: { context: 500_000 } };
     settings.saveSettings(windowOnly);
     await runtime.reloadSettings!();
     expect(runtime.contextWindowTokens).toBe(500_000);
@@ -273,12 +273,12 @@ describe('live runtime settings', () => {
 
     // Settings names both: both win, on creation and across a model switch.
     const both = settings.loadSettings();
-    both.providers.vercel!.modelSpecs = { mimo: { context: 500_000, output: 4_096 } };
+    both.providers.fixture!.modelSpecs = { modelx: { context: 500_000, output: 4_096 } };
     settings.saveSettings(both);
     await runtime.reloadSettings!();
     expect(runtime.contextWindowTokens).toBe(500_000);
     expect(runtime.outputLimitTokens).toBe(4_096);
-    await runtime.selectModel('vercel', 'minimax');
+    await runtime.selectModel('fixture', 'minimax');
     expect(runtime.contextWindowTokens).toBe(100_000);
     expect(runtime.outputLimitTokens).toBe(32_768);
   });
@@ -286,15 +286,15 @@ describe('live runtime settings', () => {
   it('restores another chat model without changing defaults or the first runtime', async () => {
     const other = await (
       await import('../src/agent-runtime.js')
-    ).createAgentRuntime({ workspaceRoot: directory, initialModel: { providerId: 'vercel', modelId: 'minimax' } });
+    ).createAgentRuntime({ workspaceRoot: directory, initialModel: { providerId: 'fixture', modelId: 'minimax' } });
     try {
       expect(other.modelId).toBe('minimax');
-      expect(runtime.modelId).toBe('mimo');
-      expect(settings.loadSettings().defaultModel).toBe('mimo');
-      await other.selectModel('vercel', 'minimax');
+      expect(runtime.modelId).toBe('modelx');
+      expect(settings.loadSettings().defaultModel).toBe('modelx');
+      await other.selectModel('fixture', 'minimax');
       await runtime.reloadSettings!();
       expect(other.modelId).toBe('minimax');
-      expect(runtime.modelId).toBe('mimo');
+      expect(runtime.modelId).toBe('modelx');
     } finally {
       await other.close();
     }
@@ -302,13 +302,13 @@ describe('live runtime settings', () => {
   it('refreshes keys and model routing without changing the selected model or rewriting files', async () => {
     const originalModel = runtime.model;
     const latest = settings.loadSettings();
-    latest.providers.vercel!.keys = ['fixture-b'];
-    latest.providers.vercel!.modelRouting = { mimo: { only: ['parasail'] } };
+    latest.providers.fixture!.keys = ['fixture-b'];
+    latest.providers.fixture!.modelRouting = { modelx: { only: ['parasail'] } };
     latest.defaultModel = 'minimax';
     settings.saveSettings(latest);
     await runtime.reloadSettings!();
     expect(runtime.model).not.toBe(originalModel);
-    expect(runtime.modelId).toBe('mimo');
+    expect(runtime.modelId).toBe('modelx');
     expect(calls.build.mock.lastCall?.[2].keys).toEqual(['fixture-b']);
     expect(runtime.getReasoningProviderOptions('default', false)).toEqual({ gateway: { only: ['parasail'] } });
     await runtime.reloadSettings!();
@@ -318,7 +318,7 @@ describe('live runtime settings', () => {
 
   it('updates reviewer selection and preferences and can return to the main reviewer model', async () => {
     const latest = settings.loadSettings();
-    latest.autoReviewProvider = 'vercel';
+    latest.autoReviewProvider = 'fixture';
     latest.autoReviewModel = 'minimax';
     latest.showReasoning = false;
     latest.approvalMode = 'auto-review';
@@ -351,11 +351,11 @@ describe('live runtime settings', () => {
     // Restore the last valid on-disk file before saving a new revision.
     // Stale settings snapshots must not silently overwrite external edits.
     writeFileSync(settings.getSettingsPath(), lastValidSettings);
-    latest.providers.vercel!.enabled = false;
+    latest.providers.fixture!.enabled = false;
     settings.saveSettings(latest);
     await expect(runtime.reloadSettings!()).rejects.toThrow(/disabled or not configured/);
-    latest.providers.vercel!.enabled = true;
-    latest.providers.vercel!.keys = ['fixture-c'];
+    latest.providers.fixture!.enabled = true;
+    latest.providers.fixture!.keys = ['fixture-c'];
     settings.saveSettings(latest);
     await runtime.reloadSettings!();
     expect(calls.build.mock.lastCall?.[2].keys).toEqual(['fixture-c']);
@@ -377,7 +377,7 @@ describe('live runtime settings', () => {
           inputSchema: jsonSchema({ type: 'object', properties: {} }),
           execute: async () => {
             const latest = settings.loadSettings();
-            latest.providers.vercel!.keys = ['fixture-next-step'];
+            latest.providers.fixture!.keys = ['fixture-next-step'];
             settings.saveSettings(latest);
             return 'updated';
           },

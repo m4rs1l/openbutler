@@ -1146,11 +1146,12 @@ describe('session streaming message boundaries', () => {
     await session.sendMessage({ text: 'inspect', images: [] }, preferences);
 
     const entries = session.getSnapshot().session.entries;
-    expect(entries.map((entry) => entry.kind)).toEqual(['divider', 'user', 'assistant', 'tool', 'assistant']);
-    expect(entries[1]).toMatchObject({ kind: 'user', text: 'inspect' });
-    expect(entries[2]).toMatchObject({ kind: 'assistant', text: 'Checking the result.' });
-    expect(entries[3]).toMatchObject({ kind: 'tool', running: false });
-    expect(entries[4]).toMatchObject({ kind: 'assistant', text: 'Completed successfully.' });
+    // A first message opens the transcript on its own: no day divider precedes it.
+    expect(entries.map((entry) => entry.kind)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+    expect(entries[0]).toMatchObject({ kind: 'user', text: 'inspect' });
+    expect(entries[1]).toMatchObject({ kind: 'assistant', text: 'Checking the result.' });
+    expect(entries[2]).toMatchObject({ kind: 'tool', running: false });
+    expect(entries[3]).toMatchObject({ kind: 'assistant', text: 'Completed successfully.' });
   });
 
   it('previews a tool call while its arguments stream, then shows the executed form', async () => {
@@ -1274,11 +1275,12 @@ describe('session streaming message boundaries', () => {
     await session.sendMessage({ text: 'inspect', images: [] }, preferences);
 
     const entries = session.getSnapshot().session.entries;
-    expect(entries.map((entry) => entry.kind)).toEqual(['divider', 'user', 'assistant', 'tool', 'assistant']);
-    expect(entries[1]).toMatchObject({ kind: 'user', text: 'inspect' });
-    expect(entries[2]).toMatchObject({ kind: 'assistant', text: 'I am updating the notes (including the details).' });
-    expect(entries[3]).toMatchObject({ kind: 'tool', running: false });
-    expect(entries[4]).toMatchObject({ kind: 'assistant', text: 'Done.' });
+    // A first message opens the transcript on its own: no day divider precedes it.
+    expect(entries.map((entry) => entry.kind)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+    expect(entries[0]).toMatchObject({ kind: 'user', text: 'inspect' });
+    expect(entries[1]).toMatchObject({ kind: 'assistant', text: 'I am updating the notes (including the details).' });
+    expect(entries[2]).toMatchObject({ kind: 'tool', running: false });
+    expect(entries[3]).toMatchObject({ kind: 'assistant', text: 'Done.' });
   });
 
   it('keeps a completed tool step in the session if the next provider step fails', async () => {
@@ -2607,22 +2609,30 @@ describe('stored transcript dividers', () => {
         (entry): entry is Extract<SessionEntry, { kind: 'divider' }> => entry.kind === 'divider' && entry.text === undefined,
       );
 
-  it('stores one day divider above the first message and stays quiet the same day', async () => {
+  it('opens a new chat with no day divider and separates only a later day', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(dividerModel()));
     await session.sendMessage({ text: 'First message', images: [] }, preferences);
     await session.waitUntilIdle(1000);
-    const dayDividers = dayDividersOf(session);
-    expect(dayDividers).toHaveLength(1);
-    expect(Math.abs((dayDividers[0]!.at ?? 0) - Date.now())).toBeLessThan(60_000);
+    // Nothing stood above the first message, so there was no boundary to draw.
+    expect(dayDividersOf(session)).toHaveLength(0);
 
     await session.sendMessage({ text: 'Second message', images: [] }, preferences);
     await session.waitUntilIdle(1000);
-    expect(dayDividersOf(session)).toHaveLength(1);
+    expect(dayDividersOf(session)).toHaveLength(0);
+
+    // With an entry from an earlier day in place, the break returns above the next message.
+    session.addEntry({ kind: 'notice', text: 'archived earlier', at: Date.now() - 2 * 86_400_000 });
+    await session.sendMessage({ text: 'Back after a gap', images: [] }, preferences);
+    await session.waitUntilIdle(1000);
+    const dayDividers = dayDividersOf(session);
+    expect(dayDividers).toHaveLength(1);
 
     const entries = session.getSnapshot().session.entries;
-    const dividerIndex = entries.findIndex((entry) => entry.kind === 'divider');
-    expect(entries.findIndex((entry) => entry.kind === 'user')).toBe(dividerIndex + 1);
+    const users = entries.filter((entry) => entry.kind === 'user');
+    const dividerIndex = entries.indexOf(dayDividers[0]!);
+    expect(dividerIndex).toBeLessThan(entries.indexOf(users[users.length - 1]!));
+    expect(dividerIndex + 1).toBe(entries.indexOf(users[users.length - 1]!));
   });
 
   it('writes a fresh day divider when the last entry belongs to an earlier day', async () => {
@@ -2663,18 +2673,32 @@ describe('stored transcript dividers', () => {
     expect(effortIndex).toBeGreaterThan(entries.indexOf(users[0]!));
   });
 
-  it('records a model switch when the runtime accepts it', async () => {
+  it('holds a model switch out of the transcript until a message runs with it', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
-    session = new AgentSessionController(runtimeFor(dividerModel()));
+    // A runtime that can be rebound: a real one restores the session model at the
+    // turn boundary, and the fixture's bare runtime cannot, which would fail the
+    // turn before its message ever reaches the transcript.
+    const runtime = runtimeFor(dividerModel());
+    runtime.restoreModel = async () => {};
+    session = new AgentSessionController(runtime);
     await session.sendMessage({ text: 'First message', images: [] }, preferences);
     await session.waitUntilIdle(1000);
 
     await session.selectModel('other', 'other-model');
+    // A pick is a choice, not a message: nothing has run under it yet.
+    expect(dividersOf(session, 'Model changed')).toHaveLength(0);
+
+    await session.selectModel('other', 'other-model');
+    expect(dividersOf(session, 'Model changed')).toHaveLength(0);
+
+    await session.sendMessage({ text: 'Runs under the new model', images: [] }, preferences);
+    await session.waitUntilIdle(1000);
     const model = dividersOf(session, 'Model changed');
     expect(model).toHaveLength(1);
     expect(model[0]!.text).toBe('Model changed from "fixture" to "other-model"');
 
-    await session.selectModel('other', 'other-model');
+    await session.sendMessage({ text: 'Still the new model', images: [] }, preferences);
+    await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Model changed')).toHaveLength(1);
   });
 });
@@ -2800,5 +2824,48 @@ describe('session-owned reasoning', () => {
     expect(entries.some((entry) => 'text' in entry && typeof entry.text === 'string' && entry.text.includes('waiting from below'))).toBe(
       false,
     );
+  });
+});
+
+describe('model and effort persistence', () => {
+  it('keeps a choice made on a chat that has no message yet', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { loadSavedSession, listSavedSessions } = await import('../src/session-store.js');
+    const runtime = runtimeFor(new MockLanguageModelV3({ doGenerate: async () => titleResponse() }));
+    runtime.selectModel = async (providerId, modelId) => {
+      runtime.providerId = providerId;
+      runtime.modelId = modelId;
+      runtime.reasoningVariants = [
+        { id: 'default', label: 'Default', providerOptions: {} },
+        { id: 'high', label: 'High', providerOptions: {} },
+      ];
+    };
+    session = new AgentSessionController(runtime);
+    const id = session.getSnapshot().session.id;
+
+    await session.selectModel('second-endpoint', 'second-model');
+    session.setReasoningPreference('high');
+    session.flushSave();
+
+    const saved = loadSavedSession(id);
+    expect(saved).not.toBeNull();
+    expect(saved!.providerId).toBe('second-endpoint');
+    expect(saved!.modelId).toBe('second-model');
+    expect(saved!.reasoning).toBe('high');
+    expect(saved!.reasoningVariants?.map((variant) => variant.id)).toEqual(['default', 'high']);
+    // The record exists only because the choice moved; a chat with no message still
+    // never surfaces in the picker.
+    expect(listSavedSessions().map((entry) => entry.id)).not.toContain(id);
+  });
+
+  it('writes nothing for a chat whose choice never moved', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { loadSavedSession } = await import('../src/session-store.js');
+    session = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doGenerate: async () => titleResponse() })));
+    const id = session.getSnapshot().session.id;
+
+    session.flushSave();
+
+    expect(loadSavedSession(id)).toBeNull();
   });
 });

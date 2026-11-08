@@ -71,3 +71,21 @@ it('falls back to the runtime while the session carries no choice of its own', (
   expect(view.showReasoningDefault).toBe(true);
   expect(view.contextWindowTokens).toBe(128_000);
 });
+
+it('drops a recorded effort the chat own list does not offer', () => {
+  const runtime = runtimeFor();
+  const view = toRuntimeView(runtime, runtime.workspaceRoot, {
+    providerId: 'other',
+    modelId: 'other-model',
+    reasoning: 'high',
+    reasoningVariants: [
+      { id: 'default', label: 'Default' },
+      { id: 'minimal', label: 'Minimal' },
+    ],
+  });
+  // The list proves this chat's model has no `high`, so reporting it would leave
+  // the picker on a value nothing can submit again.
+  expect(view.reasoningVariants.map((variant) => variant.id)).not.toContain('high');
+  expect(view.reasoningVariants.map((variant) => variant.id)).toContain(view.reasoningDefault);
+  expect(view.reasoningDefault).not.toBe('high');
+});

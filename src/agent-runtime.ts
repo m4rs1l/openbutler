@@ -9,7 +9,6 @@ import {
   createLanguageModel,
   defaultModelIsUsable,
   findReasoningCatalogMatch,
-  listReasoningVariants,
   mergeProviderOptions,
   minimalReasoningOptions,
   modelInputModalities,
@@ -21,13 +20,14 @@ import {
   reasoningSupportStatus,
   resolveReasoningVariant,
   routingProviderOptions,
-  settingsEffortVariants,
   supportsImageToolResult,
+  type ReasoningVariant,
   type ResolvedProvider,
   withReasoningVisibility,
 } from './provider/registry.js';
+import { modelReasoningVariants } from './provider/model-view.js';
 import { createPayloadFetch } from './provider/request-payload.js';
-import { resolveDefaultModel } from './usage/default-model.js';
+import { resolveRoleModel, roleModelAssignment, roleModelConfig, type ModelRole } from './model-roles.js';
 import {
   loadSettings,
   providerModelRouting,
@@ -62,6 +62,13 @@ export function requireModelContextWindow(value: number | null | undefined, prov
 
 export interface CreateAgentRuntimeOptions {
   workspaceRoot?: string;
+  /**
+   * Which role this runtime serves. The role decides the starting model when no
+   * conversation model was saved: chat runtimes bind `agent`, the head's own
+   * runtime binds `custodian`. Worker and background roles never get a runtime -
+   * they bind their model at the session level over the shared one.
+   */
+  role?: Exclude<ModelRole, 'worker' | 'background' | 'title' | 'review'>;
   /** Restore a conversation's model without changing the machine's defaults. */
   initialModel?: { providerId: string; modelId: string };
   /**
@@ -113,9 +120,10 @@ export interface CreateAgentRuntimeOptions {
 /** Creates the shared model/tool runtime without depending on a terminal UI. */
 export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}): Promise<AgentEnvironment> {
   const settings = loadSettings();
-  // A session's initial model wins; otherwise the default is explicit or, when
-  // unset, the most-used usable model from recorded usage.
-  const defaultChoice = options.initialModel ?? resolveDefaultModel(settings);
+  // A session's initial model wins; otherwise this runtime's role decides: its
+  // assignment when the owner made one, else the explicit default or, when that
+  // is unset too, the most-used usable model from recorded usage.
+  const defaultChoice = options.initialModel ?? resolveRoleModel(settings, options.role ?? 'agent');
   const providerId = defaultChoice?.providerId ?? '';
   const modelId = defaultChoice?.modelId ?? '';
   const provider = settings.providers[providerId];
@@ -155,13 +163,12 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
   // opposite orderings at the same call site.
   const budget = resolveContextBudget(provider.modelSpecs?.[modelId], reasoningCatalog.model?.limit);
   const contextWindowTokens = requireModelContextWindow(budget.window, providerId, modelId);
-  const catalogVariants = listReasoningVariants(resolved.resolved, reasoningCatalog.model);
-  const reasoningVariants = [
-    ...catalogVariants,
-    ...settingsEffortVariants(resolved.resolved, provider.modelSpecs?.[modelId]?.reasoning?.efforts ?? []).filter(
-      (variant) => !catalogVariants.some((existing) => existing.id === variant.id),
-    ),
-  ];
+  const reasoningVariants = modelReasoningVariants(
+    providerId,
+    modelId,
+    resolved.resolved,
+    provider.modelSpecs?.[modelId]?.reasoning?.efforts ?? [],
+  );
 
   async function loadReviewer(latest: SettingsStore): Promise<{
     resolved: ResolvedProvider | null;
@@ -169,35 +176,63 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
     model: LanguageModel | null;
     routing: ReturnType<typeof routingProviderOptions>;
   }> {
-    if (!latest.autoReviewProvider || !latest.autoReviewModel) return { resolved: null, catalogModel: null, model: null, routing: {} };
-    if (!modelIsUsable(latest, latest.autoReviewProvider, latest.autoReviewModel))
+    // The review role resolves the same way every role does; the legacy
+    // autoReview pair is read through the resolver, so the old settings and a
+    // roles.review entry are one code path.
+    const assignment = roleModelAssignment(latest, 'review');
+    if (!assignment) return { resolved: null, catalogModel: null, model: null, routing: {} };
+    if (!modelIsUsable(latest, assignment.providerId, assignment.modelId))
       throw new Error('The configured auto-review provider/model is not ready.');
     const built = await createLanguageModel(
-      latest.autoReviewProvider,
-      latest.autoReviewModel,
-      latest.providers[latest.autoReviewProvider],
-      createPayloadFetch(latest.providers[latest.autoReviewProvider], latest.autoReviewModel),
+      assignment.providerId,
+      assignment.modelId,
+      latest.providers[assignment.providerId],
+      createPayloadFetch(latest.providers[assignment.providerId], assignment.modelId),
     );
     if (!built.ok) throw new Error(built.error.reason);
     return {
       resolved: built.resolved,
-      catalogModel: findReasoningCatalogMatch(latest.autoReviewProvider, latest.autoReviewModel, built.resolved).model,
+      catalogModel: findReasoningCatalogMatch(assignment.providerId, assignment.modelId, built.resolved).model,
       model: built.model,
-      routing: routingProviderOptions(
-        built.resolved,
-        providerModelRouting(latest.providers[latest.autoReviewProvider], latest.autoReviewModel),
+      routing: routingProviderOptions(built.resolved, providerModelRouting(latest.providers[assignment.providerId], assignment.modelId)),
+    };
+  }
+  const reviewerConfig = (latest: SettingsStore) => JSON.stringify([roleModelConfig(latest, 'review'), getCatalogRevision()]);
+  let reviewer = await loadReviewer(settings);
+  let appliedReviewerConfig = reviewerConfig(settings);
+
+  // The title generation clerk runs on the `title` role's model when one is
+  // assigned; without an assignment it is absent and a session falls back to
+  // its main model, which is the behaviour every chat had before roles existed.
+  const titleConfig = (latest: SettingsStore) => JSON.stringify([roleModelConfig(latest, 'title'), getCatalogRevision()]);
+  async function loadTitleClerk(latest: SettingsStore): Promise<{
+    model: LanguageModel | null;
+    providerOptions: ReasoningVariant['providerOptions'] | null;
+  }> {
+    const assignment = roleModelAssignment(latest, 'title');
+    // Unlike the reviewer, a broken title target is not an error: naming a chat
+    // is a convenience, and it must never fail a run the way a missing reviewer can.
+    if (!assignment || !modelIsUsable(latest, assignment.providerId, assignment.modelId)) return { model: null, providerOptions: null };
+    const built = await createLanguageModel(
+      assignment.providerId,
+      assignment.modelId,
+      latest.providers[assignment.providerId],
+      createPayloadFetch(latest.providers[assignment.providerId], assignment.modelId),
+    );
+    if (!built.ok) return { model: null, providerOptions: null };
+    return {
+      model: built.model,
+      providerOptions: mergeProviderOptions(
+        minimalReasoningOptions(
+          built.resolved,
+          findReasoningCatalogMatch(assignment.providerId, assignment.modelId, built.resolved).model,
+        ) ?? {},
+        routingProviderOptions(built.resolved, providerModelRouting(latest.providers[assignment.providerId], assignment.modelId)),
       ),
     };
   }
-  const reviewerConfig = (latest: SettingsStore) =>
-    JSON.stringify([
-      latest.autoReviewProvider,
-      latest.autoReviewModel,
-      latest.autoReviewProvider ? latest.providers[latest.autoReviewProvider] : undefined,
-      getCatalogRevision(),
-    ]);
-  let reviewer = await loadReviewer(settings);
-  let appliedReviewerConfig = reviewerConfig(settings);
+  let titleClerk = await loadTitleClerk(settings);
+  let appliedTitleConfig = titleConfig(settings);
   let workspaceRoot = canonicalWorkspaceRoot(options.workspaceRoot ?? process.cwd());
   const { ToolRegistry } = await import('./tools/registry.js');
   let memoryIndex = new MemoryIndex(workspaceRoot);
@@ -289,13 +324,12 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       const nextCatalog = findReasoningCatalogMatch(nextProviderId, nextModelId, next.resolved);
       const nextBudget = resolveContextBudget(nextProvider.modelSpecs?.[nextModelId], nextCatalog.model?.limit);
       const nextContextWindowTokens = requireModelContextWindow(nextBudget.window, nextProviderId, nextModelId);
-      const nextCatalogVariants = listReasoningVariants(next.resolved, nextCatalog.model);
-      const nextVariants = [
-        ...nextCatalogVariants,
-        ...settingsEffortVariants(next.resolved, nextProvider.modelSpecs?.[nextModelId]?.reasoning?.efforts ?? []).filter(
-          (variant) => !nextCatalogVariants.some((existing) => existing.id === variant.id),
-        ),
-      ];
+      const nextVariants = modelReasoningVariants(
+        nextProviderId,
+        nextModelId,
+        next.resolved,
+        nextProvider.modelSpecs?.[nextModelId]?.reasoning?.efforts ?? [],
+      );
       const nextInputModalities = modelInputModalities(nextProviderId, nextModelId, next.resolved);
       const nextRegistry = createRegistry(nextInputModalities);
 
@@ -324,6 +358,8 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
     const runtime: AgentEnvironment = {
       model: resolved.model,
       ...(reviewer.model ? { reviewModel: reviewer.model } : {}),
+      ...(titleClerk.model ? { titleModel: titleClerk.model } : {}),
+      getTitleProviderOptions: () => titleClerk.providerOptions ?? {},
       get workspaceRoot() {
         return workspaceRoot;
       },
@@ -465,6 +501,13 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
           appliedReviewerConfig = nextReviewerConfig;
           if (reviewer.model) runtime.reviewModel = reviewer.model;
           else delete runtime.reviewModel;
+          const nextTitleConfig = titleConfig(latest);
+          if (nextTitleConfig !== appliedTitleConfig) {
+            titleClerk = await loadTitleClerk(latest);
+            appliedTitleConfig = nextTitleConfig;
+            if (titleClerk.model) runtime.titleModel = titleClerk.model;
+            else delete runtime.titleModel;
+          }
           runtime.reasoningDefault = resolveReasoningVariant(activeVariants, latest.reasoning ?? 'default').id;
           runtime.showReasoningDefault = latest.showReasoning !== false;
           runtime.approvalMode = latest.approvalMode;

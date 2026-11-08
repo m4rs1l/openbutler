@@ -162,6 +162,14 @@ export interface SettingsStore {
   autoReviewProvider?: string;
   autoReviewModel?: string;
   /**
+   * Role-bound provider/model pairs; the canonical place every kind of run picks
+   * its model (agent, custodian, worker, background, title, review). A role left
+   * out falls back to the default chain - explicit default, then most-used.
+   * Both fields of an entry must be set together, like autoReview: validation
+   * happens at parse, so the rest of the system reads only whole pairs.
+   */
+  roles?: Record<string, { provider: string; model: string }>;
+  /**
    * How long a manual approval prompt waits for a human decision before it
    * expires and the action is reported back to the model as unanswered. The
    * run keeps going: an expired approval is a timeout, never an approval.
@@ -242,6 +250,7 @@ const KNOWN_KEYS = new Set([
   'autoReviewTimeoutSeconds',
   'autoReviewProvider',
   'autoReviewModel',
+  'roles',
   'approvalTimeoutSeconds',
   'commandShell',
   'schedules',
@@ -570,6 +579,13 @@ export function removeProvider(settings: SettingsStore, id: string): boolean {
     settings.defaultProvider = '';
     settings.defaultModel = '';
   }
+  // A role bound to the removed provider cannot resolve to anything meaningful,
+  // so it goes the way of the default: cleared rather than left dangling.
+  if (settings.roles) {
+    const kept = Object.fromEntries(Object.entries(settings.roles).filter(([, entry]) => entry.provider !== id));
+    if (Object.keys(kept).length > 0) settings.roles = kept;
+    else delete settings.roles;
+  }
   return true;
 }
 
@@ -691,6 +707,27 @@ function loadSettingsUnlocked(): SettingsStore {
       settings.autoReviewModel = model.trim();
     }
   }
+  if (parsed.roles !== undefined) {
+    if (parsed.roles === null) {
+      delete settings.roles;
+    } else if (!isRecord(parsed.roles)) {
+      throw new Error('roles must be a mapping of role name to a { provider, model } pair.');
+    } else {
+      const roles: Record<string, { provider: string; model: string }> = {};
+      for (const [role, raw] of Object.entries(parsed.roles)) {
+        if (raw === null || raw === undefined) continue;
+        if (!isRecord(raw)) throw new Error(`roles.${role} must be a { provider, model } pair.`);
+        const { provider, model } = raw;
+        if ((provider === null || provider === undefined) && (model === null || model === undefined)) continue;
+        if (typeof provider !== 'string' || typeof model !== 'string' || !provider.trim() || !model.trim()) {
+          throw new Error(`roles.${role}.provider and roles.${role}.model must both be non-empty strings, or the role must be omitted.`);
+        }
+        roles[role] = { provider: provider.trim(), model: model.trim() };
+      }
+      if (Object.keys(roles).length > 0) settings.roles = roles;
+      else delete settings.roles;
+    }
+  }
   if (parsed.approvalTimeoutSeconds !== undefined) {
     if (
       typeof parsed.approvalTimeoutSeconds !== 'number' ||
@@ -723,6 +760,16 @@ function loadSettingsUnlocked(): SettingsStore {
   if (parsed.telegram !== undefined) settings.telegram = parseTelegramSettings(parsed.telegram);
   if (parsed.team !== undefined) settings.team = parseTeamSettings(parsed.team);
   if (parsed.custodian !== undefined) settings.custodian = parseCustodianSettings(parsed.custodian);
+  // Ingest the single-purpose fields written before roles existed: a reviewer
+  // or custodian pair read the old way becomes a role entry right here, so from
+  // parse on there is one place every reader consults. The legacy fields stay
+  // in the document for compatibility; nothing clears them.
+  if (!settings.roles?.review && settings.autoReviewProvider && settings.autoReviewModel) {
+    settings.roles = { ...settings.roles, review: { provider: settings.autoReviewProvider, model: settings.autoReviewModel } };
+  }
+  if (!settings.roles?.custodian && settings.custodian?.provider && settings.custodian?.model) {
+    settings.roles = { ...settings.roles, custodian: { provider: settings.custodian.provider, model: settings.custodian.model } };
+  }
   mergeSecrets(settings, loadSecrets());
   return settings;
 }
@@ -995,6 +1042,7 @@ function saveSettingsUnlocked(settings: SettingsStore): void {
     ...(settings.autoReviewTimeoutSeconds === undefined ? {} : { autoReviewTimeoutSeconds: settings.autoReviewTimeoutSeconds }),
     ...(settings.autoReviewProvider === undefined ? {} : { autoReviewProvider: settings.autoReviewProvider }),
     ...(settings.autoReviewModel === undefined ? {} : { autoReviewModel: settings.autoReviewModel }),
+    ...(settings.roles === undefined ? {} : { roles: settings.roles }),
     ...(settings.approvalTimeoutSeconds === undefined ? {} : { approvalTimeoutSeconds: settings.approvalTimeoutSeconds }),
     ...(settings.commandShell === undefined ? {} : { commandShell: settings.commandShell }),
     schedules: settings.schedules,

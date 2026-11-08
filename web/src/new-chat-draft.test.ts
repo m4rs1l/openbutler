@@ -14,7 +14,7 @@ function snapshot(id: string): SessionPayload {
     queuedMessageCount: 0,
     pendingApproval: null,
     pendingQuestion: null,
-    runtime: { providerId: 'vercel', modelId: 'default', workspaceRoot: 'C:/project' },
+    runtime: { providerId: 'fixture', modelId: 'default', workspaceRoot: 'C:/project' },
     session: { id, title: 'Chat', hasUserMessage: false },
   };
 }

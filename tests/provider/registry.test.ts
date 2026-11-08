@@ -24,6 +24,21 @@ const CATALOG = {
       env: ['CLOUD_ACCOUNT_PROJECT', 'CLOUD_APPLICATION_CREDENTIALS'],
       models: { 'big-model': { tool_call: true } },
     },
+    upstream: {
+      id: 'upstream',
+      name: 'Upstream Mirror',
+      npm: '@ai-sdk/openai-compatible',
+      api: 'https://mirror.example/v1',
+      env: ['UPSTREAM_API_KEY'],
+      models: {
+        'claude-sonnet-5': {
+          tool_call: true,
+          reasoning: true,
+          reasoning_options: [{ type: 'effort', values: ['low', 'medium', 'high'] }],
+          limit: { context: 1000000, output: 128000 },
+        },
+      },
+    },
     solocal: {
       id: 'solocal',
       name: 'So Local',
@@ -274,5 +289,25 @@ describe('on-demand provider packages', () => {
     /* Nothing is installed in the fresh data directory, so the entry is null
        rather than an error — the caller decides to install. */
     expect(install.installedEntry('@ai-sdk/definitely-not-installed')).toBeNull();
+  });
+});
+
+describe('catalog matching for a gateway-style model id', () => {
+  it('matches by model name when the provider id itself is not cataloged', async () => {
+    const { registry } = await load();
+    const resolved = registry.resolveProvider('custom-gateway', {
+      npm: '@ai-sdk/openai-compatible',
+      keys: ['k'],
+      url: 'https://gateway.example/v1',
+    });
+    if (!resolved.ok) throw new Error(resolved.error.reason);
+    const match = registry.findReasoningCatalogMatch('custom-gateway', 'anthropic/claude-sonnet-5@default', resolved.provider);
+    /* The gateway id is the user's own; the catalog entry is found under the
+       upstream model name, and matched metadata is reported as inferred so
+       callers know it came from a mirror rather than the configured provider. */
+    expect(match.inferred).toBe(true);
+    expect(match.sourceProviderId).toBe('upstream');
+    expect(match.model?.limit?.context).toBe(1000000);
+    expect(match.model?.reasoning).toBe(true);
   });
 });

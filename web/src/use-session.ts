@@ -11,16 +11,18 @@ function readCachedSessions(): SessionInfo[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(SESSIONS_CACHE_KEY) ?? '[]');
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (item): item is SessionInfo =>
-          item !== null &&
-          typeof item === 'object' &&
-          typeof (item as SessionInfo).id === 'string' &&
-          typeof (item as SessionInfo).title === 'string',
-      )
-      // A run that ended while the page was closed must not read as running.
-      .map((session) => ({ ...session, running: undefined }));
+    return (
+      parsed
+        .filter(
+          (item): item is SessionInfo =>
+            item !== null &&
+            typeof item === 'object' &&
+            typeof (item as SessionInfo).id === 'string' &&
+            typeof (item as SessionInfo).title === 'string',
+        )
+        // A run that ended while the page was closed must not read as running.
+        .map((session) => ({ ...session, running: undefined }))
+    );
   } catch {
     return [];
   }
@@ -272,19 +274,82 @@ export function useSession() {
       }
     }
   };
+  const deferredPick = useRef<{ sessionId: string; model: ModelChoice } | null>(null);
+  /**
+   * Publish the effort levels of a model whose switch is waiting for the run to
+   * end, keeping the identity untouched. The picker names the pending model at
+   * once, so until its own levels arrive the running model's list reads as the
+   * new model's choices - which is how a fresh pick showed the old effort.
+   */
+  const applyPendingEffort = (target: string, model: ModelChoice) => {
+    deferredPick.current = { sessionId: target, model };
+    void (async () => {
+      try {
+        const described = await api.fetchModelReasoning(model.providerId, model.modelId);
+        const held = deferredPick.current;
+        if (held?.sessionId !== target || held.model !== model) return;
+        const payload = state.payload;
+        const runtime = payload?.runtime;
+        // A switch that already landed has the server's own answer; do not overwrite it.
+        if (!payload || !runtime || sessionId !== target) return;
+        if (runtime.providerId === model.providerId && runtime.modelId === model.modelId) return;
+        const current = runtime.reasoningDefault;
+        const kept = current != null && described.reasoningVariants.some((level) => level.id === current);
+        const chosen = kept && current != null ? current : described.reasoningDefault;
+        dispatch({
+          type: 'payload',
+          payload: {
+            ...payload,
+            runtime: { ...runtime, reasoningVariants: described.reasoningVariants, reasoningDefault: chosen },
+          },
+          receivedAt: performance.now(),
+        });
+      } catch (error) {
+        report(error);
+      }
+    })();
+  };
   const selectModel = async (model: ModelChoice) => {
     if (operation.current || !sessionId || status !== 'open') return false;
-    if (draftChat.current && sessionId === PENDING_CHAT_ID && state.payload) {
-      draftChat.current.model = model;
-      dispatch({
-        type: 'payload',
-        payload: {
-          ...state.payload,
-          runtime: { ...state.payload.runtime, providerId: model.providerId, modelId: model.modelId, modelName: model.name },
-        },
-        receivedAt: performance.now(),
-      });
-      return true;
+    const draft = draftChat.current;
+    if (draft && sessionId === PENDING_CHAT_ID && state.payload) {
+      draft.model = model;
+      const shown = state.payload;
+      const identity = { providerId: model.providerId, modelId: model.modelId, modelName: model.name };
+      // A draft has no server runtime yet, so the origin chat's effort list would
+      // otherwise survive the switch until the first message materializes it.
+      try {
+        const described = await api.fetchModelReasoning(model.providerId, model.modelId);
+        if (draftChat.current !== draft || draft.model !== model) return true;
+        const kept = draft.reasoningVariantId != null && described.reasoningVariants.some((level) => level.id === draft.reasoningVariantId);
+        const chosen = kept && draft.reasoningVariantId != null ? draft.reasoningVariantId : described.reasoningDefault;
+        draft.reasoningVariantId = chosen;
+        dispatch({
+          type: 'payload',
+          payload: {
+            ...shown,
+            runtime: {
+              ...shown.runtime,
+              ...identity,
+              reasoningVariants: described.reasoningVariants,
+              reasoningDefault: chosen,
+            },
+          },
+          receivedAt: performance.now(),
+        });
+        return true;
+      } catch (error) {
+        // Losing the lookup must not lose the model the user just picked, but the
+        // stale list must not masquerade as the new model's either.
+        if (draftChat.current !== draft || draft.model !== model) return true;
+        dispatch({
+          type: 'payload',
+          payload: { ...shown, runtime: { ...shown.runtime, ...identity } },
+          receivedAt: performance.now(),
+        });
+        report(error);
+        return true;
+      }
     }
     if (model.providerId === state.payload?.runtime?.providerId && model.modelId === state.payload?.runtime?.modelId) {
       setDeferredModel(null);
@@ -292,14 +357,18 @@ export function useSession() {
     }
     if (busy || (state.payload?.queuedMessageCount ?? 0) > 0) {
       setDeferredModel({ sessionId, model });
+      applyPendingEffort(sessionId, model);
       return true;
     }
-    setDeferredModel(null);
     operation.current = true;
     setChanging(true);
     setNotice(null);
     try {
       applyNow(await api.changeModel(model, sessionId));
+      // Only a server-accepted switch ends the deferral. Clearing it before the
+      // call snapped the picker back to the old model whenever the call lost.
+      setDeferredModel(null);
+      deferredPick.current = null;
       return true;
     } catch (error) {
       report(error);
@@ -414,8 +483,18 @@ export function useSession() {
         target = snapshot.session.id;
         if (draft.model && (draft.model.providerId !== snapshot.runtime?.providerId || draft.model.modelId !== snapshot.runtime?.modelId))
           snapshot = await api.changeModel(draft.model, target);
-        if (draft.reasoningVariantId && draft.reasoningVariantId !== snapshot.runtime?.reasoningDefault)
-          snapshot = await api.changeReasoning(draft.reasoningVariantId, target);
+        // Validate against the list the model actually offers: a refused effort must
+        // never abort the send after the model already switched.
+        const effort = draft.reasoningVariantId;
+        const variants = snapshot.runtime?.reasoningVariants;
+        const offered = effort != null && (variants?.some((level) => level.id === effort) ?? false);
+        if (offered && effort != null && effort !== snapshot.runtime?.reasoningDefault) {
+          try {
+            snapshot = await api.changeReasoning(effort, target);
+          } catch (error) {
+            report(error);
+          }
+        }
         if (draft.approvalMode && draft.approvalMode !== snapshot.runtime?.approvalMode)
           snapshot = await api.changeApprovalMode(draft.approvalMode, target);
         bind(target);

@@ -245,9 +245,9 @@ describe('approval timeout setting', () => {
 
 describe('auto-review model override', () => {
   it('round-trips a configured provider and model', async () => {
-    writeSettings(['autoReviewProvider: vercel', 'autoReviewModel: alibaba/qwen3.8-omni-flash', ''].join('\n'));
+    writeSettings(['autoReviewProvider: fixture', 'autoReviewModel: alibaba/qwen3.8-omni-flash', ''].join('\n'));
     const settings = await loadSettingsModule();
-    expect(settings.loadSettings().autoReviewProvider).toBe('vercel');
+    expect(settings.loadSettings().autoReviewProvider).toBe('fixture');
     expect(settings.loadSettings().autoReviewModel).toBe('alibaba/qwen3.8-omni-flash');
     settings.saveSettings(settings.loadSettings());
     expect(settings.loadSettings().autoReviewModel).toBe('alibaba/qwen3.8-omni-flash');
@@ -260,7 +260,7 @@ describe('auto-review model override', () => {
   });
 
   it('rejects a lone provider without a model', async () => {
-    writeSettings(['autoReviewProvider: vercel', ''].join('\n'));
+    writeSettings(['autoReviewProvider: fixture', ''].join('\n'));
     const settings = await loadSettingsModule();
     expect(() => settings.loadSettings()).toThrow(/autoReviewProvider and autoReviewModel must both be/);
   });
@@ -415,20 +415,20 @@ describe('writing settings', () => {
     const settings = await loadSettingsModule();
     const { upsertProvider, writeSettings } = await loadConfigEdit();
     const store = settings.defaultSettings();
-    store.providers.vercel = {
+    store.providers.fixture = {
       enabled: true,
       keys: ['key'],
       models: ['deepseek/deepseek-v4.1-flash-1017'],
       routing: { order: ['deepinfra'], only: ['deepinfra'] },
     };
-    store.providerOrder = ['vercel'];
+    store.providerOrder = ['fixture'];
 
-    upsertProvider(store, 'vercel', { enabled: true, keys: ['new-key', 'key'] });
+    upsertProvider(store, 'fixture', { enabled: true, keys: ['new-key', 'key'] });
     writeSettings(store);
 
     const saved = settings.loadSettings();
-    expect(saved.providers.vercel?.routing).toEqual({ order: ['deepinfra'], only: ['deepinfra'] });
-    expect(saved.providers.vercel?.models).toEqual(['deepseek/deepseek-v4.1-flash-1017']);
+    expect(saved.providers.fixture?.routing).toEqual({ order: ['deepinfra'], only: ['deepinfra'] });
+    expect(saved.providers.fixture?.models).toEqual(['deepseek/deepseek-v4.1-flash-1017']);
   });
 
   it('keeps the default provider and model as one pair', async () => {
@@ -656,5 +656,75 @@ describe('custodian settings', () => {
     vi.resetModules();
     const unset = await import('../src/host/worker-service.js');
     expect(unset.configuredWorkerCaps()).toEqual({ perSession: 8, perWorkerParent: 2, perMachine: 10, depth: 2 });
+  });
+});
+
+describe('role assignments', () => {
+  it('reads a roles map with both fields of every pair', async () => {
+    writeSettings(
+      [
+        'roles:',
+        '  worker:',
+        '    provider: vendor-a',
+        '    model: acme/model-a@default',
+        '  title:',
+        '    provider: vendor-b',
+        '    model: model-b',
+        '',
+      ].join('\n'),
+    );
+    const settings = await loadSettingsModule();
+    const loaded = settings.loadSettings();
+    expect(loaded.roles).toEqual({
+      worker: { provider: 'vendor-a', model: 'acme/model-a@default' },
+      title: { provider: 'vendor-b', model: 'model-b' },
+    });
+  });
+
+  it('refuses a half pair and a roles value that is not a mapping', async () => {
+    writeSettings('roles:\n  worker:\n    provider: vendor-a\n    model: ""\n');
+    let settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/roles\.worker\.provider and roles\.worker\.model must both be non-empty strings/);
+    writeSettings('roles: just-a-string');
+    settings = await loadSettingsModule();
+    expect(() => settings.loadSettings()).toThrow(/roles must be a mapping/);
+  });
+
+  it('ingests the legacy reviewer pair into the review role on read', async () => {
+    writeSettings('autoReviewProvider: vendor-b\nautoReviewModel: model-b\n');
+    const settings = await loadSettingsModule();
+    const loaded = settings.loadSettings();
+    expect(loaded.roles).toEqual({ review: { provider: 'vendor-b', model: 'model-b' } });
+    // The legacy fields survive the read; only writers maintain the pair now.
+    expect(loaded.autoReviewProvider).toBe('vendor-b');
+    expect(loaded.autoReviewModel).toBe('model-b');
+  });
+
+  it('ingests the legacy custodian pair into the custodian role on read', async () => {
+    writeSettings('custodian:\n  provider: vendor-b\n  model: model-b\n');
+    const settings = await loadSettingsModule();
+    expect(settings.loadSettings().roles).toEqual({ custodian: { provider: 'vendor-b', model: 'model-b' } });
+  });
+
+  it('round-trips roles through a save and drops entries when their provider is removed', async () => {
+    writeSettings('');
+    let settings = await loadSettingsModule();
+    const store = settings.loadSettings();
+    store.roles = { worker: { provider: 'vendor-a', model: 'model-a' }, title: { provider: 'vendor-b', model: 'model-b' } };
+    settings.saveSettings(store);
+    expect(readSettingsFile()).toContain('roles:');
+    settings = await loadSettingsModule();
+    expect(settings.loadSettings().roles).toEqual({
+      worker: { provider: 'vendor-a', model: 'model-a' },
+      title: { provider: 'vendor-b', model: 'model-b' },
+    });
+    // A removed provider takes its role entries with it, the way it takes the default.
+    const after = settings.loadSettings();
+    after.providers['vendor-a'] = { enabled: false, keys: [] };
+    after.providers['vendor-b'] = { enabled: false, keys: [] };
+    settings.removeProvider(after, 'vendor-a');
+    expect(after.roles).toEqual({ title: { provider: 'vendor-b', model: 'model-b' } });
+    settings.removeProvider(after, 'vendor-b');
+    expect(after.roles).toBeUndefined();
   });
 });

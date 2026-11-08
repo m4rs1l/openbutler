@@ -14,7 +14,7 @@ const USAGE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 export interface DefaultModelChoice {
   providerId: string;
   modelId: string;
-  source: 'settings' | 'usage';
+  source: 'settings' | 'usage' | 'role';
   /** Requests behind an automatic choice; absent for an explicit default. */
   requests?: number;
 }

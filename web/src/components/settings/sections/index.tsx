@@ -1,5 +1,6 @@
 import type { SettingsSectionDef } from '../settings-page.js';
 import { ModelsSettings } from './models.js';
+import { ModelRolesSettings } from './model-roles.js';
 import { ProvidersSettings } from './providers.js';
 import { ModalSettings } from './modal.js';
 import { UsageSettings } from './usage.js';
@@ -35,6 +36,14 @@ export const SETTINGS_SECTIONS: SettingsSectionDef[] = [
     group: 'Intelligence',
     description: 'Available models and composer access',
     render: () => <ModelsSettings />,
+  },
+  {
+    id: 'model-roles',
+    label: 'Model roles',
+    icon: 'cpu',
+    group: 'Intelligence',
+    description: 'Default model and per-role assignments',
+    render: () => <ModelRolesSettings />,
   },
   {
     id: 'approvals',

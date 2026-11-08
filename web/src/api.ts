@@ -8,6 +8,7 @@ import type {
   Entry,
   MemoryInfo,
   ModelChoice,
+  ModelRolesInfo,
   ModelCatalogRow,
   ModalInfo,
   ProviderCatalogRow,
@@ -89,6 +90,11 @@ export const fetchWorkspaceFileTree = (sessionId: string) =>
   request<WorkspaceFileTree>(`/api/files/tree?${new URLSearchParams({ sessionId })}`);
 export const fetchModels = () => request<ModelChoice[]>('/api/models');
 export const fetchModelCatalog = () => request<ModelCatalogRow[]>('/api/models/catalog');
+// Effort options for one model, resolved without binding it to the runtime.
+export const fetchModelReasoning = (providerId: string, modelId: string) =>
+  request<{ reasoningVariants: Array<{ id: string; label: string }>; reasoningDefault: string }>(
+    `/api/models/reasoning?${new URLSearchParams({ providerId, modelId })}`,
+  );
 export const setModelActive = (providerId: string, modelId: string, active: boolean) =>
   request<ModelCatalogRow[]>('/api/models/active', { providerId, modelId, active });
 export const fetchProviderCatalog = () => request<ProviderCatalogRow[]>('/api/providers');
@@ -226,6 +232,12 @@ export const fetchTelegram = () => request<TelegramInfo>('/api/telegram');
 export const fetchApprovals = () => request<ApprovalsInfo>('/api/approvals');
 export const setAutoReview = (value: { providerId: string | null; modelId: string | null; timeoutSeconds?: number | null }) =>
   request<{ ok: true }>('/api/approvals/auto-review', value);
+/** The default model and every role assignment. */
+export const fetchModelRoles = () => request<ModelRolesInfo>('/api/model-roles');
+export const setModelRole = (value: { role: string; providerId: string | null; modelId: string | null }) =>
+  request<{ ok: true }>('/api/model-roles', value);
+export const setDefaultModelPair = (value: { providerId: string | null; modelId: string | null }) =>
+  request<{ ok: true }>('/api/default-model', value);
 export const forgetPermission = (id: string) => request<{ removed: boolean }>('/api/approvals/forget', { id });
 /** Which shell the execute-command tool uses, and the runnable preset list for this platform. */
 export const fetchCommandShell = () => request<CommandShellInfo>('/api/command-shell');

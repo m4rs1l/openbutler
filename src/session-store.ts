@@ -140,6 +140,13 @@ export interface SavedSession {
   reasoning?: string;
   /** This session's reasoning-visibility toggle; absent means the machine default. */
   showReasoning?: boolean;
+  /**
+   * The effort levels this session's own model offers, written with the model
+   * switch. A workspace runtime is shared, so it may already be bound to another
+   * session's model; this keeps the chat's own picker honest about what the model
+   * it reports can actually take.
+   */
+  reasoningVariants?: Array<{ id: string; label: string }>;
   /** Canonical workspace that supplied this session's tool and memory scope. */
   workspaceRoot?: string;
   contextTokens?: number;
@@ -569,6 +576,7 @@ export function saveSession(session: SavedSession, options: { allowEmpty?: boole
     modelId: session.modelId,
     ...(session.reasoning === undefined ? {} : { reasoning: session.reasoning }),
     ...(session.showReasoning === undefined ? {} : { showReasoning: session.showReasoning }),
+    ...(session.reasoningVariants === undefined ? {} : { reasoningVariants: session.reasoningVariants }),
     ...(session.workspaceRoot === undefined ? {} : { workspaceRoot: session.workspaceRoot }),
     ...(session.project === undefined ? {} : { project: session.project }),
     ...(session.contextTokens === undefined ? {} : { contextTokens: session.contextTokens }),
@@ -638,6 +646,11 @@ function isSavedSession(value: unknown): value is SavedSession {
     typeof value.modelId === 'string' &&
     (value.reasoning === undefined || (typeof value.reasoning === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(value.reasoning))) &&
     (value.showReasoning === undefined || typeof value.showReasoning === 'boolean') &&
+    (value.reasoningVariants === undefined ||
+      (Array.isArray(value.reasoningVariants) &&
+        value.reasoningVariants.every(
+          (variant) => isRecord(variant) && typeof variant.id === 'string' && typeof variant.label === 'string',
+        ))) &&
     (value.keyPositions === undefined ||
       (isRecord(value.keyPositions) &&
         Object.entries(value.keyPositions).every(

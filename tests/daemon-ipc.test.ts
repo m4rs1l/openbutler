@@ -2773,6 +2773,54 @@ describe('shared host and session IPC', () => {
     ).toBe(true);
   }, 20_000);
 
+  it('opens a settled worker read-only from the saved transcript after a host restart', async () => {
+    const viewer = await newChat();
+    let parentStep = 0;
+    model.doStream = vi.fn(async (options: { prompt?: unknown }) => {
+      const serialized = JSON.stringify(options.prompt ?? []);
+      if (serialized.includes('You are a worker:')) return textStream('WORKER-REPORT: restart view test done.');
+      parentStep += 1;
+      if (parentStep === 1)
+        return stream(
+          [
+            {
+              type: 'tool-call',
+              toolCallId: 'subagent-restart',
+              toolName: 'subagent',
+              input: JSON.stringify({ task: 'RESTART-TASK: settle quickly', mode: 'explorer', background: false }),
+            },
+          ],
+          'tool-calls',
+        );
+      return textStream('PARENT-AFTER-RESTART-CHECK');
+    });
+
+    await viewer.sendMessage({ text: 'Delegate the restart view test.', images: [] }, preferences);
+    await vi.waitFor(() =>
+      expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'))).toBe(
+        true,
+      ),
+    );
+    const toolEntry = viewer.getSnapshot().session.entries.find((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'));
+    const workerId = toolEntry?.kind === 'tool' ? toolEntry.session : undefined;
+    expect(workerId).toMatch(/^[0-9a-f-]{36}$/);
+
+    // The restarted host holds no live worker sessions: only the saved record and the ledger remain.
+    await replaceFixtureHost();
+
+    const view = await client({ workerSessionId: workerId! });
+    expect(view.getSnapshot().session.id).toBe(workerId);
+    expect(view.getSnapshot().busy).toBe(false);
+    expect(view.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('WORKER-REPORT'))).toBe(
+      true,
+    );
+    await view.sendMessage({ text: 'Are you done?', images: [] }, preferences);
+    expect(view.getSnapshot().session.entries.some((entry) => entry.kind === 'notice' && entry.text.includes('view-only'))).toBe(true);
+
+    // An id with no producer on this machine still refuses instead of opening a chat-shaped view.
+    await expect(client({ workerSessionId: '00000000-0000-4000-8000-000000000000' })).rejects.toThrow('not a subagent worker');
+  }, 20_000);
+
   it('runs a background subagent and automatically wakes its idle parent for the final report', async () => {
     registerFakeTool('file_read');
     registerFakeTool('file_write');

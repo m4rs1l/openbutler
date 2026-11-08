@@ -66,6 +66,7 @@ import {
 } from './telegram-setup.js';
 import type { ScheduleState, McpServerState } from './settings.js';
 import { defaultModelIsUsable, readiness, summarizeProviders } from './cli/config-edit.js';
+import { assignRoleModel } from './model-roles.js';
 import { resolveDefaultModel } from './usage/default-model.js';
 import { runUninstall } from './uninstall.js';
 import * as ui from './cli/ui.js';
@@ -246,13 +247,8 @@ async function runPermissions(parsed: Parsed): Promise<void> {
     saveSettings(settings);
   }
   if (reviewModelOverride !== undefined) {
-    if (reviewModelOverride === null) {
-      delete settings.autoReviewProvider;
-      delete settings.autoReviewModel;
-    } else {
-      settings.autoReviewProvider = reviewModelOverride.providerId;
-      settings.autoReviewModel = reviewModelOverride.modelId;
-    }
+    // The review role owns the pair; legacy autoReview fields mirror with it.
+    assignRoleModel(settings, 'review', reviewModelOverride);
     saveSettings(settings);
   }
   if (requestedMode) {

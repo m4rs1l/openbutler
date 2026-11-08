@@ -102,6 +102,10 @@ export interface AgentEnvironment extends AgentSessionRuntimeView {
   model: LanguageModel;
   /** Model the permission reviewer runs on; unset means the main model. */
   reviewModel?: LanguageModel;
+  /** Model chat titles are generated on; unset means the main model. */
+  titleModel?: LanguageModel;
+  /** Cheapest expressible reasoning options for title generation; absent with no title model. */
+  getTitleProviderOptions?: () => ReasoningVariant['providerOptions'];
   outputLimitTokens: number | null;
   supportsImageToolResult: boolean;
   disableImageInput?: () => void;
@@ -337,6 +341,8 @@ export class AgentSessionController implements AgentSessionClient {
   private sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
   /** Persistable content of the last successful save or open; a navigation that matches it writes nothing. */
   private lastPersistedContent: string | null = null;
+  /** The model/effort choice on record, so a choice made before any message still counts as a change. */
+  private lastPersistedChoice: string | null = null;
   private sessionSaveError: string | null = null;
   private streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private streamedAssistantEntry: SessionEntry | null = null;
@@ -404,6 +410,7 @@ export class AgentSessionController implements AgentSessionClient {
     );
     this.lastContextUsage = this.session.contextTokens;
     this.lastContextEstimate = this.session.contextEstimateTokens;
+    this.lastPersistedChoice = this.persistableChoiceKey(this.session);
     this.snapshot = this.makeSnapshot();
   }
 
@@ -484,7 +491,10 @@ export class AgentSessionController implements AgentSessionClient {
 
   private scheduleSave(): void {
     this.latestSessionSnapshot = this.persistableSession();
-    if (!this.session.entries.some((entry) => entry.kind === 'user') || this.sessionSaveTimer !== null) return;
+    if (this.sessionSaveTimer !== null) return;
+    // A model/effort choice is worth keeping on its own: a chat configured before its
+    // first message must not reopen on some older model.
+    if (!this.session.entries.some((entry) => entry.kind === 'user') && !this.choiceChanged(this.latestSessionSnapshot)) return;
     this.sessionSaveTimer = setTimeout(
       () => {
         this.sessionSaveTimer = null;
@@ -513,6 +523,15 @@ export class AgentSessionController implements AgentSessionClient {
     return JSON.stringify({ ...this.persistableSession(), updatedAt: '' });
   }
 
+  /** The model/effort choice alone: a chat can be configured before it has a single message. */
+  private persistableChoiceKey(session: SavedSession): string {
+    return JSON.stringify([session.providerId, session.modelId, session.reasoning ?? null, session.reasoningVariants ?? null]);
+  }
+
+  private choiceChanged(session: SavedSession): boolean {
+    return this.lastPersistedChoice !== null && this.persistableChoiceKey(session) !== this.lastPersistedChoice;
+  }
+
   /**
    * Conversation content changed - a message landed or a turn finished. The
    * recent lists order by this stamp, so navigation must never touch it.
@@ -523,14 +542,20 @@ export class AgentSessionController implements AgentSessionClient {
 
   private persistLatest(allowEmpty = false): void {
     const latest = this.latestSessionSnapshot;
-    if (!latest || (!allowEmpty && !latest.entries.some((entry) => entry.kind === 'user'))) return;
+    if (!latest) return;
+    const hasUserMessage = latest.entries.some((entry) => entry.kind === 'user');
+    const choiceMoved = this.choiceChanged(latest);
+    if (!allowEmpty && !hasUserMessage && !choiceMoved) return;
     // Opening or switching conversations carries no content change; rewriting
     // the file there would move the chat in every recent list without a reason.
     const key = JSON.stringify({ ...latest, updatedAt: '' });
     if (key === this.lastPersistedContent) return;
     try {
-      this.session = saveSession(latest, { allowEmpty });
+      // An empty chat is written only because its choice changed; the chat list
+      // already hides records without a user message, so nothing new surfaces.
+      this.session = saveSession(latest, { allowEmpty: allowEmpty || !hasUserMessage });
       this.lastPersistedContent = this.persistableContentKey();
+      this.lastPersistedChoice = this.persistableChoiceKey(latest);
       this.options.onSessionSaved?.(this.session);
       this.sessionSaveError = null;
     } catch (error) {
@@ -616,6 +641,19 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   /**
+   * A model switch reads as a boundary above the first message that runs with
+   * it. The pick alone changes no request, so it must not split the transcript;
+   * and a chat with no message yet names nothing, because there is no earlier
+   * model to say it changed from.
+   */
+  private announceModelChange(): void {
+    const current = this.session.modelId;
+    if (current === this.announcedModel) return;
+    if (this.announcedModel !== null) this.addDivider(`Model changed from "${this.announcedModel}" to "${current}"`);
+    this.announcedModel = current;
+  }
+
+  /**
    * Day boundary above the next message. Only the moment is stored; the shared
    * divider label turns it into Today/Yesterday/weekday at read time, so the
    * same entry reads correctly on later days in every client.
@@ -630,7 +668,10 @@ export class AgentSessionController implements AgentSessionClient {
         break;
       }
     }
-    if (last !== undefined && new Date(last).toDateString() === now.toDateString()) return;
+    // Nothing precedes a first message, so there is no boundary to draw: an empty
+    // transcript opens without a day divider instead of inventing one at now.
+    if (last === undefined) return;
+    if (new Date(last).toDateString() === now.toDateString()) return;
     this.addEntry({ kind: 'divider' });
   }
 
@@ -670,12 +711,14 @@ export class AgentSessionController implements AgentSessionClient {
     this.sessionHasUserMessage = session.entries.some((entry) => entry.kind === 'user');
     // Content is clean on open: a pure navigation must never rewrite the file.
     this.lastPersistedContent = this.persistableContentKey();
+    this.lastPersistedChoice = this.persistableChoiceKey(this.session);
     this.pendingApproval = null;
     this.pendingApprovalId = null;
     this.streamedAssistantEntry = null;
     this.streamedReasoningEntry = null;
-    // Each session announces its own effort from a clean baseline.
+    // Each session announces its own model and effort from a clean baseline.
     this.announcedEffort = null;
+    this.announcedModel = null;
     this.runningToolEntry = null;
     this.currentReviewAuthorization = null;
     this.currentReviewMessages = [];
@@ -723,6 +766,7 @@ export class AgentSessionController implements AgentSessionClient {
     this.lastContextUsage = undefined;
     this.lastContextEstimate = undefined;
     this.sessionHasUserMessage = false;
+    this.lastPersistedChoice = this.persistableChoiceKey(this.session);
     this.pendingApproval = null;
     this.pendingApprovalId = null;
     this.streamedAssistantEntry = null;
@@ -804,17 +848,22 @@ export class AgentSessionController implements AgentSessionClient {
     if (this.runtime.providerId === this.session.providerId && this.runtime.modelId === this.session.modelId) return;
     if (!this.runtime.restoreModel) throw new Error('This runtime cannot restore the saved session model.');
     await this.runtime.restoreModel(this.session.providerId, this.session.modelId);
+    // The runtime now matches this chat again, so its list is this chat's list.
+    if (this.runtime.reasoningVariants.length > 0)
+      this.session = {
+        ...this.session,
+        reasoningVariants: this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label })),
+      };
     this.publish();
   }
 
   async selectModel(providerId: string, modelId: string): Promise<void> {
     if (this.busy) return;
-    const previousModel = this.session.modelId;
     const sameModel = modelId === this.session.modelId;
     await this.runtime.selectModel(providerId, modelId);
-    // The new model is live the moment the runtime accepts it, so that is when
-    // the transcript records the switch.
-    if (!sameModel) this.addDivider(`Model changed from "${previousModel}" to "${modelId}"`);
+    // No divider here on purpose: the switch is a choice, not a message. The
+    // transcript records it above the first message that runs with it, which is
+    // where a reader can tell what the following request was made with.
     // A provider change for the same model must not replace measured usage with a smaller byte estimate.
     if (!sameModel) {
       this.lastContextUsage = undefined;
@@ -824,11 +873,23 @@ export class AgentSessionController implements AgentSessionClient {
       ...this.session,
       providerId,
       modelId,
+      // The runtime is shared, so its list belongs to whichever session last
+      // activated a model. Recording this chat's own list here is what lets the
+      // picker answer for the model this chat reports, even while another chat
+      // has the runtime bound to a different one.
+      ...(this.runtime.reasoningVariants.length > 0
+        ? { reasoningVariants: this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label })) }
+        : {}),
       ...(this.runtime.contextWindowTokens === null ? {} : { contextWindowTokens: this.runtime.contextWindowTokens }),
     };
     if (!sameModel) {
       delete this.session.contextTokens;
       delete this.session.contextEstimateTokens;
+      // An effort the new model cannot take is dropped rather than shown as a
+      // selection the model will not honour; the chat then reports the runtime's
+      // default, which resolveReasoningVariant already proved is in this model's list.
+      if (this.session.reasoning !== undefined && !this.runtime.reasoningVariants.some((variant) => variant.id === this.session.reasoning))
+        delete this.session.reasoning;
     }
     if (this.runtime.contextWindowTokens === null) delete this.session.contextWindowTokens;
     this.publish();
@@ -1102,6 +1163,8 @@ export class AgentSessionController implements AgentSessionClient {
   private reasoningDefaultAtTurnStart = 'default';
   /** Last effort announced in the transcript; null until the first admission pins it. */
   private announcedEffort: string | null = null;
+  /** Last model announced in the transcript; null until the first admission pins it. */
+  private announcedModel: string | null = null;
   private showReasoningAtTurnStart = true;
 
   /**
@@ -1119,8 +1182,6 @@ export class AgentSessionController implements AgentSessionClient {
         showReasoning: this.sessionShowReasoning(),
       };
     const changed = this.sessionReasoning() !== this.reasoningDefaultAtTurnStart;
-    // The first request that actually uses a mid-run change records it once.
-    if (changed) this.announceEffortChange();
     const visibilityChanged = this.sessionShowReasoning() !== this.showReasoningAtTurnStart;
     return {
       reasoningVariantId: changed ? this.sessionReasoning() : turn.reasoningVariantId,
@@ -1612,6 +1673,7 @@ export class AgentSessionController implements AgentSessionClient {
     // message opens and the effort it will actually run with. Both land above
     // the message, while no turn id is assigned yet.
     this.ensureTimeDivider();
+    this.announceModelChange();
     this.announceEffortChange();
     if (!steering || !this.activeTurnId) this.activeTurnId = randomUUID();
     this.addEntry({
@@ -2304,9 +2366,14 @@ export class AgentSessionController implements AgentSessionClient {
     void (async () => {
       try {
         const live = this.liveTurnPreferences();
-        const providerOptions = this.runtime.getReasoningProviderOptions(live.reasoningVariantId, live.showReasoning);
+        // With a title role assigned the clerk runs there - on the cheapest
+        // expressible options - and a session without one stays on its chat model
+        // with the chat's own reasoning settings, as it always did.
+        const providerOptions = this.runtime.titleModel
+          ? (this.runtime.getTitleProviderOptions?.() ?? {})
+          : this.runtime.getReasoningProviderOptions(live.reasoningVariantId, live.showReasoning);
         // Metadata must not rotate the active conversation's keys or report retries into its next turn.
-        const model = bindSessionKeyRotation(this.runtime.model, { ...this.session.keyPositions }, () => {});
+        const model = bindSessionKeyRotation(this.runtime.titleModel ?? this.runtime.model, { ...this.session.keyPositions }, () => {});
         const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
         const title = await generateSessionTitle(model, request.message, signal, providerOptions);
         if (!this.closed && !signal.aborted && this.session.id === request.sessionId && this.session.title === fallback) {

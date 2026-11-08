@@ -5,7 +5,12 @@ import { TurnView } from './turn.js';
 import { buildTurns } from './turns.js';
 import type { Entry } from './types.js';
 
-const user = (text: string, turnOutcome?: Entry['turnOutcome']): Entry => ({ kind: 'user', text, turnId: 't', ...(turnOutcome ? { turnOutcome } : {}) });
+const user = (text: string, turnOutcome?: Entry['turnOutcome']): Entry => ({
+  kind: 'user',
+  text,
+  turnId: 't',
+  ...(turnOutcome ? { turnOutcome } : {}),
+});
 
 const reasoning = (text: string, at: number, durationMs?: number): Entry => ({
   kind: 'reasoning',
@@ -31,10 +36,7 @@ describe('reasoning row mount state', () => {
   });
 
   it('closes every reasoning row in a finished turn, live or not', () => {
-    const [turn] = buildTurns([
-      user('Task', 'completed'),
-      reasoning('done thought', 1_000, 500),
-    ]);
+    const [turn] = buildTurns([user('Task', 'completed'), reasoning('done thought', 1_000, 500)]);
     if (!turn) throw new Error('expected turn');
     const html = renderToStaticMarkup(createElement(TurnView, { turn, live: false, sessionId: 's' }));
     expect(html).toContain('step-collapse" data-state="closed"');

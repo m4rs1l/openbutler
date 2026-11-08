@@ -17,7 +17,7 @@ const row = (atMs: number, overrides: Partial<UsageRow> = {}): UsageRow => ({
   tzOffsetMin: 180,
   sessionId: 'session-a',
   runKind: 'chat',
-  providerId: 'vercel',
+  providerId: 'fixture',
   modelId: 'model-a',
   attempt: 1,
   status: 'ok',

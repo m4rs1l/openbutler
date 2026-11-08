@@ -262,3 +262,68 @@ describe('offline behaviour', () => {
     expect(catalog.catalogSizeOnDisk()).toBeGreaterThan(0);
   });
 });
+
+describe('gateway-style model ids', () => {
+  it('offers a gateway id the literal spelling first, then its scoped variants', async () => {
+    const catalog = await loadWithCatalog();
+    expect(catalog.modelIdCandidates('anthropic/claude-sonnet-5@default')).toEqual([
+      'anthropic/claude-sonnet-5@default',
+      'anthropic/claude-sonnet-5',
+      'claude-sonnet-5@default',
+      'claude-sonnet-5',
+    ]);
+    /* An id without a vendor or a variant stays itself: normalization only
+       drops pieces that were actually there, it never invents spellings. */
+    expect(catalog.modelIdCandidates('gpt-5')).toEqual(['gpt-5']);
+    expect(catalog.modelIdCandidates('claude-sonnet-5')).toEqual(['claude-sonnet-5']);
+    expect(catalog.modelIdCandidates('@default')).toEqual(['@default']);
+    expect(catalog.modelIdCandidates('vendor/')).toEqual(['vendor/']);
+  });
+
+  it('finds a cataloged model by name when the catalog never heard the requesting id', async () => {
+    const catalog = await loadWithCatalog({
+      providers: {
+        upstream: {
+          id: 'upstream',
+          npm: '@ai-sdk/openai-compatible',
+          api: 'https://mirror.example/v1',
+          env: ['UPSTREAM_API_KEY'],
+          models: {
+            'claude-sonnet-5': {
+              id: 'claude-sonnet-5',
+              tool_call: true,
+              reasoning: true,
+              reasoning_options: [{ type: 'effort', values: ['low', 'medium', 'high'] }],
+              limit: { context: 1000000, output: 128000 },
+            },
+          },
+        },
+      },
+    });
+    /* A custom gateway id is not in models.dev, but its model is — under the
+       upstream name the catalog uses. Without name matching the reverse lookup
+       returns nothing and context budgeting has no limit to read. */
+    expect(catalog.getProvider('custom-gateway')).toBeNull();
+    expect(catalog.listProviderIdsForModel('anthropic/claude-sonnet-5@default')).toEqual(['upstream']);
+    const model = catalog.getModel('upstream', 'anthropic/claude-sonnet-5@default');
+    expect(model?.limit?.context).toBe(1000000);
+    expect(model?.reasoning_options).toEqual([{ type: 'effort', values: ['low', 'medium', 'high'] }]);
+  });
+
+  it('keeps an exact catalog key ahead of any normalized alias', async () => {
+    const catalog = await loadWithCatalog({
+      providers: {
+        openai: {
+          id: 'openai',
+          npm: '@ai-sdk/openai',
+          models: {
+            'gpt-5': { id: 'gpt-5', limit: { context: 400000 } },
+            'openai/gpt-5': { id: 'openai/gpt-5', limit: { context: 1000 } },
+          },
+        },
+      },
+    });
+    expect(catalog.getModel('openai', 'openai/gpt-5')?.limit?.context).toBe(1000);
+    expect(catalog.getModel('openai', 'gpt-5')?.limit?.context).toBe(400000);
+  });
+});

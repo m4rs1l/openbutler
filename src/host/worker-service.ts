@@ -1,5 +1,6 @@
 /** Worker/subagent domain, split out of daemon-host.ts (phase 2, slice b). */
 import type { AgentSessionController, AgentSessionOptions } from '../agent-session.js';
+import type { ModelRole } from '../model-roles.js';
 import type { ActivityLedger, ObservedEventRow } from '../activity-ledger.js';
 import { loadSavedSession, type SavedSession, type SessionEntry } from '../session-store.js';
 import type { WorkspaceHost, PrivateSessionHost } from '../daemon-host.js';
@@ -77,8 +78,8 @@ export interface WorkerServiceDeps {
     workspace: WorkspaceHost,
     persistentKey?: string,
     isBackground?: boolean,
-    extra?: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string },
-  ) => PrivateSessionHost;
+    extra?: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string; modelRole?: ModelRole },
+  ) => Promise<PrivateSessionHost>;
   signalStillNeeded: (event: ObservedEventRow) => boolean;
   workspaces: Map<string, WorkspaceHost>;
   isClosing: () => boolean;
@@ -157,9 +158,10 @@ export function createWorkerService(deps: WorkerServiceDeps) {
           return;
         }
         if (lineage?.background && !lineage.result?.error && (lineage.mode === 'explorer' || lineage.mode === 'executor')) {
-          const restored = createPrivateSession(workspace, undefined, false, {
+          const restored = await createPrivateSession(workspace, undefined, false, {
             label: 'Subagent',
             restoreSessionId: parentId,
+            modelRole: 'worker',
             options: workerSessionOptions(
               workspace,
               { mode: lineage.mode, background: true, context: lineage.context ?? { paths: [] } },
@@ -309,8 +311,9 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       return { status: 'error', error: 'The parent session could not be persisted before delegation.' };
     const workspace =
       parent.workspace === custodianWorkspace() ? await getWorkspace(parent.controller.runtime.workspaceRoot) : parent.workspace;
-    const worker = createPrivateSession(workspace, undefined, false, {
+    const worker = await createPrivateSession(workspace, undefined, false, {
       label: 'Subagent',
+      modelRole: 'worker',
       options: workerSessionOptions(workspace, request, depth, caps),
     });
     const workerId = worker.controller.getSnapshot().session.id;
@@ -326,9 +329,11 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     };
     workers.set(workerId, workerRecord);
     writeWorkerRecord(ledger, workerId, { ...workerRecord, finished: false });
+    // Preferences follow the worker's own view: a role-bound worker resolves
+    // its effort against its own model's variants, the shared runtime's otherwise.
     const preferences = {
-      reasoningVariantId: workspace.runtime.reasoningDefault,
-      showReasoning: workspace.runtime.showReasoningDefault,
+      reasoningVariantId: worker.controller.runtime.reasoningDefault,
+      showReasoning: worker.controller.runtime.showReasoningDefault,
     };
     if (request.background) {
       void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }, preferences).catch((error: unknown) => {

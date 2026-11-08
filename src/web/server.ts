@@ -15,10 +15,15 @@ import {
   loadSettings,
   saveModalCredentials,
   saveSettings,
+  type SettingsStore,
 } from '../settings.js';
+import { assignRoleModel, isModelRole, modelRoles, roleModelAssignment } from '../model-roles.js';
+import { resolveDefaultModel } from '../usage/default-model.js';
+import { setDefaultModel } from '../cli/config-edit.js';
 import { verifyModalCredentials } from '../modal.js';
 import { CATALOG_FILENAMES, getProvider, listProviderSummaries } from '../provider/catalog.js';
 import { modelPresentation, resolveModelName, resolveProviderName, type ModelCatalogRow } from '../provider/model-presentation.js';
+import { describeModelReasoning } from '../provider/model-view.js';
 import { watchSettingsFiles } from '../settings-watch.js';
 import { addProviderKeys } from '../provider/keys.js';
 import { verifyAttachmentPath } from '../attachments.js';
@@ -61,6 +66,15 @@ function commandShellState(): { value: string; resolved: string | null; options:
   } catch (error) {
     return { value, resolved: null, options: SHELL_OPTIONS, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Enabled providers' active models, flattened for the reviewer and role pickers. */
+function activeModelChoices(settings: SettingsStore): Array<{ providerId: string; modelId: string; name: string }> {
+  return Object.entries(settings.providers)
+    .filter(([, provider]) => provider.enabled)
+    .flatMap(([providerId, provider]) =>
+      (provider.models ?? []).map((modelId) => ({ providerId, modelId, name: resolveModelName(providerId, modelId, settings) })),
+    );
 }
 
 /** Outside the Windows ephemeral range so the port stays free between runs. */
@@ -657,15 +671,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
           modelId: settings.autoReviewModel ?? null,
           timeoutSeconds: settings.autoReviewTimeoutSeconds ?? null,
         },
-        models: Object.entries(settings.providers)
-          .filter(([, provider]) => provider.enabled)
-          .flatMap(([providerId, provider]) =>
-            (provider.models ?? []).map((modelId) => ({
-              providerId,
-              modelId,
-              name: resolveModelName(providerId, modelId, settings),
-            })),
-          ),
+        models: activeModelChoices(settings),
       });
     }
 
@@ -677,16 +683,15 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       };
       const settings = loadSettings();
       if (body.providerId === null || body.modelId === null) {
-        delete settings.autoReviewProvider;
-        delete settings.autoReviewModel;
+        // The review role is the reviewer; its legacy fields mirror with it.
+        assignRoleModel(settings, 'review', null);
       } else {
         if (typeof body.providerId !== 'string' || typeof body.modelId !== 'string')
           return sendJson(res, 400, { error: 'Choose a reviewer model, or clear it to use the conversation model.' });
         const provider = settings.providers[body.providerId];
         if (!provider?.enabled || !provider.models?.includes(body.modelId))
           return sendJson(res, 400, { error: 'Choose an active model for the reviewer.' });
-        settings.autoReviewProvider = body.providerId;
-        settings.autoReviewModel = body.modelId;
+        assignRoleModel(settings, 'review', { providerId: body.providerId, modelId: body.modelId });
       }
       if (body.timeoutSeconds === null) delete settings.autoReviewTimeoutSeconds;
       else if (body.timeoutSeconds !== undefined) {
@@ -708,6 +713,61 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       if (typeof body.id !== 'string') return sendJson(res, 400, { error: 'Choose a remembered permission.' });
       const removed = forgetRememberedPermission(body.id);
       return sendJson(res, removed ? 200 : 404, { removed });
+    }
+
+    if (url.pathname === '/api/model-roles' && req.method === 'GET') {
+      const settings = loadSettings();
+      const roles: Record<string, { providerId: string; modelId: string } | null> = {};
+      for (const role of modelRoles()) {
+        roles[role] = roleModelAssignment(settings, role);
+      }
+      return sendJson(res, 200, {
+        // The choice a new conversation actually starts on - explicit when set,
+        // the most-used usable model otherwise - so the owner can see it.
+        default: resolveDefaultModel(settings),
+        // Per-role pairs; null means the role follows the default chain.
+        roles,
+        models: activeModelChoices(settings),
+      });
+    }
+
+    if (url.pathname === '/api/model-roles' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}') as { role?: unknown; providerId?: unknown; modelId?: unknown };
+      if (typeof body.role !== 'string' || !isModelRole(body.role))
+        return sendJson(res, 400, { error: `Role must be one of: ${modelRoles().join(', ')}.` });
+      const settings = loadSettings();
+      if (body.providerId === null || body.modelId === null) {
+        assignRoleModel(settings, body.role, null);
+      } else {
+        if (typeof body.providerId !== 'string' || typeof body.modelId !== 'string')
+          return sendJson(res, 400, { error: `Choose a model for the ${body.role} role, or clear it to follow the default.` });
+        const provider = settings.providers[body.providerId];
+        if (!provider?.enabled || !provider.models?.includes(body.modelId))
+          return sendJson(res, 400, { error: 'Choose an active model for the role.' });
+        assignRoleModel(settings, body.role, { providerId: body.providerId, modelId: body.modelId });
+      }
+      saveSettings(settings);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (url.pathname === '/api/default-model' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}') as { providerId?: unknown; modelId?: unknown };
+      const settings = loadSettings();
+      if ((body.providerId === null || body.providerId === undefined) && (body.modelId === null || body.modelId === undefined)) {
+        // Cleared: a new conversation falls back to the most-used model.
+        settings.defaultProvider = '';
+        settings.defaultModel = '';
+      } else {
+        if (typeof body.providerId !== 'string' || typeof body.modelId !== 'string')
+          return sendJson(res, 400, { error: 'Choose a default model, or clear it to follow usage.' });
+        const provider = settings.providers[body.providerId];
+        if (!provider?.enabled || !provider.models?.includes(body.modelId))
+          return sendJson(res, 400, { error: 'Choose an active model as the default.' });
+        if (!setDefaultModel(settings, body.providerId, body.modelId))
+          return sendJson(res, 400, { error: 'That provider is not configured.' });
+      }
+      saveSettings(settings);
+      return sendJson(res, 200, { ok: true });
     }
 
     if (url.pathname === '/api/telegram' && req.method === 'GET') {
@@ -825,6 +885,23 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 
     if (url.pathname === '/api/models/catalog' && req.method === 'GET') {
       return sendJson(res, 200, modelCatalogRows());
+    }
+
+    // Effort options belong to a model, not to the runtime that happens to be bound,
+    // so a draft chat can ask what the model it is switching to actually offers.
+    if (url.pathname === '/api/models/reasoning' && req.method === 'GET') {
+      const providerId = url.searchParams.get('providerId');
+      const modelId = url.searchParams.get('modelId');
+      const settings = loadSettings();
+      const provider = providerId ? settings.providers[providerId] : undefined;
+      if (!providerId || !modelId || !provider?.enabled || !(provider.models ?? []).includes(modelId))
+        return sendJson(res, 400, { error: 'Choose a configured model.' });
+      const described = describeModelReasoning(providerId, modelId, provider, settings.reasoning);
+      if (!described) return sendJson(res, 400, { error: 'That provider is not configured.' });
+      return sendJson(res, 200, {
+        reasoningVariants: described.variants.map(({ id, label }) => ({ id, label })),
+        reasoningDefault: described.defaultVariantId,
+      });
     }
 
     if (url.pathname === '/api/models/active' && req.method === 'POST') {
@@ -1029,10 +1106,14 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     if (url.pathname === '/api/reasoning' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)) || '{}') as { reasoningVariantId?: unknown; sessionId?: unknown };
       if (body.sessionId !== client.getSnapshot().session.id) return sendJson(res, 409, { error: 'The active chat changed. Try again.' });
+      // The picker offers THIS chat's model's levels, which the session records.
+      // The runtime is shared and may still be bound to another chat's model, so
+      // validating against its list would refuse an effort this chat does offer.
+      const offered = client.getSnapshot().session.reasoningVariants ?? client.runtime.reasoningVariants;
       if (
         typeof body.reasoningVariantId !== 'string' ||
         body.reasoningVariantId.length > 256 ||
-        !client.runtime.reasoningVariants.some((variant) => variant.id === body.reasoningVariantId)
+        !offered.some((variant) => variant.id === body.reasoningVariantId)
       )
         return sendJson(res, 400, { error: 'Choose a supported effort level.' });
       client.runtime.saveReasoningPreference(body.reasoningVariantId);
@@ -1193,7 +1274,11 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         await client.selectProject(null, currentSession.id);
       const reasoningVariantId =
         typeof body.reasoningVariantId === 'string' ? body.reasoningVariantId : (client.runtime.reasoningDefault ?? 'default');
-      if (body.reasoningVariantId !== undefined && !client.runtime.reasoningVariants.some((variant) => variant.id === reasoningVariantId))
+      // The picker offered this chat's own levels. The runtime is shared and may
+      // still be bound to another chat's model, so its list must not refuse a
+      // send whose effort this session does offer.
+      const offered = currentSession.reasoningVariants ?? client.runtime.reasoningVariants;
+      if (body.reasoningVariantId !== undefined && !offered.some((variant) => variant.id === reasoningVariantId))
         return sendJson(res, 400, { error: 'Choose a supported reasoning level.' });
       // The run outlives this request. Waiting for it here made a phone browser
       // abandon the request with a network error on any long turn, so the message

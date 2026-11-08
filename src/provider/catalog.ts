@@ -423,7 +423,26 @@ export function listProviderIds(): string[] {
   return Object.keys(currentIndex()?.entries ?? {});
 }
 
-/** Provider ids that expose this exact model id in the cached models.dev catalog. */
+/**
+ * The spellings one gateway-style model id may be cataloged under, in preference
+ * order: the literal id first, then without the trailing `@variant`, then without
+ * a vendor path segment, then both. Exact first, so a real catalog key always
+ * beats a normalized one. A custom provider id never appears in models.dev, but
+ * its model still does — under the vendor name (or bare name) the upstream
+ * catalog uses — and model-identity normalization lives here, once, so every
+ * catalog lookup agrees on what counts as the same model.
+ */
+export function modelIdCandidates(modelId: string): string[] {
+  const at = modelId.lastIndexOf('@');
+  const withoutVariant = at > 0 ? modelId.slice(0, at) : modelId;
+  const stripVendor = (id: string) => {
+    const slash = id.indexOf('/');
+    return slash > 0 && slash < id.length - 1 ? id.slice(slash + 1) : id;
+  };
+  return [...new Set([modelId, withoutVariant, stripVendor(modelId), stripVendor(withoutVariant)])];
+}
+
+/** Provider ids that expose this model id — or a gateway-style alias of it — in the cached model catalog. */
 export function listProviderIdsForModel(modelId: string): string[] {
   const catalog = currentIndex();
   if (!catalog) return [];
@@ -437,7 +456,11 @@ export function listProviderIdsForModel(modelId: string): string[] {
     // This derived reverse map is process-local. Never rewrite a published
     // index from a stale reader and overwrite a newer catalog's pointer.
   }
-  return catalog.modelProviders[modelId] ?? [];
+  const matched = new Set<string>();
+  for (const candidate of modelIdCandidates(modelId)) {
+    for (const sourceProviderId of catalog.modelProviders[candidate] ?? []) matched.add(sourceProviderId);
+  }
+  return [...matched];
 }
 
 /** Per-provider facts held in the index, so listing needs no provider read. */
@@ -447,7 +470,13 @@ export function listProviderSummaries(): Array<{ id: string } & CatalogEntry> {
 }
 
 export function getModel(providerId: string, modelId: string): CatalogModel | null {
-  return getProvider(providerId)?.models?.[modelId] ?? null;
+  const models = getProvider(providerId)?.models;
+  if (!models) return null;
+  for (const candidate of modelIdCandidates(modelId)) {
+    const model = models[candidate];
+    if (model) return model;
+  }
+  return null;
 }
 
 /** Token price for a model, or null when the catalog has no price. */

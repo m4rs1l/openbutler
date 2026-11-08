@@ -4,13 +4,13 @@ import { estimateCost } from '../src/usage/recorder.js';
 
 describe('provider cost', () => {
   it('reads the cost the gateway states in the completion', () => {
-    const resolved = resolveProviderCost({ providerId: 'vercel', usageRaw: { cost: 0.00001064 } });
+    const resolved = resolveProviderCost({ providerId: 'fixture', usageRaw: { cost: 0.00001064 } });
     expect(resolved).toEqual({ costUsd: 0.00001064, source: 'provider-inline' });
   });
 
   it('accepts a cost stated as a decimal string', () => {
     const resolved = resolveProviderCost({
-      providerId: 'vercel',
+      providerId: 'fixture',
       providerMetadata: { gateway: { cost: '0.00001064' } },
     });
     expect(resolved).toEqual({ costUsd: 0.00001064, source: 'provider-inline' });
