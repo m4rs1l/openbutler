@@ -20,6 +20,14 @@ export function createScrollFollower(node: HTMLElement): ScrollFollower {
   let frame: number | null = null;
   let lastTime = 0;
   let writtenTop: number | null = null;
+  /**
+   * The scroller's own box, read on every follow(). When it changes, content
+   * re-wrapped under the reader (window resize, panel toggle, keyboard) and the
+   * correction must land in the commit that caused it — exact, before paint —
+   * otherwise every re-wrap paints as a pop and eases back: the trembling.
+   */
+  let boxWidth: number | undefined;
+  let boxHeight: number | undefined;
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
   const bottom = () => Math.max(0, node.scrollHeight - node.clientHeight);
   const atBottom = () => bottom() - node.scrollTop <= BOTTOM_SLACK_PX;
@@ -54,6 +62,13 @@ export function createScrollFollower(node: HTMLElement): ScrollFollower {
   const follow = ({ immediate = false }: { immediate?: boolean } = {}) => {
     if (!pinned) return;
     const target = bottom();
+    // Compare the box with the previous follow so a change made in this commit
+    // is still visible here (this runs before paint).
+    const width = node.clientWidth;
+    const height = node.clientHeight;
+    const boxChanged = width !== undefined && boxWidth !== undefined && (width !== boxWidth || height !== boxHeight);
+    boxWidth = width;
+    boxHeight = height;
     if (immediate || !initialized || reducedMotion.matches) {
       initialized = true;
       cancel();
@@ -61,6 +76,15 @@ export function createScrollFollower(node: HTMLElement): ScrollFollower {
       return;
     }
     if (Math.abs(target - node.scrollTop) <= 1) return;
+    // Snap when the tail moved for a reason the reader must not watch glide:
+    // the viewport re-wrapped (resize), or content shrank and clamped them.
+    // Growth under an unchanged box is streamed content catching up: that is
+    // the eased follow, and cancelling it here is what killed the animation.
+    if (boxChanged || target < node.scrollTop) {
+      cancel();
+      write(target);
+      return;
+    }
     if (target - node.scrollTop > node.clientHeight) {
       // A backlog bigger than one viewport can never close at the catch-up
       // speed; snap to the tail instead of chasing it frame by frame.
