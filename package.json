@@ -28,7 +28,8 @@
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "vitest run",
     "build:web": "npm --prefix web run build",
-    "web:dev": "npm --prefix web run dev"
+    "web:dev": "npm --prefix web run dev",
+    "probe:resize": "npm --prefix web run probe:resize"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.125",

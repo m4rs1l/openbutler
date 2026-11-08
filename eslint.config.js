@@ -8,12 +8,16 @@ export default tseslint.config(
   {
     // Plain Node.js helper scripts: TypeScript-aware rules do not apply, but
     // the Node.js runtime globals must be known to `no-undef`.
-    files: ['scripts/**/*.mjs'],
+    files: ['scripts/**/*.mjs', 'web/scripts/**/*.mjs'],
     languageOptions: {
       globals: {
         Buffer: 'readonly',
+        clearTimeout: 'readonly',
+        console: 'readonly',
         fetch: 'readonly',
         process: 'readonly',
+        setTimeout: 'readonly',
+        URL: 'readonly',
       },
     },
   },
