@@ -193,23 +193,17 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     const controller = parent;
     const attemptId = `${event.id}:attempt:${event.attempts}`;
     try {
-      await controller.sendEvent(
-        {
-          text: inboxNotice('Subagent', 1),
-          images: [],
-          eventId: attemptId,
-          communication: { source: 'inbox' },
-          ...(event.workspaceRoot ? { workspaceRoot: event.workspaceRoot } : {}),
-          beforeDelivery: async () => {
-            if (controller.getSnapshot().session.id !== parentId || !signalStillNeeded(event)) return null;
-            return inboxNotice('Subagent', 1);
-          },
+      await controller.sendEvent({
+        text: inboxNotice('Subagent', 1),
+        images: [],
+        eventId: attemptId,
+        communication: { source: 'inbox' },
+        ...(event.workspaceRoot ? { workspaceRoot: event.workspaceRoot } : {}),
+        beforeDelivery: async () => {
+          if (controller.getSnapshot().session.id !== parentId || !signalStillNeeded(event)) return null;
+          return inboxNotice('Subagent', 1);
         },
-        {
-          reasoningVariantId: controller.runtime.reasoningDefault,
-          showReasoning: controller.runtime.showReasoningDefault,
-        },
-      );
+      });
       await controller.flushSave();
       const result = controller.takeEventRunResult(attemptId);
       const error = result ? result.error : controller.getLastRunError();
@@ -329,14 +323,8 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     };
     workers.set(workerId, workerRecord);
     writeWorkerRecord(ledger, workerId, { ...workerRecord, finished: false });
-    // Preferences follow the worker's own view: a role-bound worker resolves
-    // its effort against its own model's variants, the shared runtime's otherwise.
-    const preferences = {
-      reasoningVariantId: worker.controller.runtime.reasoningDefault,
-      showReasoning: worker.controller.runtime.showReasoningDefault,
-    };
     if (request.background) {
-      void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }, preferences).catch((error: unknown) => {
+      void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }).catch((error: unknown) => {
         releaseWorkerLeases(workerId);
         worker.controller.flushSave();
         options.log(`Background subagent failed to run (session ${workerId}): ${String(error)}`);
@@ -350,7 +338,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     const onAbort = () => worker.controller.stop();
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      await worker.controller.sendMessage({ text: workerTaskText(request), images: [] }, preferences);
+      await worker.controller.sendMessage({ text: workerTaskText(request), images: [] });
       worker.controller.flushSave();
       const error = worker.controller.getLastRunError();
       markWorkerFinished(workerId);

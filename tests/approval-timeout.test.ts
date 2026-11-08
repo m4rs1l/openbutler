@@ -18,7 +18,6 @@ const usage = {
   inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 20, text: 20, reasoning: 0 },
 };
-const preferences = { reasoningVariantId: 'default', showReasoning: false };
 
 function stream(parts: LanguageModelV3StreamPart[], reason: 'stop' | 'tool-calls' = 'stop') {
   return {
@@ -188,6 +187,7 @@ describe('manual approval expiry in a session', () => {
       reasoningMetadataSource: null,
       reasoningSupport: 'model-unsupported',
       reasoningDefault: 'default',
+      reasoningPreference: 'default',
       saveReasoningPreference: () => {},
       showReasoningDefault: false,
       saveShowReasoningPreference: () => {},
@@ -200,7 +200,7 @@ describe('manual approval expiry in a session', () => {
     };
     const { AgentSessionController } = await import('../src/agent-session.js');
     controller = new AgentSessionController(environment, (action) => ledger.recordToolAction(action));
-    await controller.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await controller.sendMessage({ text: 'Inspect the fixture', images: [] });
 
     expect(execute).not.toHaveBeenCalled();
     const entries = controller.getSnapshot().session.entries;

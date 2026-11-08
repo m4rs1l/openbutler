@@ -44,6 +44,7 @@ async function createFixtureHost(): Promise<DaemonHost> {
       reasoningMetadataSource: null,
       reasoningSupport: 'model-unsupported',
       reasoningDefault: 'default',
+      reasoningPreference: 'default',
       showReasoningDefault: false,
       saveReasoningPreference: () => {},
       saveShowReasoningPreference: () => {},

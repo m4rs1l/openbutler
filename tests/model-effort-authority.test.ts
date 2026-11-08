@@ -84,6 +84,7 @@ function runtimeFor(model: MockLanguageModelV3, registry = new ToolRegistry()): 
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: true,
     saveShowReasoningPreference: () => {},
@@ -131,6 +132,25 @@ describe('a stored effort never costs more than the owner asked for', () => {
     // The same rule for a level that sits between two offered ones.
     const withoutXhigh = ['default', 'low', 'medium', 'high', 'max'].map(variant);
     expect(resolveReasoningVariant(withoutXhigh, 'xhigh').id).toBe('high');
+  });
+
+  it('resolves the machine default against the ladder of the model that runs', async () => {
+    // The machine default is a raw id. The runtime resolves it against ITS
+    // OWN model, so the value it publishes belongs to that model's ladder.
+    // A chat that inherits the default must resolve the RAW id against its
+    // own ladder, or the first model's ladder silently demotes it.
+    const { resolveReasoningVariant } = await import('../src/provider/registry.js');
+    const runtimeModel = ['default', 'low', 'medium', 'high'].map(variant);
+    const chatModel = ['default', 'minimal', 'low', 'medium'].map(variant);
+
+    // The runtime's model does not offer "minimal", so it degrades it.
+    const published = resolveReasoningVariant(runtimeModel, 'minimal').id;
+    expect(published).not.toBe('minimal');
+
+    // The chat's model DOES offer it, so inheriting the machine default must
+    // keep it. Resolving the published value instead would lose it.
+    const inherited = resolveReasoningVariant(chatModel, 'minimal').id;
+    expect(inherited).toBe('minimal');
   });
 
   it('keeps a listed effort exactly as stored', async () => {
@@ -187,7 +207,7 @@ describe('a chat keeps its own effort across a model change', () => {
     session.setReasoningPreference('medium');
 
     await session.selectModel('second-endpoint', 'second-model');
-    await session.sendMessage({ text: 'Uses the chat effort', images: [] }, { reasoningVariantId: 'default', showReasoning: true });
+    await session.sendMessage({ text: 'Uses the chat effort', images: [] });
     await session.waitUntilIdle(1000);
 
     // The machine default is "default"; the chat chose "medium" and the new

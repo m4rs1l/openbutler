@@ -88,6 +88,15 @@ export interface AgentSessionRuntimeView {
   reasoningMetadataSource: string | null;
   reasoningSupport: ReasoningSupport;
   reasoningDefault: string;
+  /**
+   * The machine's stored preference, unresolved.
+   *
+   * `reasoningDefault` is already resolved against the runtime's model,
+   * so a chat that inherits it inherits another model's ladder. This is
+   * the raw id: each chat resolves it against the levels its own model
+   * offers, so a stored `minimal` stays `minimal` wherever it is valid.
+   */
+  reasoningPreference: string;
   saveReasoningPreference: (variantId: string) => void;
   showReasoningDefault: boolean;
   /** This provider's reasoning opens with a bold title line; views may headline it instead of a picked sentence. */
@@ -175,7 +184,11 @@ export interface AgentSessionSnapshot {
   streamingAssistantEntry: SessionEntry | null;
 }
 
-export interface AgentTurnPreferences {
+/**
+ * The settings a turn runs with. They belong to the chat: the chat resolves
+ * them from its own record, and no channel declares them.
+ */
+interface TurnSettings {
   reasoningVariantId: string;
   showReasoning: boolean;
 }
@@ -186,7 +199,6 @@ type QueuedTurn = {
   /** Only explicit owner steering and host notifications may enter a live run. */
   steering: boolean;
   message: QueuedMessage;
-  preferences: AgentTurnPreferences;
   resolve: () => void;
   reject: (error: unknown) => void;
   /** The owner message already has a transcript entry; the turn only delivers it to the model. */
@@ -249,8 +261,8 @@ export interface AgentSessionClient {
   approveToolCall(decision: ApprovalDecision, requestId?: string): void;
   answerQuestion(answer: string | null, questionId?: string): void;
   stop(options?: { keepQueue?: boolean; holdQueue?: boolean }): void;
-  sendMessage(message: QueuedMessage, preferences: AgentTurnPreferences): Promise<void>;
-  compact(preferences: AgentTurnPreferences, recovery?: boolean): Promise<void>;
+  sendMessage(message: QueuedMessage): Promise<void>;
+  compact(recovery?: boolean): Promise<void>;
   selectModel(providerId: string, modelId: string): Promise<void>;
   /**
    * Records the effort for THIS chat. The machine default in settings.yaml is
@@ -258,6 +270,13 @@ export interface AgentSessionClient {
    * surfaces cannot disagree about what a chat runs with.
    */
   setReasoningPreference(variantId: string): void | Promise<void>;
+  /**
+   * Records the reasoning-visibility choice for THIS chat.
+   *
+   * The machine-wide visibility setting is never written from a chat
+   * surface, so one chat's toggle cannot change what another chat shows.
+   */
+  setShowReasoningPreference(visible: boolean): void | Promise<void>;
   setApprovalMode(mode: ApprovalMode): Promise<void>;
   listSessions(): SessionSummary[] | Promise<SessionSummary[]>;
   loadSession(id: string): SavedSession | AgentSessionView | null | Promise<SavedSession | AgentSessionView | null>;
@@ -351,7 +370,7 @@ export class AgentSessionController implements AgentSessionClient {
    * next step boundary; the run's end is only the fallback for a request that
    * arrives after the last step.
    */
-  private pendingCompaction: { preferences: AgentTurnPreferences; recovery: boolean; scopeRoot?: string } | null = null;
+  private pendingCompaction: { recovery: boolean; scopeRoot?: string } | null = null;
   private pendingApproval: ToolCallRequest | null = null;
   private pendingApprovalId: string | null = null;
   private approvalResolver: ((decision: ApprovalDecision) => void) | null = null;
@@ -706,8 +725,11 @@ export class AgentSessionController implements AgentSessionClient {
     if (this.session.reasoning !== undefined) return this.session.reasoning;
     // The machine default is an effort id; the levels that exist are this
     // chat's model's, so the default is resolved against THIS chat's model.
+    // The RAW id is used on purpose: the runtime's resolved default belongs
+    // to another model's ladder and would silently degrade this chat's.
     const variants = this.stateVariants();
-    return variants.length > 0 ? resolveReasoningVariant(variants, this.runtime.reasoningDefault).id : this.runtime.reasoningDefault;
+    const preference = this.runtime.reasoningPreference;
+    return variants.length > 0 ? resolveReasoningVariant(variants, preference).id : preference;
   }
 
   /** The session's reasoning-visibility choice, with the machine default as fallback. */
@@ -1152,17 +1174,9 @@ export class AgentSessionController implements AgentSessionClient {
   async command(name: string, payload: Record<string, unknown> = {}): Promise<void> {
     const action = daemonCommandAction(name);
     if (action === 'session.compact') {
-      // The surface passes turn preferences through untouched; refuse anything
-      // malformed here rather than let it reach a compaction request.
-      const turn = payload.preferences as Partial<AgentTurnPreferences> | null | undefined;
-      if (
-        !turn ||
-        typeof turn.reasoningVariantId !== 'string' ||
-        turn.reasoningVariantId.length > 256 ||
-        typeof turn.showReasoning !== 'boolean'
-      )
-        throw new Error('turn preferences are invalid.');
-      await this.compact({ reasoningVariantId: turn.reasoningVariantId, showReasoning: turn.showReasoning }, payload.recovery === true);
+      // A compaction runs with the chat's own effort and visibility. The
+      // caller declares nothing about them: there is one authority.
+      await this.compact(payload.recovery === true);
       return;
     }
     if (action === 'session.new') {
@@ -1321,7 +1335,7 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   /** The admitted turn's own message preferences; cleared when the run settles. */
-  private activeTurnPreferences: AgentTurnPreferences | null = null;
+  private activeTurnPreferences: TurnSettings | null = null;
   /** The model state this chat runs with. It belongs to this chat alone. */
   private modelState: ModelState | null = null;
   /** The state the running turn was admitted with: a pick made during a run belongs to the NEXT turn. */
@@ -1345,7 +1359,7 @@ export class AgentSessionController implements AgentSessionClient {
    * Moving the ground under a request that is already in flight is what made
    * a chat answer with an effort nobody picked.
    */
-  private liveTurnPreferences(): AgentTurnPreferences {
+  private liveTurnPreferences(): TurnSettings {
     const turn = this.activeTurnPreferences;
     if (!turn)
       return {
@@ -1885,15 +1899,15 @@ export class AgentSessionController implements AgentSessionClient {
     return null;
   }
 
-  sendMessage(message: QueuedMessage, preferences: AgentTurnPreferences): Promise<void> {
-    return this.enqueueMessage(message, preferences, false);
+  sendMessage(message: QueuedMessage): Promise<void> {
+    return this.enqueueMessage(message, false);
   }
 
   /** Automatic wake-ups share the normal queue but never release an owner's stop. */
-  sendEvent(message: QueuedMessage, preferences: AgentTurnPreferences): Promise<void> {
+  sendEvent(message: QueuedMessage): Promise<void> {
     if (this.closed) return Promise.reject(new Error('The target session is closed.'));
     if (this.automaticWakeHeld) return Promise.reject(new Error('Automatic wake is held by the owner.'));
-    return this.enqueueMessage(message, preferences, true);
+    return this.enqueueMessage(message, true);
   }
 
   /**
@@ -1947,7 +1961,7 @@ export class AgentSessionController implements AgentSessionClient {
     this.publish(false);
   }
 
-  private enqueueMessage(message: QueuedMessage, preferences: AgentTurnPreferences, automatic: boolean): Promise<void> {
+  private enqueueMessage(message: QueuedMessage, automatic: boolean): Promise<void> {
     if (this.closed) return Promise.resolve();
     const wasHeld = this.automaticWakeHeld || this.queueHold;
     if (!automatic && this.automaticWakeHeld) {
@@ -1999,7 +2013,7 @@ export class AgentSessionController implements AgentSessionClient {
       // Web keeps the explicit steer button; Telegram/inbox/team already steer.
       const steering =
         automatic || source === 'terminal' || source === 'inbox' || source === 'owner-inbox' || source === 'team' || source === 'worker';
-      const turn: QueuedTurn = { id: randomUUID(), message, preferences, resolve, reject, automatic, steering };
+      const turn: QueuedTurn = { id: randomUUID(), message, resolve, reject, automatic, steering };
       if (!automatic && wasHeld) {
         const events = this.queuedMessages.filter((queued) => queued.automatic);
         const ownerMessages = this.queuedMessages.filter((queued) => !queued.automatic);
@@ -2110,13 +2124,13 @@ export class AgentSessionController implements AgentSessionClient {
         // The admitted turn owns the model it runs with: a pick made while
         // this turn runs belongs to the NEXT turn, never to this one.
         this.activeModelState = this.modelState;
-        // The admitted turn's own message preferences govern it, but a session
-        // that recorded its own effort always wins: the session is the single
-        // authority, so a wake-up or another channel carrying the machine
-        // default can never override what this chat was set to.
+        // The chat is the single authority for its effort and visibility: its
+        // own recorded choice, else the machine default resolved against THIS
+        // chat's model levels. Nothing a channel carries - a request body, a
+        // wake-up, another surface - can move the chat.
         this.activeTurnPreferences = {
-          reasoningVariantId: this.session.reasoning ?? currentTurn.preferences.reasoningVariantId,
-          showReasoning: this.session.showReasoning ?? currentTurn.preferences.showReasoning,
+          reasoningVariantId: this.sessionReasoning(),
+          showReasoning: this.sessionShowReasoning(),
         };
         const current = currentTurn.message;
         this.resetAutoReviewTurn();
@@ -2238,10 +2252,7 @@ export class AgentSessionController implements AgentSessionClient {
                       ? {
                           force: true,
                           ...(pendingCompaction.recovery ? { recovery: true } : {}),
-                          providerOptions: this.stateReasoningOptions(
-                            pendingCompaction.preferences.reasoningVariantId,
-                            pendingCompaction.preferences.showReasoning,
-                          ),
+                          providerOptions: this.stateReasoningOptions(this.sessionReasoning(), this.sessionShowReasoning()),
                         }
                       : {}),
                     onStart: () => {
@@ -2570,7 +2581,7 @@ export class AgentSessionController implements AgentSessionClient {
     const pendingCompaction = this.pendingCompaction;
     if (pendingCompaction) {
       this.pendingCompaction = null;
-      void this.compact(pendingCompaction.preferences, pendingCompaction.recovery, pendingCompaction.scopeRoot);
+      void this.compact(pendingCompaction.recovery, pendingCompaction.scopeRoot);
     } else if (!this.queueHold && this.queuedMessages.length > 0) {
       void this.runQueuedMessages();
     }
@@ -2583,22 +2594,22 @@ export class AgentSessionController implements AgentSessionClient {
    * the scope mid-run would move the active turn, so it stays queued for the
    * run's end, where the scope is selected before compacting.
    */
-  private takePendingCompactionForStep(): { preferences: AgentTurnPreferences; recovery: boolean } | null {
+  private takePendingCompactionForStep(): { recovery: boolean } | null {
     const pending = this.pendingCompaction;
     if (!pending) return null;
     if (pending.scopeRoot !== undefined && pending.scopeRoot !== this.runtime.workspaceRoot) return null;
     this.pendingCompaction = null;
-    return { preferences: pending.preferences, recovery: pending.recovery };
+    return { recovery: pending.recovery };
   }
 
-  async compact(preferences: AgentTurnPreferences, recovery = false, scopeRoot?: string): Promise<void> {
+  async compact(recovery = false, scopeRoot?: string): Promise<void> {
     if (this.closed) return;
     // Compaction rewrites the conversation, so it must not run while a turn is
     // in flight. Instead of refusing, queue it: the run serves it at the next
     // step boundary (after the pending tool batch, before the next model
     // request) and falls back to the run's end when no step follows.
     if (this.busy) {
-      this.pendingCompaction = { preferences, recovery, ...(scopeRoot === undefined ? {} : { scopeRoot }) };
+      this.pendingCompaction = { recovery, ...(scopeRoot === undefined ? {} : { scopeRoot }) };
       this.addNotice('Compaction is queued; it runs at the next step boundary or when the run finishes.');
       return;
     }
@@ -2646,7 +2657,7 @@ export class AgentSessionController implements AgentSessionClient {
         outputLimitTokens: this.runtime.outputLimitTokens,
         ...(this.lastContextUsage !== undefined ? { previousContextTokens: this.lastContextUsage } : {}),
         ...(this.lastContextEstimate !== undefined ? { previousContextEstimateTokens: this.lastContextEstimate } : {}),
-        providerOptions: this.stateReasoningOptions(preferences.reasoningVariantId, preferences.showReasoning),
+        providerOptions: this.stateReasoningOptions(this.sessionReasoning(), this.sessionShowReasoning()),
         onStepUsage: (report) => this.onStepUsage(report, 'compaction'),
         onStart: () => {
           this.flushStreamedEntries();

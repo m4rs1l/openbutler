@@ -32,7 +32,7 @@ interface ComposerProps {
   changing: boolean;
   modelChanging: boolean;
   onDraft: (text: string) => void;
-  onSend: (text: string, images?: DraftImage[], reasoningVariantId?: string) => Promise<void>;
+  onSend: (text: string, images?: DraftImage[]) => Promise<void>;
   onStop: () => void;
   onCommand: (name: string) => Promise<void> | void;
   onModel: (model: ModelChoice) => Promise<boolean>;
@@ -151,7 +151,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
     props.onDraft('');
     props.onImages([]);
     try {
-      await props.onSend(text, images, modelSelection.reasoningVariantId);
+      await props.onSend(text, images);
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
       // Give the words back unless the owner already started a new message.

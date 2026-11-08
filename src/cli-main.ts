@@ -761,13 +761,7 @@ async function runQuestion(question: string, workspaceRoot: string): Promise<voi
 
   try {
     onSnapshot();
-    await controller.sendMessage(
-      { text: question, images: [] },
-      {
-        reasoningVariantId: resolveReasoningVariant(runtime.reasoningVariants, runtime.reasoningDefault).id,
-        showReasoning: loadSettings().showReasoning !== false,
-      },
-    );
+    await controller.sendMessage({ text: question, images: [] });
     await done;
   } finally {
     clearTimeout(startTimeout);

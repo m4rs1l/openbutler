@@ -542,10 +542,14 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       reasoningMetadataSource: activeCatalog.inferred ? activeCatalog.sourceProviderId : null,
       reasoningSupport: reasoningSupportStatus(resolved.resolved, reasoningCatalog.model),
       reasoningDefault: resolveReasoningVariant(reasoningVariants, settings.reasoning ?? 'default').id,
+      // The raw preference travels beside the resolved one: a chat that
+      // inherits the machine default resolves it against its own ladder.
+      reasoningPreference: normalizeReasoningVariantId(settings.reasoning ?? 'default'),
       saveReasoningPreference: (variantId) => {
         const latest = loadSettings();
         latest.reasoning = normalizeReasoningVariantId(variantId);
         saveSettings(latest);
+        runtime.reasoningPreference = latest.reasoning;
         runtime.reasoningDefault = resolveReasoningVariant(activeVariants, latest.reasoning).id;
       },
       showReasoningDefault: settings.showReasoning !== false,
@@ -667,6 +671,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
             if (titleClerk.model) runtime.titleModel = titleClerk.model;
             else delete runtime.titleModel;
           }
+          runtime.reasoningPreference = normalizeReasoningVariantId(latest.reasoning ?? 'default');
           runtime.reasoningDefault = resolveReasoningVariant(activeVariants, latest.reasoning ?? 'default').id;
           runtime.showReasoningDefault = latest.showReasoning !== false;
           runtime.approvalMode = latest.approvalMode;

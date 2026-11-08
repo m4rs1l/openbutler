@@ -60,6 +60,7 @@ function fakeClient(entries: SessionEntry[]): AgentSessionClient {
       supportsVision: false,
       reasoningVariants: [{ id: 'default', label: 'Default' }],
       reasoningDefault: 'default',
+      reasoningPreference: 'default',
       reasoningSupport: 'model-unsupported',
       showReasoningDefault: false,
       saveApprovalModePreference: () => {},

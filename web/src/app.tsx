@@ -416,11 +416,11 @@ export function App() {
                         // Accessing localStorage itself can be blocked by the browser.
                       }
                     }}
-                    onSend={async (text, images, reasoning) => {
+                    onSend={async (text, images) => {
                       if (projects.loading || projects.error)
                         throw new Error('Project information is not ready yet. Try again from the project menu.');
                       if (!projects.supportsSelection) throw new Error('Restart the OpenButler server to enable the project scope.');
-                      await session.send(text, images, reasoning);
+                      await session.send(text, images);
                     }}
                     onStop={() => void session.stop()}
                     onCommand={async (name) => {

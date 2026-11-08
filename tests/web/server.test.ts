@@ -63,6 +63,7 @@ const client = {
       { id: 'high', label: 'High' },
     ],
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: vi.fn((variantId: string) => {
       Object.assign(client.runtime, { reasoningDefault: variantId });
     }),
@@ -420,7 +421,7 @@ describe('browser session controls', () => {
     const other = actors.get('session-b')!;
     other.getSnapshot().busy = true;
     expect((await post('/api/message', { text: 'Only B.', sessionId: 'session-b' })).status).toBe(200);
-    expect(other.sendMessage).toHaveBeenCalledWith({ text: 'Only B.', images: [] }, expect.anything());
+    expect(other.sendMessage).toHaveBeenCalledWith({ text: 'Only B.', images: [] });
     expect(send).not.toHaveBeenCalled();
     expect((await post('/api/stop', {})).status).toBe(409);
     expect((await post('/api/stop', { sessionId: 'session-b' })).status).toBe(200);
@@ -440,7 +441,7 @@ describe('browser session controls', () => {
     expect(send).not.toHaveBeenCalled();
     expect((await fetch(`${server.url}/api/entries?before=1&sessionId=old-chat`, { headers: { cookie } })).status).toBe(404);
     expect((await post('/api/message', { text: 'Hello', sessionId: 'session-a' })).status).toBe(200);
-    expect(send).toHaveBeenCalledWith({ text: 'Hello', images: [] }, expect.anything());
+    expect(send).toHaveBeenCalledWith({ text: 'Hello', images: [] });
   });
   it('declares web identity on the connection and ignores identity in the HTTP message body', async () => {
     expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', { clientKind: 'web', chatSessionId: 'session-a' });
@@ -451,19 +452,20 @@ describe('browser session controls', () => {
       communication: { source: 'telegram' },
     });
     expect(response.status).toBe(200);
-    expect(send).toHaveBeenCalledWith({ text: 'Browser message', images: [] }, expect.anything());
+    expect(send).toHaveBeenCalledWith({ text: 'Browser message', images: [] });
   });
-  it('accepts validated image attachments and a supported reasoning level without altering the message', async () => {
+  it('accepts validated image attachments and carries no effort in the message', async () => {
     const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9KsAAAAASUVORK5CYII=';
     const images = [{ base64: png, mediaType: 'image/png' }];
     expect((await post('/api/message', { text: '', images, reasoningVariantId: 'high', sessionId: 'session-a' })).status).toBe(200);
-    expect(send).toHaveBeenCalledWith({ text: '', images }, { reasoningVariantId: 'high', showReasoning: undefined });
+    // The message carries the text and the images and nothing else: the effort
+    // of a chat is recorded with the chat, never with a message.
+    expect(send).toHaveBeenCalledWith({ text: '', images });
     send.mockClear();
     expect(
       (await post('/api/message', { text: 'test', images: [{ base64: 'not-an-image', mediaType: 'image/png' }], sessionId: 'session-a' }))
         .status,
     ).toBe(400);
-    expect((await post('/api/message', { text: 'test', reasoningVariantId: 'not-supported', sessionId: 'session-a' })).status).toBe(400);
     expect(send).not.toHaveBeenCalled();
   });
   it('answers a send without waiting for the run it started', async () => {

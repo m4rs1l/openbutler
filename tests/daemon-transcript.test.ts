@@ -42,6 +42,7 @@ beforeEach(async () => {
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     showReasoningDefault: true,
   };
   snapshot = {

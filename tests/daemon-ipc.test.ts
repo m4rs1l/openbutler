@@ -22,7 +22,6 @@ const usage = {
   inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 20, text: 20, reasoning: 0 },
 };
-const preferences = { reasoningVariantId: 'default', showReasoning: false };
 let root: string;
 let host: DaemonHost;
 let server: Server;
@@ -206,6 +205,7 @@ async function createFixtureHost(): Promise<DaemonHost> {
         reasoningMetadataSource: null,
         reasoningSupport: 'model-unsupported',
         reasoningDefault: 'default',
+        reasoningPreference: 'default',
         showReasoningDefault: false,
         saveReasoningPreference: () => {},
         saveShowReasoningPreference: () => {},
@@ -387,8 +387,8 @@ describe('shared host and session IPC', () => {
     const aId = a.getSnapshot().session.id;
     const bId = b.getSnapshot().session.id;
     expect(aId).not.toBe(bId);
-    await a.sendMessage({ text: 'Keep A running.', images: [] }, preferences);
-    await b.sendMessage({ text: 'Keep B running.', images: [] }, preferences);
+    await a.sendMessage({ text: 'Keep A running.', images: [] });
+    await b.sendMessage({ text: 'Keep B running.', images: [] });
     await vi.waitFor(() => {
       expect(a.isBusy).toBe(true);
       expect(b.isBusy).toBe(true);
@@ -419,13 +419,13 @@ describe('shared host and session IPC', () => {
     const hostMcp = daemonStart.runtimeOptions.mock.lastCall?.[0]?.mcpManager;
     expect(hostMcp).toBeDefined();
     const ownerId = owner.getSnapshot().session.id;
-    await owner.sendMessage({ text: 'Keep the owner conversation.', images: [] }, preferences);
+    await owner.sendMessage({ text: 'Keep the owner conversation.', images: [] });
     await vi.waitFor(() => expect(owner.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant')).toBe(true));
     await owner.flushSave();
     const opened = await client({ newChatSession: true, clientKind: 'web' });
     expect(daemonStart.runtimeOptions.mock.lastCall?.[0]?.mcpManager).toBe(hostMcp);
     const id = opened.getSnapshot().session.id;
-    await opened.sendMessage({ text: 'Remember this conversation.', images: [] }, preferences);
+    await opened.sendMessage({ text: 'Remember this conversation.', images: [] });
     await vi.waitFor(() =>
       expect(
         opened.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant'),
@@ -607,7 +607,7 @@ describe('shared host and session IPC', () => {
     settings.saveSettings(store);
     await vi.waitFor(() => expect(reload).toHaveBeenCalledWith(true));
     model.doStream = async (options) => holdOpenWorkerStream(options.abortSignal);
-    const running = viewer.sendMessage({ text: 'Keep this turn open.', images: [] }, preferences);
+    const running = viewer.sendMessage({ text: 'Keep this turn open.', images: [] });
     await vi.waitFor(() => expect(viewer.getSnapshot().busy).toBe(true));
     reload.mockClear();
     store.theme = 'Dark';
@@ -633,14 +633,11 @@ describe('shared host and session IPC', () => {
   it('binds web and terminal source labels to the connection and persists them', async () => {
     const web = await newChat({ clientKind: 'web' });
     const terminal = await newChat();
-    await web.sendMessage(
-      {
-        text: 'Browser message.',
-        images: [],
-        communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: 'fake' } },
-      },
-      preferences,
-    );
+    await web.sendMessage({
+      text: 'Browser message.',
+      images: [],
+      communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: 'fake' } },
+    });
     await vi.waitFor(() =>
       expect(web.getSnapshot().session.entries).toContainEqual(
         expect.objectContaining({
@@ -653,7 +650,7 @@ describe('shared host and session IPC', () => {
     );
     expect(JSON.stringify(model.doStreamCalls[0]!.prompt)).toContain('[Host context: owner message via web]');
     expect(JSON.stringify(model.doStreamCalls[0]!.prompt)).not.toContain('owner message via Telegram');
-    await terminal.sendMessage({ text: 'Terminal message.', images: [] }, preferences);
+    await terminal.sendMessage({ text: 'Terminal message.', images: [] });
     await vi.waitFor(() =>
       expect(terminal.getSnapshot().session.entries).toContainEqual(
         expect.objectContaining({
@@ -686,7 +683,7 @@ describe('shared host and session IPC', () => {
 
     // The chat layer switches chats by opening another attachment, so each surface keeps
     // its own session and nothing is moved between them.
-    await otherChat.sendMessage({ text: 'Web after switching.', images: [] }, preferences);
+    await otherChat.sendMessage({ text: 'Web after switching.', images: [] });
     await vi.waitFor(() =>
       expect(otherChat.getSnapshot().session.entries).toContainEqual(
         expect.objectContaining({
@@ -696,7 +693,7 @@ describe('shared host and session IPC', () => {
         }),
       ),
     );
-    await web.sendMessage({ text: 'Web before reconnect.', images: [] }, preferences);
+    await web.sendMessage({ text: 'Web before reconnect.', images: [] });
     await vi.waitFor(() =>
       expect(web.getSnapshot().session.entries).toContainEqual(
         expect.objectContaining({
@@ -718,7 +715,7 @@ describe('shared host and session IPC', () => {
         ).toBe(true),
       { timeout: 5_000, interval: 25 },
     );
-    await web.sendMessage({ text: 'Web after reconnect.', images: [] }, preferences);
+    await web.sendMessage({ text: 'Web after reconnect.', images: [] });
     await vi.waitFor(() =>
       expect(web.getSnapshot().session.entries).toContainEqual(
         expect.objectContaining({
@@ -836,7 +833,7 @@ describe('shared host and session IPC', () => {
     const sharedId = shared.getSnapshot().session.id;
     const isolatedId = isolated.getSnapshot().session.id;
     for (const attached of [shared, isolated]) {
-      await attached.sendMessage({ text: 'Preserve this session during restart.', images: [] }, preferences);
+      await attached.sendMessage({ text: 'Preserve this session during restart.', images: [] });
       await vi.waitFor(() =>
         expect(
           attached.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'Fixture response'),
@@ -875,7 +872,7 @@ describe('shared host and session IPC', () => {
   it('hands a surface the chat it left off in after a restart with no client connected', async () => {
     const attached = await newChat();
     const id = attached.getSnapshot().session.id;
-    await attached.sendMessage({ text: 'Resume this workspace after restart.', images: [] }, preferences);
+    await attached.sendMessage({ text: 'Resume this workspace after restart.', images: [] });
     await vi.waitFor(() =>
       expect(attached.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'Fixture response')).toBe(
         true,
@@ -917,7 +914,7 @@ describe('shared host and session IPC', () => {
   it('reattaches the existing client and restores its saved session after an unexpected host disconnect', async () => {
     const attached = await newChat();
     const sessionId = attached.getSnapshot().session.id;
-    await attached.sendMessage({ text: 'Persist this task before disconnect.', images: [] }, preferences);
+    await attached.sendMessage({ text: 'Persist this task before disconnect.', images: [] });
     await vi.waitFor(
       () =>
         expect(
@@ -1007,7 +1004,7 @@ describe('shared host and session IPC', () => {
     expect(isolated.getSnapshot().session.id).not.toBe(sharedId);
     const longAnswer = 'Large sample café naïve 👋 output\n'.repeat(4000);
     model.doStream = async () => textStream(longAnswer);
-    await isolated.sendMessage({ text: 'Isolated fixture request', images: [] }, preferences);
+    await isolated.sendMessage({ text: 'Isolated fixture request', images: [] });
     await vi.waitFor(() => {
       expect(isolated.getSnapshot().busy).toBe(false);
       expect(isolated.getSnapshot().session.entries.find((entry) => entry.kind === 'assistant')).toMatchObject({
@@ -1040,7 +1037,7 @@ describe('shared host and session IPC', () => {
       .mockImplementationOnce(async () => textStream('Approved fixture complete'));
     const first = await newChat();
     const chatId = first.getSnapshot().session.id;
-    await first.sendMessage({ text: 'Inspect fixture', images: [] }, preferences);
+    await first.sendMessage({ text: 'Inspect fixture', images: [] });
     await vi.waitFor(() => expect(first.getSnapshot().pendingApprovalId).toBeTruthy());
     const id = first.getSnapshot().pendingApprovalId!;
     await first.close();
@@ -1089,7 +1086,7 @@ describe('shared host and session IPC', () => {
       )
       .mockImplementationOnce(async () => textStream('Fixture complete.'));
     const viewer = await newChat();
-    await viewer.sendMessage({ text: 'Inspect fixture', images: [] }, { reasoningVariantId: 'default', showReasoning: true });
+    await viewer.sendMessage({ text: 'Inspect fixture', images: [] });
     await vi.waitFor(() => expect(viewer.getSnapshot().busy).toBe(false));
     const blocks = viewer.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
     expect(blocks).toHaveLength(1);
@@ -1117,7 +1114,7 @@ describe('shared host and session IPC', () => {
       )
       .mockImplementationOnce(async () => textStream('Deploying to Staging.'));
     const asker = await newChat();
-    await asker.sendMessage({ text: 'Deploy fixture', images: [] }, preferences);
+    await asker.sendMessage({ text: 'Deploy fixture', images: [] });
     await vi.waitFor(() => expect(asker.getSnapshot().pendingQuestion).not.toBeNull());
     const pending = asker.getSnapshot().pendingQuestion!;
     expect(pending.question).toBe('Which environment?');
@@ -1149,7 +1146,7 @@ describe('shared host and session IPC', () => {
 
     // /compact normalizes to the request the host already implements: it is
     // accepted, and the session's own compaction answers for it.
-    await attached.command('/compact', { preferences });
+    await attached.command('/compact');
     await vi.waitFor(() =>
       expect(
         attached
@@ -1180,7 +1177,7 @@ describe('shared host and session IPC', () => {
     const idleId = idle.getSnapshot().session.id;
     const isolated = await client({ isolatedSession: true });
     const sessionId = isolated.getSnapshot().session.id;
-    await isolated.sendMessage({ text: 'Isolated inspection', images: [] }, preferences);
+    await isolated.sendMessage({ text: 'Isolated inspection', images: [] });
     await vi.waitFor(() => expect(isolated.getSnapshot().pendingApprovalId).toBeTruthy());
     const requestId = isolated.getSnapshot().pendingApprovalId!;
     await isolated.close();
@@ -1393,7 +1390,7 @@ describe('shared host and session IPC', () => {
       )
       .mockImplementationOnce(async () => textStream('Task created'));
     const caller = await newChat();
-    await caller.sendMessage({ text: 'Create a schedule', images: [] }, preferences);
+    await caller.sendMessage({ text: 'Create a schedule', images: [] });
     // Same-workspace task management runs silent: no approval card.
     await vi.waitFor(() =>
       expect(caller.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'Task created')).toBe(true),
@@ -1545,7 +1542,7 @@ describe('shared host and session IPC', () => {
     const viewerEntries = () => viewer.getSnapshot().session.entries as Array<{ kind: string; session?: unknown; result?: unknown }>;
     const viewer = await newChat();
     const parentId = viewer.getSnapshot().session.id;
-    await viewer.sendMessage({ text: 'Spawn the worker.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Spawn the worker.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewerEntries()
@@ -1757,7 +1754,7 @@ describe('shared host and session IPC', () => {
       return textStream('Chat answer');
     });
 
-    await chat.sendMessage({ text: 'Say something', images: [] }, preferences);
+    await chat.sendMessage({ text: 'Say something', images: [] });
     await vi.waitFor(() => expect(offered.length).toBeGreaterThan(0));
 
     // Absence, not refusal: the name is never offered, so the model cannot spend a
@@ -1933,7 +1930,7 @@ describe('shared host and session IPC', () => {
       // The recent-chat list is chats: the custodian is written on its own surface and would
       // not appear, so this opens the chat the owner would have open while working.
       const viewer = await client({ newChatSession: true, clientKind: 'web' });
-      await viewer.sendMessage({ text: 'Hello from the terminal', images: [] }, preferences);
+      await viewer.sendMessage({ text: 'Hello from the terminal', images: [] });
       await vi.waitFor(() =>
         expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'Fixture response')).toBe(
           true,
@@ -2000,7 +1997,7 @@ describe('shared host and session IPC', () => {
     settings.saveSettings(store);
     const viewer = await newChat();
     const worker = await client({ isolatedSession: true });
-    await worker.sendMessage({ text: 'Worker standing by.', images: [] }, preferences);
+    await worker.sendMessage({ text: 'Worker standing by.', images: [] });
     await vi.waitFor(() =>
       expect(worker.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'Fixture response')).toBe(
         true,
@@ -2077,7 +2074,7 @@ describe('shared host and session IPC', () => {
       chatTools.push(offeredToolNames(options));
       return textStream('Fixture response');
     });
-    await viewer.sendMessage({ text: 'Attempt to steer the worker from a chat.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Attempt to steer the worker from a chat.', images: [] });
     await vi.waitFor(() => expect(chatTools.length).toBeGreaterThan(0));
     expect(chatTools[0]).not.toContain('session_message');
     expect(chatTools[0]).toContain('custodian_message');
@@ -2122,7 +2119,7 @@ describe('shared host and session IPC', () => {
       return textStream('PARENT-WAITING');
     });
 
-    await viewer.sendMessage({ text: 'Delegate the README inspection.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Delegate the README inspection.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewer
@@ -2248,7 +2245,7 @@ describe('shared host and session IPC', () => {
       return textStream('Fixture response');
     });
 
-    await reporter.sendMessage({ text: 'AGENT-REPORT-TASK', images: [] }, preferences);
+    await reporter.sendMessage({ text: 'AGENT-REPORT-TASK', images: [] });
     // The custodian is woken by the record, not by the text: the turn carries a count.
     await vi.waitFor(() =>
       expect(
@@ -2311,7 +2308,7 @@ describe('shared host and session IPC', () => {
         (event) => event.kind === 'inbox.wakeup' && event.payload.toSessionId === CUSTODIAN_SESSION_ID,
       ).length;
 
-    await reporter.sendMessage({ text: 'NAG-TASK', images: [] }, preferences);
+    await reporter.sendMessage({ text: 'NAG-TASK', images: [] });
     await vi.waitFor(async () => expect(await wakeCount()).toBe(1), { timeout: 8000 });
     await new Promise<void>((resolveWait) => setTimeout(resolveWait, 300));
     // The head was shown the line and chose not to act: that is a decision, not a missed
@@ -2355,9 +2352,9 @@ describe('shared host and session IPC', () => {
         (event) => event.kind === 'inbox.wakeup' && event.payload.toSessionId === CUSTODIAN_SESSION_ID,
       ).length;
 
-    await first.sendMessage({ text: 'GAP-A', images: [] }, preferences);
+    await first.sendMessage({ text: 'GAP-A', images: [] });
     await vi.waitFor(async () => expect(await wakeCount()).toBe(1), { timeout: 8000 });
-    await second.sendMessage({ text: 'GAP-B', images: [] }, preferences);
+    await second.sendMessage({ text: 'GAP-B', images: [] });
     // The second report arrives inside the gap: its turn is deferred, not dropped.
     expect(await wakeCount()).toBe(1);
     await vi.waitFor(async () => expect(await wakeCount()).toBe(2), { timeout: 8000 });
@@ -2418,7 +2415,7 @@ describe('shared host and session IPC', () => {
     // The chat runs a turn first, so the head has something to address. Its record is
     // debounced, so addressing it immediately is also the case that must not depend on
     // that timer: the head writes the live record before resolving the id.
-    await reporter.sendMessage({ text: 'LINE-SETUP', images: [] }, preferences);
+    await reporter.sendMessage({ text: 'LINE-SETUP', images: [] });
     await host.receiveTelegramMessage(41, 'line probe');
     await vi.waitFor(() => expect(headPrompts().length).toBeGreaterThanOrEqual(1), { timeout: 8000 });
     // The head addresses the chat first: only then is its report anchored to a call.
@@ -2429,7 +2426,7 @@ describe('shared host and session IPC', () => {
         { sessionId: CUSTODIAN_SESSION_ID },
       ),
     ).toMatchObject({ status: 'delivered' });
-    await reporter.sendMessage({ text: 'LINE-ONE', images: [] }, preferences);
+    await reporter.sendMessage({ text: 'LINE-ONE', images: [] });
     await vi.waitFor(() => expect(headPrompts().length).toBeGreaterThanOrEqual(2), { timeout: 8000 });
     // Switched off: the head is woken and the record is there, but no line is projected.
     expect(headPrompts().every((prompt) => !prompt.includes('waiting from below'))).toBe(true);
@@ -2440,7 +2437,7 @@ describe('shared host and session IPC', () => {
     expect(listed.items).toHaveLength(1);
 
     settings.saveSettings({ ...settings.loadSettings(), custodian: { reportLine: true, reportTurnGapSeconds: 0 } });
-    await reporter.sendMessage({ text: 'LINE-TWO', images: [] }, preferences);
+    await reporter.sendMessage({ text: 'LINE-TWO', images: [] });
     await vi.waitFor(() => expect(headPrompts().some((prompt) => prompt.includes('waiting from below'))).toBe(true), { timeout: 8000 });
   }, 20_000);
 
@@ -2514,7 +2511,7 @@ describe('shared host and session IPC', () => {
     store.custodian = { provider: 'fixture', model: 'pinned-head' };
     settings.saveSettings(store);
     const chat = await newChat();
-    await chat.sendMessage({ text: 'PIN-CHAT', images: [] }, preferences);
+    await chat.sendMessage({ text: 'PIN-CHAT', images: [] });
     // A chat is a different layer: the head's pin never reaches it.
     expect(fixtureSelectModels).toEqual([]);
     await host.receiveTelegramMessage(53, 'model pin probe');
@@ -2616,7 +2613,7 @@ describe('shared host and session IPC', () => {
     });
 
     const chat = await newChat();
-    await chat.sendMessage({ text: 'CHAT-PROBE', images: [] }, preferences);
+    await chat.sendMessage({ text: 'CHAT-PROBE', images: [] });
     await vi.waitFor(() => expect(chatOffered.length).toBeGreaterThan(0));
     await host.receiveTelegramMessage(72, 'Head probe');
     await vi.waitFor(() => expect(custodianOffered.length).toBeGreaterThan(0));
@@ -2657,7 +2654,7 @@ describe('shared host and session IPC', () => {
       return textStream('PARENT-WAITING');
     });
 
-    await viewer.sendMessage({ text: 'Delegate this.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Delegate this.', images: [] });
     await vi.waitFor(() => expect(workerNames.length).toBeGreaterThan(0));
 
     expect(workerNames).toContain('parent_message');
@@ -2722,7 +2719,7 @@ describe('shared host and session IPC', () => {
       );
     });
 
-    await viewer.sendMessage({ text: 'Delegate the deep inspection.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Delegate the deep inspection.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewer
@@ -2771,7 +2768,7 @@ describe('shared host and session IPC', () => {
       return textStream('PARENT-WAITING');
     });
 
-    const parentRun = viewer.sendMessage({ text: 'Delegate the view test.', images: [] }, preferences);
+    const parentRun = viewer.sendMessage({ text: 'Delegate the view test.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.running === true)).toBe(true),
     );
@@ -2782,7 +2779,7 @@ describe('shared host and session IPC', () => {
     expect(live.getSnapshot().session.entries.some((entry) => entry.kind === 'user' && String(entry.text).includes('VIEW-TASK'))).toBe(
       true,
     );
-    await live.sendMessage({ text: 'Are you done?', images: [] }, preferences);
+    await live.sendMessage({ text: 'Are you done?', images: [] });
     expect(live.getSnapshot().session.entries.some((entry) => entry.kind === 'notice' && entry.text.includes('view-only'))).toBe(true);
 
     releaseWorker();
@@ -2827,7 +2824,7 @@ describe('shared host and session IPC', () => {
       return textStream('PARENT-AFTER-RESTART-CHECK');
     });
 
-    await viewer.sendMessage({ text: 'Delegate the restart view test.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Delegate the restart view test.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'))).toBe(
         true,
@@ -2846,7 +2843,7 @@ describe('shared host and session IPC', () => {
     expect(view.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('WORKER-REPORT'))).toBe(
       true,
     );
-    await view.sendMessage({ text: 'Are you done?', images: [] }, preferences);
+    await view.sendMessage({ text: 'Are you done?', images: [] });
     expect(view.getSnapshot().session.entries.some((entry) => entry.kind === 'notice' && entry.text.includes('view-only'))).toBe(true);
 
     // An id with no producer on this machine still refuses instead of opening a chat-shaped view.
@@ -2928,7 +2925,7 @@ describe('shared host and session IPC', () => {
       );
     });
 
-    await viewer.sendMessage({ text: 'Delegate in background.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Delegate in background.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewer
@@ -3103,7 +3100,7 @@ describe('shared host and session IPC', () => {
       );
     });
 
-    await viewer.sendMessage({ text: 'Stop the worker test.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Stop the worker test.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewer
@@ -3128,7 +3125,7 @@ describe('shared host and session IPC', () => {
     expect(workerView.getSnapshot().session.id).toBe(spawnedWorkerId);
     await vi.waitFor(() => expect(workerView.getSnapshot().busy).toBe(false), { timeout: 10_000 });
 
-    await viewer.sendMessage({ text: 'Check it.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Check it.', images: [] });
     await vi.waitFor(() =>
       expect(
         viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'PARENT-DONE: worker halted.'),
@@ -3144,7 +3141,7 @@ describe('shared host and session IPC', () => {
     ).toBe(false);
 
     const isolated = await client({ isolatedSession: true });
-    await isolated.sendMessage({ text: 'ISOLATED-PROBE stop please.', images: [] }, preferences);
+    await isolated.sendMessage({ text: 'ISOLATED-PROBE stop please.', images: [] });
     await vi.waitFor(() =>
       expect(
         isolated.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('Only the parent')),
@@ -3180,7 +3177,7 @@ describe('shared host and session IPC', () => {
       return textStream('CAP-BUSY-SEEN');
     });
 
-    await viewer.sendMessage({ text: 'Fill the worker cap.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Fill the worker cap.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'CAP-BUSY-SEEN')).toBe(true),
     );
@@ -3199,7 +3196,7 @@ describe('shared host and session IPC', () => {
     firstView.stop();
     await vi.waitFor(() => expect(firstView.getSnapshot().busy).toBe(false), { timeout: 10_000 });
 
-    await viewer.sendMessage({ text: 'Retry after release.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Retry after release.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'CAP-RETRY-OK')).toBe(true),
     );
@@ -3265,7 +3262,7 @@ describe('shared host and session IPC', () => {
       return textStream('CHILD-CAP-STARTED');
     });
 
-    await viewer.sendMessage({ text: 'Run the child cap test.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Run the child cap test.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'CHILD-CAP-STARTED')).toBe(
         true,
@@ -3383,7 +3380,7 @@ describe('shared host and session IPC', () => {
       return textStream('LEASE-STARTED');
     });
 
-    await viewer.sendMessage({ text: 'Run the lease test.', images: [] }, preferences);
+    await viewer.sendMessage({ text: 'Run the lease test.', images: [] });
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'LEASE-STARTED')).toBe(true),
     );
@@ -3496,7 +3493,7 @@ async function automaticWorkerFixture(options: { fail?: boolean; question?: bool
     }
     return textStream('PARENT_READY');
   });
-  await viewer.sendMessage({ text: 'Delegate and continue independently.', images: [] }, preferences);
+  await viewer.sendMessage({ text: 'Delegate and continue independently.', images: [] });
   await vi.waitFor(() =>
     expect(
       viewer
@@ -3624,7 +3621,7 @@ it('retains a completion across owner pause and host restart, then wakes only it
   expect(resumed.getSnapshot().session.id).toBe(parentId);
   expect(resumed.getSnapshot().session.automaticWakeHeld).toBe(true);
   expect(resumed.getSnapshot().session.entries.some((entry) => entry.kind === 'user' && entry.source === 'inbox')).toBe(false);
-  await resumed.sendMessage({ text: 'Resume my work.', images: [] }, preferences);
+  await resumed.sendMessage({ text: 'Resume my work.', images: [] });
   await vi.waitFor(() =>
     expect(
       resumed.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'PARENT_RESULT_INTEGRATED'),
@@ -3742,10 +3739,10 @@ it.each(['terminal', 'telegram'])(
       },
     );
     if (channel === 'terminal')
-      await viewer.sendMessage(
-        { text: '[image#1] Inspect this reference.', images: [{ base64: bytes.toString('base64'), mediaType: 'image/png' }] },
-        preferences,
-      );
+      await viewer.sendMessage({
+        text: '[image#1] Inspect this reference.',
+        images: [{ base64: bytes.toString('base64'), mediaType: 'image/png' }],
+      });
     else
       await host.receiveTelegramMessage(999, '[image#1] Inspect this reference.', {
         image: { bytes, filename: 'reference.png', mediaType: 'image/png' },

@@ -692,14 +692,6 @@ export function SessionScreen({
     [addEntry, controller, flushSessionSave],
   );
 
-  const turnPreferences = useCallback(
-    () => ({
-      reasoningVariantId,
-      showReasoning: showReasoningRef.current,
-    }),
-    [reasoningVariantId],
-  );
-
   // The registry names the command and the transport carries it out. Both
   // clients behind this screen implement `command`; one that does not is a
   // version mismatch, which the owner has to see rather than a typed command
@@ -751,7 +743,7 @@ export function SessionScreen({
         return;
       }
       if (commandOnly && text === '/compact') {
-        void runCommand('/compact', { preferences: turnPreferences() });
+        void runCommand('/compact');
         return;
       }
       if (commandOnly && text === '/stop') {
@@ -823,7 +815,7 @@ export function SessionScreen({
       if (escapeStopTimer.current !== null) clearTimeout(escapeStopTimer.current);
       escapeStopTimer.current = null;
       setEscapeWarning(null);
-      void controller.sendMessage({ text: messageText, images: attachedImages }, turnPreferences());
+      void controller.sendMessage({ text: messageText, images: attachedImages });
     },
     [
       addEntry,
@@ -838,7 +830,6 @@ export function SessionScreen({
       runCommand,
       runtime,
       selectedTheme,
-      turnPreferences,
     ],
   );
 
@@ -1524,7 +1515,7 @@ export function SessionScreen({
         showReasoningRef.current = visible;
         setShowReasoning(visible);
         try {
-          runtime.saveShowReasoningPreference(visible);
+          void controller.setShowReasoningPreference(visible);
         } catch (error) {
           addEntry({ kind: 'notice', text: error instanceof Error ? error.message : String(error) });
         }

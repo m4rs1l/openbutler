@@ -25,6 +25,7 @@ function runtimeFor(): AgentEnvironment {
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: true,
     saveShowReasoningPreference: () => {},

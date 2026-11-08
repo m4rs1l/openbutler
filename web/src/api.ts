@@ -59,12 +59,11 @@ async function request<T>(path: string, body?: unknown): Promise<T> {
   }
   return response.json() as Promise<T>;
 }
-export const sendMessage = (text: string, sessionId: string, images: DraftImage[] = [], reasoningVariantId?: string) =>
+export const sendMessage = (text: string, sessionId: string, images: DraftImage[] = []) =>
   request('/api/message', {
     text,
     sessionId,
     images: images.map(({ base64, mediaType }) => ({ base64, mediaType })),
-    reasoningVariantId,
   });
 export const fetchProjects = () => request<ProjectCatalog>('/api/projects');
 export const createProject = (name: string, folders: string[]) => request<Project>('/api/projects', { name, folders });

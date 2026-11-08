@@ -51,6 +51,7 @@ function runtimeFor(model: MockLanguageModelV3, registry: ToolRegistry): AgentEn
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: true,
     saveShowReasoningPreference: () => {},
@@ -101,8 +102,6 @@ afterEach(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-const preferences = { reasoningVariantId: 'default', showReasoning: true };
-
 async function setupBusyRun() {
   let started = false;
   let release!: () => void;
@@ -143,10 +142,12 @@ async function setupBusyRun() {
   const { AgentSessionController } = await import('../src/agent-session.js');
   // sessionWorkspaceRoot: null is the custodian, where a team wake lands and steering is allowed.
   session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-  const first = session.sendMessage(
-    { text: 'Start the long task.', images: [], eventId: 'first', communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-    preferences,
-  );
+  const first = session.sendMessage({
+    text: 'Start the long task.',
+    images: [],
+    eventId: 'first',
+    communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+  });
   await vi.waitFor(() => expect(started).toBe(true));
   return { model, release, first };
 }
@@ -154,7 +155,7 @@ async function setupBusyRun() {
 describe('team wake steering', () => {
   it('steers a team direct message into a busy run', async () => {
     const { model, release, first } = await setupBusyRun();
-    const second = session!.sendMessage({ text: 'TEAM_NOTE', images: [], eventId: 'team', communication: { source: 'team' } }, preferences);
+    const second = session!.sendMessage({ text: 'TEAM_NOTE', images: [], eventId: 'team', communication: { source: 'team' } });
     release();
     await Promise.all([first, second]);
     const prompts = model.doStreamCalls.map((call) => JSON.stringify(call.prompt));
@@ -167,10 +168,12 @@ describe('team wake steering', () => {
   it('steers a same-route web message only after explicit promotion', async () => {
     const { model, release, first } = await setupBusyRun();
     // Web is the surface whose follow-ups wait for the steer button; CLI messages steer by default.
-    const second = session!.sendMessage(
-      { text: 'OWNER_NOTE', images: [], eventId: 'owner', communication: { source: 'web', replyTo: { channel: 'terminal' } } },
-      preferences,
-    );
+    const second = session!.sendMessage({
+      text: 'OWNER_NOTE',
+      images: [],
+      eventId: 'owner',
+      communication: { source: 'web', replyTo: { channel: 'terminal' } },
+    });
     session!.manageQueuedMessage(session!.getSnapshot().queuedMessages[0]!.id!, 'steer', session!.getSnapshot().session.id);
     release();
     await Promise.all([first, second]);
@@ -181,11 +184,12 @@ describe('team wake steering', () => {
 
   it('admits host notifications even when an ordinary owner message is waiting ahead of them', async () => {
     const { model, release, first } = await setupBusyRun();
-    const waiting = session!.sendMessage(
-      { text: 'LATER_OWNER_TASK', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-      preferences,
-    );
-    const notification = session!.sendEvent({ text: 'WORKER_SIGNAL', images: [], communication: { source: 'inbox' } }, preferences);
+    const waiting = session!.sendMessage({
+      text: 'LATER_OWNER_TASK',
+      images: [],
+      communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+    });
+    const notification = session!.sendEvent({ text: 'WORKER_SIGNAL', images: [], communication: { source: 'inbox' } });
     release();
     await Promise.all([first, waiting, notification]);
     // CLI follow-ups steer into the live run by default (owner decision 2026-10-31),
@@ -206,10 +210,13 @@ describe('team wake steering', () => {
 
 it('withdraws an obsolete team wake before it enters a busy conversation', async () => {
   const { model, release, first } = await setupBusyRun();
-  const stale = session!.sendMessage(
-    { text: 'STALE_TEAM_SIGNAL', images: [], eventId: 'stale-team', communication: { source: 'team' }, beforeDelivery: async () => null },
-    preferences,
-  );
+  const stale = session!.sendMessage({
+    text: 'STALE_TEAM_SIGNAL',
+    images: [],
+    eventId: 'stale-team',
+    communication: { source: 'team' },
+    beforeDelivery: async () => null,
+  });
   release();
   await Promise.all([first, stale]);
   expect(model.doStreamCalls).toHaveLength(2);
@@ -219,10 +226,12 @@ it('withdraws an obsolete team wake before it enters a busy conversation', async
 
 it('steers a worker lifecycle event into a busy parent at the tool boundary', async () => {
   const { model, release, first } = await setupBusyRun();
-  const signal = session!.sendEvent(
-    { text: 'WORKER_RESULT_READY', images: [], eventId: 'worker-complete', communication: { source: 'inbox' } },
-    preferences,
-  );
+  const signal = session!.sendEvent({
+    text: 'WORKER_RESULT_READY',
+    images: [],
+    eventId: 'worker-complete',
+    communication: { source: 'inbox' },
+  });
   release();
   await Promise.all([first, signal]);
   expect(model.doStreamCalls).toHaveLength(2);
@@ -239,12 +248,11 @@ it('preserves an owner stop across saves and releases it only on explicit input'
   const { loadSavedSession } = await import('../src/session-store.js');
   const saved = loadSavedSession(session!.getSnapshot().session.id)!;
   expect(saved.automaticWakeHeld).toBe(true);
-  await expect(session!.sendEvent({ text: 'automatic', images: [], communication: { source: 'inbox' } }, preferences)).rejects.toThrow(
-    'held',
-  );
-  await session!.sendMessage(
-    { text: 'Resume the task.', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-    preferences,
-  );
+  await expect(session!.sendEvent({ text: 'automatic', images: [], communication: { source: 'inbox' } })).rejects.toThrow('held');
+  await session!.sendMessage({
+    text: 'Resume the task.',
+    images: [],
+    communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+  });
   expect(session!.automaticWakeHeld).toBe(false);
 });

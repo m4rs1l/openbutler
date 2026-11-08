@@ -56,6 +56,7 @@ function runtimeFor(model: MockLanguageModelV3, registry = new ToolRegistry()): 
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: true,
     saveShowReasoningPreference: () => {},
@@ -98,8 +99,6 @@ afterEach(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-const preferences = { reasoningVariantId: 'default', showReasoning: true };
-
 function fixtureText(text: string, finishReason: 'stop' | 'length' = 'stop', inputTokens = 100) {
   return delayedStream(
     [
@@ -122,19 +121,19 @@ describe('owner replies and safe steering', () => {
     const generate = vi.fn<MockLanguageModelV3['doGenerate']>(() => pending);
     const model = new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Completed answer') });
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     expect(session.getSnapshot().busy).toBe(false);
     expect(session.getSnapshot().session.entries.find((entry) => entry.kind === 'user')?.turnOutcome).toBe('completed');
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
-    await session.sendMessage({ text: 'Next message', images: [] }, preferences);
+    await session.sendMessage({ text: 'Next message', images: [] });
     await session.waitUntilIdle(1000);
     expect(session.getSnapshot().session.entries.filter((entry) => entry.kind === 'user')).toHaveLength(2);
     complete(titleResponse());
     await vi.waitFor(() => expect(session!.getSnapshot().session.title).toBe('Fixture greeting'));
   });
 
-  it('carries the admitted message reasoning variant into every model step', async () => {
+  it('carries the effort this chat owns into every model step', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const runtime = runtimeFor(
       new MockLanguageModelV3({
@@ -142,13 +141,22 @@ describe('owner replies and safe steering', () => {
         doStream: async () => fixtureText('Chosen effort'),
       }),
     );
+    runtime.reasoningVariants = [
+      { id: 'default', label: 'Default', providerOptions: {} },
+      { id: 'low', label: 'Low', providerOptions: {} },
+      { id: 'medium', label: 'Medium', providerOptions: {} },
+      { id: 'high', label: 'High', providerOptions: {} },
+    ];
     const seen: string[] = [];
     runtime.getReasoningProviderOptions = (variantId: string) => {
       seen.push(variantId);
       return {};
     };
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'Reason hard', images: [] }, { reasoningVariantId: 'high', showReasoning: true });
+    // The chat owns its effort: a message body carries none any more, so the
+    // only way an effort reaches a request is the chat's own record.
+    session.setReasoningPreference('high');
+    await session.sendMessage({ text: 'Reason hard', images: [] });
     await session.waitUntilIdle(1000);
     expect(seen[0]).toBe('high');
     expect(seen).toContain('high');
@@ -164,7 +172,7 @@ describe('owner replies and safe steering', () => {
     session = new AgentSessionController(
       runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Done') })),
     );
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
     const signal = generate.mock.calls[0]![0]?.abortSignal;
@@ -215,7 +223,7 @@ describe('owner replies and safe steering', () => {
     session = new AgentSessionController(
       runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Done') })),
     );
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
     await session.close();
@@ -256,11 +264,11 @@ describe('owner replies and safe steering', () => {
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
     // Web keeps the explicit steer button: queued until promoted.
     const communication = { source: 'web' as const, replyTo: { channel: 'terminal' as const } };
-    const first = session.sendMessage({ text: 'Original task.', images: [], communication }, preferences);
+    const first = session.sendMessage({ text: 'Original task.', images: [], communication });
     await vi.waitFor(() => expect(started).toBe(true));
-    const waiting = session.sendMessage({ text: 'Later independent task.', images: [], communication }, preferences);
-    const steering = session.sendMessage({ text: 'Correct the current task.', images: [], communication }, preferences);
-    const removed = session.sendMessage({ text: 'Removed task.', images: [], communication }, preferences);
+    const waiting = session.sendMessage({ text: 'Later independent task.', images: [], communication });
+    const steering = session.sendMessage({ text: 'Correct the current task.', images: [], communication });
+    const removed = session.sendMessage({ text: 'Removed task.', images: [], communication });
     const pending = session.getSnapshot().queuedMessages;
     expect(pending.every((message) => message.steering === false)).toBe(true);
     session.manageQueuedMessage(pending[1]!.id!, 'steer', session.getSnapshot().session.id);
@@ -304,9 +312,9 @@ describe('owner replies and safe steering', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model), undefined, { sessionWorkspaceRoot: null });
     const communication = { source: 'terminal' as const, replyTo: { channel: 'terminal' as const } };
-    const first = session.sendMessage({ text: 'Original request', images: [], communication }, preferences);
+    const first = session.sendMessage({ text: 'Original request', images: [], communication });
     await vi.waitFor(() => expect(started).toBe(true));
-    const second = session.sendMessage({ text: 'Change the current request', images: [], communication }, preferences);
+    const second = session.sendMessage({ text: 'Change the current request', images: [], communication });
     const queued = session.getSnapshot().queuedMessages[0]!;
     session.manageQueuedMessage(queued.id!, 'steer', session.getSnapshot().session.id);
     release();
@@ -361,9 +369,9 @@ describe('owner replies and safe steering', () => {
       // Unlike a custodian chat, a workspace controller has a non-null scope.
       session = new AgentSessionController(runtimeFor(model, registry));
       const communication = { source, replyTo: { channel: 'terminal' as const } };
-      const first = session.sendMessage({ text: 'Inspect the project.', images: [], communication }, preferences);
+      const first = session.sendMessage({ text: 'Inspect the project.', images: [], communication });
       await vi.waitFor(() => expect(started).toBeGreaterThan(0));
-      const second = session.sendMessage({ text: 'Steer: inspect only, do not edit.', images: [], communication }, preferences);
+      const second = session.sendMessage({ text: 'Steer: inspect only, do not edit.', images: [], communication });
       const id = session.getSnapshot().queuedMessages[0]!.id!;
       session.manageQueuedMessage(id, 'steer', session.getSnapshot().session.id);
       release();
@@ -411,20 +419,17 @@ describe('owner replies and safe steering', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
     const communication = { source: 'terminal' as const, replyTo: { channel: 'terminal' as const } };
-    const first = session.sendMessage({ text: 'Initial task', images: [], communication }, preferences);
+    const first = session.sendMessage({ text: 'Initial task', images: [], communication });
     await vi.waitFor(() => expect(started).toBe(true));
-    const notification = session.sendEvent(
-      {
-        text: 'UNRELATED_NOTIFICATION',
-        images: [],
-        communication: { source: 'inbox' },
-        // A foreign project is what makes this notification incompatible; an
-        // effort difference alone never does (the live run governs effort).
-        projectContext: { id: 'project-other', name: 'Other', folders: [] },
-      },
-      { ...preferences, reasoningVariantId: 'different' },
-    );
-    const correction = session.sendMessage({ text: 'OWNER_CORRECTION', images: [], communication }, preferences);
+    const notification = session.sendEvent({
+      text: 'UNRELATED_NOTIFICATION',
+      images: [],
+      communication: { source: 'inbox' },
+      // A foreign project is what makes this notification incompatible; an
+      // effort difference alone never does (the live run governs effort).
+      projectContext: { id: 'project-other', name: 'Other', folders: [] },
+    });
+    const correction = session.sendMessage({ text: 'OWNER_CORRECTION', images: [], communication });
     const owner = session.getSnapshot().queuedMessages.find((message) => message.text === 'OWNER_CORRECTION')!;
     session.manageQueuedMessage(owner.id!, 'steer', session.getSnapshot().session.id);
     release();
@@ -471,25 +476,24 @@ describe('owner replies and safe steering', () => {
     // Web: messages queue until the steer button, so both the promotion path
     // and the foreign-project refusal stay exercisable here.
     const communication = { source: 'web' as const, replyTo: { channel: 'terminal' as const } };
-    const first = session.sendMessage({ text: 'Initial task', images: [], communication }, preferences);
+    const first = session.sendMessage({ text: 'Initial task', images: [], communication });
     await vi.waitFor(() => expect(started).toBe(true));
 
     // The running turn governs the live effort, so a queued message carrying another
     // effort must still be admitted — the owner changed the setting, newest wins.
-    const correction = session.sendMessage(
-      { text: 'Narrow it to the failing case.', images: [], communication },
-      { ...preferences, reasoningVariantId: 'high' },
-    );
+    const correction = session.sendMessage({ text: 'Narrow it to the failing case.', images: [], communication });
     const queued = session.getSnapshot().queuedMessages[0]!;
     expect(queued.steering).toBe(false);
     session.manageQueuedMessage(queued.id!, 'steer', session.getSnapshot().session.id);
     expect(session.getSnapshot().queuedMessages[0]!.steering).toBe(true);
 
     // A different project is a real incompatibility: it stays queued.
-    const foreign = session.sendMessage(
-      { text: 'Start something else.', images: [], communication, projectContext: { id: 'project-x', name: 'Other', folders: [] } },
-      preferences,
-    );
+    const foreign = session.sendMessage({
+      text: 'Start something else.',
+      images: [],
+      communication,
+      projectContext: { id: 'project-x', name: 'Other', folders: [] },
+    });
     const foreignQueued = session.getSnapshot().queuedMessages.find((message) => message.text === 'Start something else.')!;
     expect(() => session!.manageQueuedMessage(foreignQueued.id!, 'steer', session!.getSnapshot().session.id)).toThrow('different project');
     expect(session.getSnapshot().queuedMessages.some((message) => message.text === 'Start something else.' && !message.steering)).toBe(
@@ -543,9 +547,9 @@ describe('owner replies and safe steering', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
     const communication = { source: 'telegram' as const, replyTo: { channel: 'telegram' as const, chatId: '42' } };
-    const first = session.sendMessage({ text: 'Review it.', images: [], eventId: 'first', communication }, preferences);
+    const first = session.sendMessage({ text: 'Review it.', images: [], eventId: 'first', communication });
     await vi.waitFor(() => expect(started).toBe(true));
-    const second = session.sendMessage({ text: 'Do not delete, only read.', images: [], eventId: 'second', communication }, preferences);
+    const second = session.sendMessage({ text: 'Do not delete, only read.', images: [], eventId: 'second', communication });
     const queued = session.getSnapshot().queuedMessages[0]!;
     expect(queued.steering).toBe(false);
     session.manageQueuedMessage(queued.id!, 'steer', session.getSnapshot().session.id);
@@ -623,11 +627,11 @@ describe('owner replies and safe steering', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
     const terminal = { source, replyTo: { channel: 'terminal' as const } };
-    const first = session.sendMessage({ text: 'First task.', images: [], communication: terminal }, preferences);
+    const first = session.sendMessage({ text: 'First task.', images: [], communication: terminal });
     await vi.waitFor(() => expect(started).toBe(true));
-    const second = session.sendMessage({ text: 'Second note alpha.', images: [], communication: terminal }, preferences);
-    const third = session.sendMessage({ text: 'Third note beta.', images: [], communication: terminal }, preferences);
-    const fourth = session.sendMessage({ text: 'Fourth note gamma.', images: [], communication: terminal }, preferences);
+    const second = session.sendMessage({ text: 'Second note alpha.', images: [], communication: terminal });
+    const third = session.sendMessage({ text: 'Third note beta.', images: [], communication: terminal });
+    const fourth = session.sendMessage({ text: 'Fourth note gamma.', images: [], communication: terminal });
     for (const queued of session.getSnapshot().queuedMessages) {
       session.manageQueuedMessage(queued.id!, 'steer', session.getSnapshot().session.id);
     }
@@ -656,15 +660,12 @@ describe('owner replies and safe steering', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model), undefined, { sessionWorkspaceRoot: null });
-    await session.sendMessage(
-      {
-        text: 'hello',
-        images: [],
-        eventId: 'hello',
-        communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
-      },
-      preferences,
-    );
+    await session.sendMessage({
+      text: 'hello',
+      images: [],
+      eventId: 'hello',
+      communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
+    });
     expect(model.doStreamCalls).toHaveLength(2);
     expect(model.doStreamCalls[1]!.tools ?? []).toHaveLength(0);
     expect(session.takeEventRunResult('hello')).toEqual({ error: null, outputs: [{ kind: 'assistant', text: 'Hello!' }] });
@@ -681,15 +682,12 @@ describe('owner replies and safe steering', () => {
       effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
       autoApprove: () => true,
       execute: async () => {
-        next = session!.sendMessage(
-          {
-            text: 'Terminal followup',
-            images: [],
-            eventId: 'terminal',
-            communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
-          },
-          preferences,
-        );
+        next = session!.sendMessage({
+          text: 'Terminal followup',
+          images: [],
+          eventId: 'terminal',
+          communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+        });
         session!.manageQueuedMessage(session!.getSnapshot().queuedMessages[0]!.id!, 'steer', session!.getSnapshot().session.id);
         return { message: 'Tool completed' };
       },
@@ -706,15 +704,12 @@ describe('owner replies and safe steering', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    await session.sendMessage(
-      {
-        text: 'Telegram request',
-        images: [],
-        eventId: 'telegram',
-        communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
-      },
-      preferences,
-    );
+    await session.sendMessage({
+      text: 'Telegram request',
+      images: [],
+      eventId: 'telegram',
+      communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
+    });
     await next;
     expect(model.doStreamCalls).toHaveLength(3);
     expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).not.toContain('Terminal followup');
@@ -755,15 +750,12 @@ describe('owner replies and safe steering', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    await session.sendMessage(
-      {
-        text: 'Inspect',
-        images: [],
-        eventId: 'all',
-        communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
-      },
-      preferences,
-    );
+    await session.sendMessage({
+      text: 'Inspect',
+      images: [],
+      eventId: 'all',
+      communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
+    });
     expect(session.takeEventRunResult('all')?.outputs.map((output) => output.text)).toEqual(answers);
   });
 
@@ -771,10 +763,7 @@ describe('owner replies and safe steering', () => {
     const model = new MockLanguageModelV3({ doGenerate: async () => titleResponse(), doStream: async () => delayedStream([]) });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage(
-      { text: 'Hello', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-      preferences,
-    );
+    await session.sendMessage({ text: 'Hello', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } });
     expect(model.doStreamCalls).toHaveLength(2);
     expect(session.getLastRunError()).toContain('without a user-facing answer');
     expect(session.getSnapshot().session.entries.find((entry) => entry.kind === 'user')?.turnOutcome).toBe('failed');
@@ -796,7 +785,7 @@ describe('restored session model identity', () => {
       runtime.modelId = modelId;
     });
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'Original task', images: [] }, preferences);
+    await session.sendMessage({ text: 'Original task', images: [] });
     session.flushSave();
     const id = session.getSnapshot().session.id;
     runtime.providerId = 'different';
@@ -835,16 +824,16 @@ describe('provider retry reporting', () => {
     const runtime = runtimeFor(second);
     runtime.model = createRotatingModel([first, second], { poolId: 'a'.repeat(64), delaysMs: [] });
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'First', images: [] }, preferences);
+    await session.sendMessage({ text: 'First', images: [] });
     expect(session.getLastRunError()).toBeNull();
     const originalId = session.getSnapshot().session.id;
-    await session.sendMessage({ text: 'Continue', images: [] }, preferences);
+    await session.sendMessage({ text: 'Continue', images: [] });
     expect(first.doStreamCalls).toHaveLength(1);
     session.createNewSession();
-    await session.sendMessage({ text: 'New conversation', images: [] }, preferences);
+    await session.sendMessage({ text: 'New conversation', images: [] });
     expect(first.doStreamCalls).toHaveLength(2);
     expect(session.loadSession(originalId)).not.toBeNull();
-    await session.sendMessage({ text: 'Resume', images: [] }, preferences);
+    await session.sendMessage({ text: 'Resume', images: [] });
     expect(session.getLastRunError()).toBeNull();
     expect(first.doStreamCalls).toHaveLength(2);
   });
@@ -877,7 +866,7 @@ describe('provider retry reporting', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtime);
 
-    const running = session.sendMessage({ text: 'hello', images: [] }, preferences);
+    const running = session.sendMessage({ text: 'hello', images: [] });
     await vi.waitFor(() => expect(report).not.toBeNull());
     const fire = report as unknown as (event: Record<string, unknown>) => void;
     fire({ kind: 'retry', keyIndex: 0, attempt: 0, waitMs: 1_000, error: { statusCode: 429 } });
@@ -919,7 +908,7 @@ describe('provider retry reporting', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtime);
 
-    const running = session.sendMessage({ text: 'hello', images: [] }, preferences);
+    const running = session.sendMessage({ text: 'hello', images: [] });
     await vi.waitFor(() => expect(report).not.toBeNull());
     (report as unknown as (event: Record<string, unknown>) => void)({
       kind: 'rotate',
@@ -957,7 +946,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage({ text: 'hello', images: [] }, preferences);
+    await session.sendMessage({ text: 'hello', images: [] });
 
     const snapshot = session.getSnapshot();
     const reasoningEntries = snapshot.session.entries.filter((entry) => entry.kind === 'reasoning');
@@ -990,7 +979,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage({ text: 'hello', images: [] }, { reasoningVariantId: 'default', showReasoning: false });
+    await session.sendMessage({ text: 'hello', images: [] });
 
     const entries = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
     expect(entries).toHaveLength(1);
@@ -1043,7 +1032,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    const run = session.sendMessage({ text: 'inspect', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'inspect', images: [] });
     try {
       await vi.waitFor(() =>
         expect(session!.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.preparing === true)).toBe(true),
@@ -1099,7 +1088,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    await session.sendMessage({ text: 'inspect', images: [] }, preferences);
+    await session.sendMessage({ text: 'inspect', images: [] });
 
     const blocks = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
     expect(blocks).toHaveLength(1);
@@ -1147,7 +1136,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    await session.sendMessage({ text: 'inspect', images: [] }, preferences);
+    await session.sendMessage({ text: 'inspect', images: [] });
 
     const entries = session.getSnapshot().session.entries;
     // A first message opens the transcript on its own: no day divider precedes it.
@@ -1206,7 +1195,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    const run = session.sendMessage({ text: 'write the file', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'write the file', images: [] });
 
     try {
       await vi.waitFor(() => {
@@ -1276,7 +1265,7 @@ describe('session streaming message boundaries', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    await session.sendMessage({ text: 'inspect', images: [] }, preferences);
+    await session.sendMessage({ text: 'inspect', images: [] });
 
     const entries = session.getSnapshot().session.entries;
     // A first message opens the transcript on its own: no day divider precedes it.
@@ -1322,7 +1311,7 @@ describe('session streaming message boundaries', () => {
     session = new AgentSessionController(runtimeFor(model, registry));
     const sessionId = session.getSnapshot().session.id;
 
-    await session.sendMessage({ text: 'Inspect, then summarize.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect, then summarize.', images: [] });
     session.flushSave();
 
     const saved = loadSavedSession(sessionId)!;
@@ -1379,10 +1368,11 @@ describe('session compaction persistence and continuation', () => {
       execute: async () => {
         executions++;
         if (executions === 1) {
-          void session!.sendMessage(
-            { text: 'Keep the queued constraint.', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-            preferences,
-          );
+          void session!.sendMessage({
+            text: 'Keep the queued constraint.',
+            images: [],
+            communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+          });
           session!.manageQueuedMessage(session!.getSnapshot().queuedMessages[0]!.id!, 'steer', session!.getSnapshot().session.id);
         }
         return { finding: `Original tool result ${executions}. ` + 'Detailed evidence. '.repeat(1_000) };
@@ -1408,10 +1398,11 @@ describe('session compaction persistence and continuation', () => {
       entries: [{ kind: 'user', text: 'Original task: inspect both results.' }],
     });
     const id = session.getSnapshot().session.id;
-    await session.sendMessage(
-      { text: 'Continue the original task.', images: [], communication: { source: 'terminal', replyTo: { channel: 'terminal' } } },
-      preferences,
-    );
+    await session.sendMessage({
+      text: 'Continue the original task.',
+      images: [],
+      communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
+    });
     session.flushSave();
     expect(summaryCalls).toBe(2);
     expect(normalCalls).toBe(4);
@@ -1487,7 +1478,7 @@ describe('session compaction persistence and continuation', () => {
       conversation: [{ role: 'user', content: 'Keep the original task.' }],
     });
     const id = session.getSnapshot().session.id;
-    await session.sendMessage({ text: 'Inspect the evidence.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the evidence.', images: [] });
     session.flushSave();
     // A summarization failure must never cost the owner their message: the run
     // finished, the transcript explains the failure, and no partial checkpoint
@@ -1504,7 +1495,7 @@ describe('session compaction persistence and continuation', () => {
     expect(JSON.stringify(failed.conversation)).toContain('Original completed evidence.');
     expect(JSON.stringify(failed.conversation)).not.toContain('Incomplete checkpoint.');
     expect(failed.conversationArchive).toBeUndefined();
-    await session.sendMessage({ text: 'Retry compaction and continue.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Retry compaction and continue.', images: [] });
     expect(summaryCalls).toBeGreaterThan(1);
     expect(session.getLastRunError()).toBeNull();
   });
@@ -1531,9 +1522,9 @@ describe('session compaction persistence and continuation', () => {
       entries: [{ kind: 'user', text: oversized }],
       conversation: [{ role: 'user', content: oversized }],
     });
-    await session.sendMessage({ text: 'Keep going.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Keep going.', images: [] });
     await session.waitUntilIdle(1000);
-    await session.compact(preferences);
+    await session.compact();
     session.flushSave();
     expect(session.getLastRunError()).toBeNull();
     const notices = session
@@ -1592,13 +1583,13 @@ describe('session compaction persistence and continuation', () => {
       execute: async () => {
         if (!requested) {
           requested = true;
-          await session!.compact(preferences);
+          await session!.compact();
         }
         return { status: 'completed', detail: 'Fixture result' };
       },
     });
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    await session.sendMessage({ text: 'inspect the workspace', images: [] }, preferences);
+    await session.sendMessage({ text: 'inspect the workspace', images: [] });
     // The compaction is requested while the run is in flight; wait for it so the
     // assertion reports the real position instead of racing the run's teardown.
     await vi.waitFor(() => expect(order).toContain('compaction'), { timeout: 2_000, interval: 20 });
@@ -1646,13 +1637,13 @@ describe('session compaction persistence and continuation', () => {
           requested = true;
           // Changing the scope mid-run would move the active turn, so this
           // request may only run once the run has finished.
-          await session!.compact(preferences, false, join(tmpdir(), 'openbutler-other-scope'));
+          await session!.compact(false, join(tmpdir(), 'openbutler-other-scope'));
         }
         return { status: 'completed', detail: 'Fixture result' };
       },
     });
     session = new AgentSessionController(runtimeFor(model, registry), undefined, { sessionWorkspaceRoot: null });
-    await session.sendMessage({ text: 'inspect the workspace', images: [] }, preferences);
+    await session.sendMessage({ text: 'inspect the workspace', images: [] });
     await vi.waitFor(() => expect(order).toContain('compaction'), { timeout: 2_000, interval: 20 });
     expect(order).toEqual(['step-1', 'step-2', 'compaction']);
   });
@@ -1695,7 +1686,7 @@ describe('session compaction persistence and continuation', () => {
       conversation: raw,
     });
     const id = session.getSnapshot().session.id;
-    const pending = session.compact(preferences);
+    const pending = session.compact();
     try {
       await vi.waitFor(
         () => {
@@ -1767,15 +1758,71 @@ describe('session compaction persistence and continuation', () => {
       contextTokens: 90_000,
       contextEstimateTokens: estimateContextTokens(getAgentContext(raw)),
     });
-    const selected = { reasoningVariantId: 'xhigh', showReasoning: true };
-    if (mode === 'manual') await session.compact(selected);
-    else await session.sendMessage({ text: 'Continue.', images: [] }, selected);
+    // The chat owns its effort: the pick is recorded on the session, and both
+    // the compaction request and the admitted turn then run with it.
+    session.setReasoningPreference('xhigh');
+    session.setShowReasoningPreference(true);
+    if (mode === 'manual') await session.compact();
+    else await session.sendMessage({ text: 'Continue.', images: [] });
     expect(model.doStreamCalls).toHaveLength(mode === 'manual' ? 1 : 2);
     for (const request of model.doStreamCalls) expect(request.providerOptions).toEqual(providerOptions);
-    // Manual compaction honors its explicit argument; an admitted message's own
-    // preference now governs its running turn, and an explicit runtime settings
-    // change made mid-turn still overrides it immediately.
+    // The chat's own effort governs the compaction request as well as the
+    // admitted message that triggered it.
     expect(runtime.getReasoningProviderOptions).toHaveBeenCalledWith('xhigh', true);
+  });
+
+  it('resolves the machine default against the ladder of the model this chat runs', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const model = new MockLanguageModelV3({ doStream: [fixtureText('Answer.')] });
+    const runtime = runtimeFor(model);
+    // The runtime holds a model whose ladder does NOT offer "minimal", so the
+    // value it publishes has already been demoted to that model's ladder.
+    runtime.reasoningVariants = [
+      { id: 'default', label: 'Default', providerOptions: {} },
+      { id: 'low', label: 'Low', providerOptions: {} },
+      { id: 'medium', label: 'Medium', providerOptions: {} },
+      { id: 'high', label: 'High', providerOptions: {} },
+    ];
+    runtime.reasoningDefault = 'low';
+    // The raw machine preference is "minimal".
+    runtime.reasoningPreference = 'minimal';
+    // This chat runs a model whose ladder DOES offer "minimal".
+    // The provider options come from the model STATE this chat runs with, not
+    // from the runtime's own model, so the spy below sees the effort the chat
+    // actually asked for.
+    const stateOptions = vi.fn(() => ({}));
+    runtime.modelFor = async () => ({
+      providerId: 'fixture',
+      modelId: 'fixture',
+      modelName: 'Local streaming fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: null,
+      outputLimitTokens: null,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [
+        { id: 'default', label: 'Default', providerOptions: {} },
+        { id: 'minimal', label: 'Minimal', providerOptions: {} },
+        { id: 'low', label: 'Low', providerOptions: {} },
+        { id: 'medium', label: 'Medium', providerOptions: {} },
+      ],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'available',
+      getReasoningProviderOptions: stateOptions,
+      registry: new ToolRegistry(),
+    });
+    runtime.getReasoningProviderOptions = vi.fn(() => ({}));
+    session = new AgentSessionController(runtime);
+    session.openSession(createSession('fixture', 'fixture'));
+    // The chat never chose an effort, so it inherits the machine default.
+    await session.sendMessage({ text: 'Hello.', images: [] });
+    // The inherited default is resolved against THIS chat's ladder, so the
+    // raw "minimal" survives instead of the runtime's demoted "low", and the
+    // chat's own model state is the one that maps it to provider options.
+    expect(stateOptions).toHaveBeenCalledWith('minimal', true);
   });
 
   it('reuses the frozen system prompt for the compaction request and refreshes it only after the summary', async () => {
@@ -1793,7 +1840,7 @@ describe('session compaction persistence and continuation', () => {
     session = new AgentSessionController(runtime);
 
     // First turn freezes the prompt; the provider caches system + messages.
-    await session.sendMessage({ text: 'first', images: [] }, preferences);
+    await session.sendMessage({ text: 'first', images: [] });
     const firstRequest = model.doStreamCalls[0]!;
     expect(firstRequest.prompt[0]!.role).toBe('system');
     const frozenSystem = firstRequest.prompt[0]!.content;
@@ -1805,7 +1852,7 @@ describe('session compaction persistence and continuation', () => {
     expect(buildAgentSystem(runtime.workspaceRoot)).not.toBe(frozenSystem);
 
     // The compaction request must share that prefix: only its appended prompt is new.
-    await session.compact(preferences);
+    await session.compact();
     expect(model.doStreamCalls).toHaveLength(2);
     const compactionRequest = model.doStreamCalls[1]!;
     expect(JSON.stringify(compactionRequest.prompt)).toContain(COMPACTION_PROMPT.slice(0, 40));
@@ -1817,7 +1864,7 @@ describe('session compaction persistence and continuation', () => {
 
     // The refresh lands after the summary, so the next turn reads fresh
     // reference data and pays for it once, at the prefix boundary.
-    await session.sendMessage({ text: 'second', images: [] }, preferences);
+    await session.sendMessage({ text: 'second', images: [] });
     const refreshed = model.doStreamCalls[2]!.prompt[0]!.content;
     expect(refreshed).toBe(buildAgentSystem(runtime.workspaceRoot));
     expect(refreshed).not.toBe(frozenSystem);
@@ -1860,7 +1907,7 @@ describe('session compaction persistence and continuation', () => {
     session.flushSave();
     const { loadSavedSession } = await import('../src/session-store.js');
     expect(loadSavedSession(session.getSnapshot().session.id)!.conversation).toEqual(raw);
-    await session.sendMessage({ text: 'Continue.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Continue.', images: [] });
     expect(model.doStreamCalls).toHaveLength(2);
     expect(model.doStreamCalls[0]!.prompt.at(-1)).toEqual({ role: 'user', content: [{ type: 'text', text: COMPACTION_PROMPT }] });
     expect(model.doStreamCalls[1]!.prompt.at(-1)).not.toEqual(model.doStreamCalls[0]!.prompt.at(-1));
@@ -1902,7 +1949,7 @@ describe('session compaction persistence and continuation', () => {
       contextTokens: 258_950,
       contextEstimateTokens: estimateContextTokens(getAgentContext(raw)),
     });
-    await session.compact({ reasoningVariantId: 'xhigh', showReasoning: true }, true);
+    await session.compact(true);
     session.flushSave();
     const saved = loadSavedSession(session.getSnapshot().session.id)!;
     expect(model.doStreamCalls).toHaveLength(1);
@@ -1957,7 +2004,7 @@ describe('session compaction persistence and continuation', () => {
       conversation: raw,
     });
     const id = session.getSnapshot().session.id;
-    await session.compact(preferences);
+    await session.compact();
     session.flushSave();
     const checkpoint = loadSavedSession(id)!;
     expect(checkpoint.conversationArchive).toEqual(source);
@@ -1965,14 +2012,14 @@ describe('session compaction persistence and continuation', () => {
     expect(checkpoint.conversation).toContainEqual({ role: 'assistant', content: [{ type: 'text', text: 'Inspecting src/runtime.ts.' }] });
     expect(JSON.stringify(checkpoint.conversation)).not.toContain(reasoning);
 
-    await session.sendMessage({ text: 'Continue safely.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Continue safely.', images: [] });
     session.flushSave();
     const resumed = loadSavedSession(id)!;
     expect(resumed.contextTokens).toBe(100);
     expect(resumed.contextEstimateTokens).toBeGreaterThan(0);
     expect(resumed.conversationArchive!.slice(0, 3)).toEqual(source);
     expect(resumed.conversationArchive).toHaveLength(5);
-    await session.compact(preferences);
+    await session.compact();
     session.flushSave();
     const repeated = loadSavedSession(id)!;
     expect(repeated.conversationArchive).toEqual(resumed.conversationArchive);
@@ -2012,7 +2059,7 @@ describe('session compaction persistence and continuation', () => {
       contextTokens: 90_000,
     });
     const id = session.getSnapshot().session.id;
-    await session.compact(preferences);
+    await session.compact();
     session.flushSave();
     const saved = loadSavedSession(id)!;
     expect(saved.conversation).toEqual(source);
@@ -2022,7 +2069,7 @@ describe('session compaction persistence and continuation', () => {
       expect.objectContaining({ kind: 'assistant', text: 'Incomplete checkpoint must not be committed.' }),
     );
     expect(saved.entries.some((entry) => entry.kind === 'notice' && entry.text.includes('Compaction failed:'))).toBe(true);
-    await session.sendMessage({ text: 'Continue.', images: [] }, preferences);
+    await session.sendMessage({ text: 'Continue.', images: [] });
     const resumedPrompt = JSON.stringify(model.doStreamCalls[1]!.prompt);
     expect(resumedPrompt).toContain('The unfinished original request.');
     expect(resumedPrompt).not.toContain('Incomplete checkpoint');
@@ -2049,7 +2096,7 @@ describe('session questions', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    const run = session.sendMessage({ text: 'deploy', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'deploy', images: [] });
 
     await vi.waitFor(() => {
       expect(session!.getSnapshot().pendingQuestion).not.toBeNull();
@@ -2079,7 +2126,7 @@ describe('session questions', () => {
     });
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(model, registry));
-    const run = session.sendMessage({ text: 'go', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'go', images: [] });
 
     await vi.waitFor(() => {
       expect(session!.getSnapshot().pendingQuestion).not.toBeNull();
@@ -2108,7 +2155,7 @@ describe('session questions', () => {
       background: true,
       autoApprove: () => true,
     });
-    await session.sendMessage({ text: 'deploy', images: [] }, preferences);
+    await session.sendMessage({ text: 'deploy', images: [] });
 
     const snapshot = session.getSnapshot();
     expect(snapshot.pendingQuestion).toBeNull();
@@ -2145,7 +2192,7 @@ describe('session activity reporting', () => {
     session = new AgentSessionController(runtimeFor(model));
     const id = session.getSnapshot().session.id;
 
-    const run = session.sendMessage({ text: 'Do the work.', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'Do the work.', images: [] });
     expect(isSessionActive(id)).toBe(true);
     await run;
     expect(isSessionActive(id)).toBe(false);
@@ -2194,21 +2241,21 @@ describe('session activity reporting', () => {
         ),
     });
     session = new AgentSessionController(runtimeFor(model));
-    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'First request.', images: [] });
     // Wait until the stream is actually flowing so the queued message cannot be drained mid-run.
     await vi.waitFor(() =>
       expect(
         session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
       ).toBe(true),
     );
-    void session.sendMessage({ text: 'Second request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'Second request.', images: [] });
     await vi.waitFor(() => expect(session!.getSnapshot().queuedMessageCount).toBe(1));
 
     session.stop({ keepQueue: true });
     // The aborted run ends and the preserved input starts automatically in a fresh turn.
     await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
     expect(session.getSnapshot().queuedMessageCount).toBe(0);
-    void session.sendMessage({ text: 'Third request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'Third request.', images: [] });
     await vi.waitFor(() =>
       expect(session!.getSnapshot().session.entries.some((entry) => entry.kind === 'user' && entry.text === 'Second request.')).toBe(true),
     );
@@ -2230,13 +2277,13 @@ describe('session activity reporting', () => {
         ),
     });
     session = new AgentSessionController(runtimeFor(plainModel));
-    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'First request.', images: [] });
     await vi.waitFor(() =>
       expect(
         session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
       ).toBe(true),
     );
-    void session.sendMessage({ text: 'Second request.', images: [] }, preferences).catch(() => {});
+    void session.sendMessage({ text: 'Second request.', images: [] }).catch(() => {});
     await vi.waitFor(() => expect(session!.getSnapshot().queuedMessageCount).toBe(1));
 
     session.stop();
@@ -2285,13 +2332,13 @@ describe('session activity reporting', () => {
       doStream: vi.fn().mockImplementation(async () => answer(`answer-${calls + 1}`, `Answer ${calls + 1}.`)()),
     });
     session = new AgentSessionController(runtimeFor(model));
-    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'First request.', images: [] });
     await vi.waitFor(() =>
       expect(
         session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
       ).toBe(true),
     );
-    void session.sendMessage({ text: 'Second request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'Second request.', images: [] });
     await vi.waitFor(() => expect(session!.getSnapshot().queuedMessageCount).toBe(1));
 
     session.stop({ keepQueue: true, holdQueue: true });
@@ -2307,7 +2354,7 @@ describe('session activity reporting', () => {
     expect(heldEntries()[0]!.turnOutcome).toBeUndefined();
 
     // The next explicit send releases the hold: held and new messages resume in order.
-    void session.sendMessage({ text: 'Third request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'Third request.', images: [] });
     await vi.waitFor(() =>
       expect(session!.getSnapshot().session.entries.some((entry) => entry.kind === 'user' && entry.text === 'Third request.')).toBe(true),
     );
@@ -2358,7 +2405,7 @@ describe('session activity reporting', () => {
       }),
     });
     session = new AgentSessionController(runtimeFor(model));
-    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'First request.', images: [] });
     await vi.waitFor(() =>
       expect(
         session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
@@ -2368,7 +2415,7 @@ describe('session activity reporting', () => {
 
     // The send lands synchronously inside the abort window: the run is still busy.
     session.stop({ keepQueue: true, holdQueue: true });
-    void session.sendMessage({ text: 'After stop.', images: [] }, preferences);
+    void session.sendMessage({ text: 'After stop.', images: [] });
 
     await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
     // The Esc contract in the race window: delivered to the chat, no restart, nothing stuck.
@@ -2389,7 +2436,7 @@ describe('session activity reporting', () => {
 
     // The next explicit send releases the hold: held and new messages run in order,
     // and the already-materialised entry is delivered exactly once.
-    void session.sendMessage({ text: 'Third request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'Third request.', images: [] });
     await vi.waitFor(() => expect(users().find((entry) => entry.text === 'After stop.')?.turnOutcome).toBe('completed'));
     expect(users().filter((entry) => entry.text === 'After stop.')).toHaveLength(1);
     await vi.waitFor(() => expect(session!.getSnapshot().busy).toBe(false));
@@ -2435,13 +2482,13 @@ describe('session activity reporting', () => {
       }),
     });
     session = new AgentSessionController(runtimeFor(model));
-    void session.sendMessage({ text: 'First request.', images: [] }, preferences);
+    void session.sendMessage({ text: 'First request.', images: [] });
     await vi.waitFor(() =>
       expect(
         session!.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('Still working')),
       ).toBe(true),
     );
-    void session.sendMessage({ text: 'Queued before stop.', images: [] }, preferences).catch(() => {});
+    void session.sendMessage({ text: 'Queued before stop.', images: [] }).catch(() => {});
     await vi.waitFor(() => expect(session!.getSnapshot().queuedMessageCount).toBe(1));
 
     session.stop({ keepQueue: true, holdQueue: true });
@@ -2499,12 +2546,12 @@ describe('run turn identity at send time', () => {
       }),
     });
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage({ text: 'first message', images: [] }, preferences);
+    await session.sendMessage({ text: 'first message', images: [] });
     expect(session.getSnapshot().busy).toBe(false);
     const entriesBefore = session.getSnapshot().session.entries;
     const lastBefore = entriesBefore[entriesBefore.length - 1];
     holdNextRun = true;
-    const run = session.sendMessage({ text: 'second message', images: [] }, preferences);
+    const run = session.sendMessage({ text: 'second message', images: [] });
     // The queue runner marks the run busy synchronously, but the message's entry
     // only lands after the agent modules load. There is a published window in
     // which the run is busy while the transcript still ends with the previous
@@ -2539,10 +2586,10 @@ describe('run turn identity at send time', () => {
       doStream: async () => fixtureText('Checkpoint: the fixture conversation is condensed.'),
     });
     session = new AgentSessionController(runtimeFor(model));
-    await session.sendMessage({ text: 'first message', images: [] }, preferences);
+    await session.sendMessage({ text: 'first message', images: [] });
     const userEntry = session.getSnapshot().session.entries.find((entry) => entry.kind === 'user')!;
     expect(userEntry.turnId).toBeDefined();
-    const compaction = session.compact(preferences);
+    const compaction = session.compact();
     // compact() marks the run busy synchronously; the compaction row lands in
     // the turn the transcript already ends in, but a standalone compaction is
     // a boundary, never a running turn: reporting one here re-opened the
@@ -2616,18 +2663,18 @@ describe('stored transcript dividers', () => {
   it('opens a new chat with no day divider and separates only a later day', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(dividerModel()));
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     // Nothing stood above the first message, so there was no boundary to draw.
     expect(dayDividersOf(session)).toHaveLength(0);
 
-    await session.sendMessage({ text: 'Second message', images: [] }, preferences);
+    await session.sendMessage({ text: 'Second message', images: [] });
     await session.waitUntilIdle(1000);
     expect(dayDividersOf(session)).toHaveLength(0);
 
     // With an entry from an earlier day in place, the break returns above the next message.
     session.addEntry({ kind: 'notice', text: 'archived earlier', at: Date.now() - 2 * 86_400_000 });
-    await session.sendMessage({ text: 'Back after a gap', images: [] }, preferences);
+    await session.sendMessage({ text: 'Back after a gap', images: [] });
     await session.waitUntilIdle(1000);
     const dayDividers = dayDividersOf(session);
     expect(dayDividers).toHaveLength(1);
@@ -2643,7 +2690,7 @@ describe('stored transcript dividers', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     session = new AgentSessionController(runtimeFor(dividerModel()));
     session.addEntry({ kind: 'notice', text: 'archived earlier', at: Date.now() - 2 * 86_400_000 });
-    await session.sendMessage({ text: 'Back after a gap', images: [] }, preferences);
+    await session.sendMessage({ text: 'Back after a gap', images: [] });
     await session.waitUntilIdle(1000);
     const dayDividers = dayDividersOf(session);
     expect(dayDividers).toHaveLength(1);
@@ -2655,18 +2702,20 @@ describe('stored transcript dividers', () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const runtime = runtimeFor(dividerModel());
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'Baseline', images: [] }, preferences);
+    await session.sendMessage({ text: 'Baseline', images: [] });
     await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Reasoning effort')).toHaveLength(0);
 
-    runtime.reasoningDefault = 'high';
-    await session.sendMessage({ text: 'Uses the new effort', images: [] }, preferences);
+    // The machine default a chat inherits is the RAW preference; the chat
+    // resolves it against its own levels.
+    runtime.reasoningPreference = 'high';
+    await session.sendMessage({ text: 'Uses the new effort', images: [] });
     await session.waitUntilIdle(1000);
     const effort = dividersOf(session, 'Reasoning effort');
     expect(effort).toHaveLength(1);
     expect(effort[0]!.text).toBe('Reasoning effort changed from "default" to "high"');
 
-    await session.sendMessage({ text: 'Quiet again', images: [] }, preferences);
+    await session.sendMessage({ text: 'Quiet again', images: [] });
     await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Reasoning effort')).toHaveLength(1);
 
@@ -2685,7 +2734,7 @@ describe('stored transcript dividers', () => {
     const runtime = runtimeFor(dividerModel());
     runtime.restoreModel = async () => {};
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
 
     await session.selectModel('other', 'other-model');
@@ -2695,13 +2744,13 @@ describe('stored transcript dividers', () => {
     await session.selectModel('other', 'other-model');
     expect(dividersOf(session, 'Model changed')).toHaveLength(0);
 
-    await session.sendMessage({ text: 'Runs under the new model', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the new model', images: [] });
     await session.waitUntilIdle(1000);
     const model = dividersOf(session, 'Model changed');
     expect(model).toHaveLength(1);
     expect(model[0]!.text).toBe('Model changed from "fixture" to "other-model"');
 
-    await session.sendMessage({ text: 'Still the new model', images: [] }, preferences);
+    await session.sendMessage({ text: 'Still the new model', images: [] });
     await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Model changed')).toHaveLength(1);
   });
@@ -2727,7 +2776,7 @@ describe('session-owned reasoning', () => {
 
     // The message carries another effort: the session still wins, and the
     // machine default in the runtime is never written.
-    await session.sendMessage({ text: 'Uses the session choice', images: [] }, preferences);
+    await session.sendMessage({ text: 'Uses the session choice', images: [] });
     await session.waitUntilIdle(1000);
     expect(seen[0]).toBe('high');
     expect(runtime.reasoningDefault).toBe('default');
@@ -2753,7 +2802,7 @@ describe('session-owned reasoning', () => {
       return {};
     };
     session = new AgentSessionController(runtime);
-    await session.sendMessage({ text: 'No choice made', images: [] }, { reasoningVariantId: 'default', showReasoning: false });
+    await session.sendMessage({ text: 'No choice made', images: [] });
     await session.waitUntilIdle(1000);
     expect(seen[0]).toBe('default');
     expect(session.getSnapshot().session.reasoning).toBeUndefined();
@@ -2814,7 +2863,7 @@ describe('session-owned reasoning', () => {
       sessionWorkspaceRoot: null,
       pendingReports: () => pendingLine,
     });
-    const turn = session.sendMessage({ text: 'Owner task.', images: [] }, preferences);
+    const turn = session.sendMessage({ text: 'Owner task.', images: [] });
     await vi.waitFor(() => expect(started).toBe(true));
     // The report lands while the turn is waiting on a tool, so only the next step can see it.
     pendingLine = '[Host context: 1 report waiting from below - a1b2c3d4 "Refactor": 1 result. Read them with inbox.]';

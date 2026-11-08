@@ -13,7 +13,6 @@ const usage = {
   inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 20, text: 20, reasoning: 0 },
 };
-const preferences = { reasoningVariantId: 'default', showReasoning: false };
 
 function stream(parts: LanguageModelV3StreamPart[], reason: 'stop' | 'tool-calls' = 'stop') {
   return {
@@ -116,6 +115,7 @@ function runtime(): AgentEnvironment {
     reasoningMetadataSource: null,
     reasoningSupport: 'model-unsupported',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: false,
     saveShowReasoningPreference: () => {},
@@ -222,7 +222,9 @@ describe('auto-review records its verdict and still lets the decision through', 
     environment.getReasoningProviderOptions = () => providerOptions;
     const { AgentSessionController } = await import('../src/agent-session.js');
     controller = new AgentSessionController(environment, (action) => ledger.recordToolAction(action));
-    await controller.sendMessage({ text: 'Inspect the fixture', images: [] }, { reasoningVariantId: 'xhigh', showReasoning: false });
+    controller.setReasoningPreference('xhigh');
+    controller.setShowReasoningPreference(false);
+    await controller.sendMessage({ text: 'Inspect the fixture', images: [] });
     expect(execute).toHaveBeenCalledOnce();
     // The title is metadata: the run hands it to a background task instead of
     // waiting for it, so the request lands after sendMessage resolves.
@@ -249,7 +251,7 @@ describe('auto-review records its verdict and still lets the decision through', 
       .mockImplementationOnce(async () => toolCallStream('inspect', 'call-1'))
       .mockImplementationOnce(async () => toolCallStream('inspect', 'call-2'))
       .mockImplementation(async () => textStream('Auto-review fixture complete'));
-    await session.sendMessage({ text: 'Inspect the fixture twice', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the fixture twice', images: [] });
 
     expect(execute).toHaveBeenCalledTimes(2);
     expect(reviewer).toHaveBeenCalledOnce();
@@ -277,7 +279,7 @@ describe('auto-review records its verdict and still lets the decision through', 
       .mockImplementationOnce(async () => toolCallStream('inspect', 'call-2'))
       .mockImplementation(async () => textStream('Second attempt complete.'));
 
-    await session.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the fixture', images: [] });
     expect(execute).not.toHaveBeenCalled();
     expect(reviewer).toHaveBeenCalledTimes(1);
 
@@ -286,7 +288,7 @@ describe('auto-review records its verdict and still lets the decision through', 
     expect(denied).toMatchObject({ name: 'inspect' });
     expect(overrides.approveDeniedAction(denied!.fingerprint)).toBeTruthy();
 
-    await session.sendMessage({ text: 'Inspect the fixture again', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the fixture again', images: [] });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(reviewer).toHaveBeenCalledTimes(2);
     expect(seen[1]).toMatchObject({ userOverride: true });
@@ -300,7 +302,7 @@ describe('auto-review records its verdict and still lets the decision through', 
       seen.push(options);
       return verdict();
     }) as never);
-    await session.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the fixture', images: [] });
 
     expect(execute).toHaveBeenCalledTimes(1);
     // The fixture tool declares no workspace scope, so review carries the gate reason.
@@ -336,14 +338,14 @@ describe('auto-review records its verdict and still lets the decision through', 
         return verdict();
       }) as never,
     });
-    await controller.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await controller.sendMessage({ text: 'Inspect the fixture', images: [] });
     expect(seen[0]).toBe(reviewModel);
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('denies without executing and stops nothing else when the reviewer rejects the action', async () => {
     const session = await startSession(async () => verdict({ verdict: 'deny', risk: 'high', reason: 'Outside the request.' }));
-    await session.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await session.sendMessage({ text: 'Inspect the fixture', images: [] });
 
     expect(execute).not.toHaveBeenCalled();
     const [row] = ledger.listActions();
@@ -359,7 +361,7 @@ describe('auto-review records its verdict and still lets the decision through', 
   it('escalates to the user, records why, and executes only after the human allows it', async () => {
     const session = await startSession(async () => verdict({ verdict: 'escalate', confidence: 'medium', reason: 'Not enough evidence.' }));
 
-    const sending = session.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    const sending = session.sendMessage({ text: 'Inspect the fixture', images: [] });
     await vi.waitFor(() => expect(session.getSnapshot().pendingApprovalId).toBeTruthy());
     const [row] = ledger.listActions();
     expect(ledger.actionTransitions(row!.requestId).map((entry) => entry.state)).toEqual(['proposed', 'reviewed']);
@@ -382,7 +384,7 @@ describe('auto-review records its verdict and still lets the decision through', 
   it('asks the user when the reviewer is unavailable instead of failing the run', async () => {
     const session = await startSession(async () => ({ status: 'unavailable', code: 'timeout', reason: 'Reviewer timed out.' }));
 
-    const sending = session.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    const sending = session.sendMessage({ text: 'Inspect the fixture', images: [] });
     await vi.waitFor(() => expect(session.getSnapshot().pendingApprovalId).toBeTruthy());
 
     const [row] = ledger.listActions();
@@ -411,7 +413,7 @@ describe('auto-review records its verdict and still lets the decision through', 
       { autoReviewer: (async () => verdict()) as never },
     );
 
-    await controller.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await controller.sendMessage({ text: 'Inspect the fixture', images: [] });
 
     expect(refused).toEqual(['reviewed']);
     expect(execute).toHaveBeenCalledTimes(1);
@@ -432,7 +434,7 @@ describe('auto-review records its verdict and still lets the decision through', 
       { autoReviewer: (async () => verdict()) as never },
     );
 
-    await controller.sendMessage({ text: 'Inspect the fixture', images: [] }, preferences);
+    await controller.sendMessage({ text: 'Inspect the fixture', images: [] });
 
     expect(execute).not.toHaveBeenCalled();
     const [row] = ledger.listActions();

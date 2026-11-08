@@ -8,7 +8,6 @@ import type {
   AgentSessionRuntimeView,
   AgentSessionSnapshot,
   AgentSessionView,
-  AgentTurnPreferences,
   ApprovalDecision,
   QueuedMessage,
 } from './agent-session.js';
@@ -121,8 +120,10 @@ class DaemonSessionClient implements AgentSessionClient {
       reasoningMetadataSource: null,
       reasoningSupport: 'model-unsupported',
       reasoningDefault: 'default',
+      reasoningPreference: 'default',
       saveReasoningPreference: (variantId) => {
         this.runtime.reasoningDefault = variantId;
+        this.runtime.reasoningPreference = variantId;
         void this.request('runtime.save-reasoning', { variantId }).catch(() => {});
       },
       showReasoningDefault: true,
@@ -239,8 +240,8 @@ class DaemonSessionClient implements AgentSessionClient {
     void this.request('session.stop', payload).catch((error: unknown) => this.addLocalNotice(error));
   }
 
-  sendMessage(message: QueuedMessage, preferences: AgentTurnPreferences): Promise<void> {
-    return this.request('session.send', { message, preferences }).then(
+  sendMessage(message: QueuedMessage): Promise<void> {
+    return this.request('session.send', { message }).then(
       () => undefined,
       (error: unknown) => {
         const text = error instanceof Error ? error.message : String(error);
@@ -260,8 +261,8 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.request('session.queue', { messageId: id, queueAction: action, sessionId }).then(() => undefined);
   }
 
-  compact(preferences: AgentTurnPreferences, recovery = false): Promise<void> {
-    return this.submit('session.compact', { preferences, ...(recovery ? { recovery: true } : {}) });
+  compact(recovery = false): Promise<void> {
+    return this.submit('session.compact', { ...(recovery ? { recovery: true } : {}) });
   }
 
   // The host resolves the name against the shared command registry, so this
@@ -281,6 +282,11 @@ class DaemonSessionClient implements AgentSessionClient {
    */
   setReasoningPreference(variantId: string): Promise<void> {
     return this.request('runtime.save-reasoning', { variantId }).then(() => undefined);
+  }
+
+  /** The visibility belongs to this chat, exactly like the effort does. */
+  setShowReasoningPreference(visible: boolean): Promise<void> {
+    return this.request('runtime.save-show-reasoning', { visible }).then(() => undefined);
   }
 
   setApprovalMode(mode: ApprovalMode): Promise<void> {

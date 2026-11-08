@@ -71,6 +71,7 @@ function runtimeFor(model: MockLanguageModelV3, registry = new ToolRegistry()): 
     reasoningMetadataSource: null,
     reasoningSupport: 'available',
     reasoningDefault: 'default',
+    reasoningPreference: 'default',
     saveReasoningPreference: () => {},
     showReasoningDefault: true,
     saveShowReasoningPreference: () => {},
@@ -124,8 +125,6 @@ afterEach(async () => {
   }
   rmSync(dataDir, { recursive: true, force: true });
 });
-
-const preferences = { reasoningVariantId: 'default', showReasoning: true };
 
 const dividersOf = (target: AgentSessionController, prefix: string) =>
   target
@@ -195,7 +194,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     });
     session = new AgentSessionController(runtime);
 
-    const turn = session.sendMessage({ text: 'Runs under the old model', images: [] }, preferences);
+    const turn = session.sendMessage({ text: 'Runs under the old model', images: [] });
     await vi.waitFor(() => expect(started).toBe(true));
 
     // The pick is accepted while the run is going.
@@ -214,7 +213,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     expect(runtime.modelId).toBe('fixture');
 
     // The next message runs with the picked model, and the transcript says so.
-    await session.sendMessage({ text: 'Runs under the new model', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the new model', images: [] });
     await session.waitUntilIdle(1000);
     // The picked model ran the turn...
     expect(otherModel.doStreamCalls.length).toBeGreaterThan(0);
@@ -262,7 +261,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     session = new AgentSessionController(runtime);
     session.setReasoningPreference('high');
 
-    await session.sendMessage({ text: 'Runs under the admitted effort', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the admitted effort', images: [] });
     await session.waitUntilIdle(1000);
     // Both steps of the running turn used the effort the turn was admitted with.
     expect(seen).toEqual(['high', 'high']);
@@ -275,7 +274,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     ];
 
     // The next turn takes the new effort, and the transcript marks the change.
-    await session.sendMessage({ text: 'Runs under the new effort', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the new effort', images: [] });
     await session.waitUntilIdle(1000);
     expect(seen).toEqual(['high', 'high', 'low']);
     const changed = dividersOf(session, 'Reasoning effort');
@@ -300,7 +299,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     };
     session = new AgentSessionController(runtime);
 
-    await session.sendMessage({ text: 'Baseline', images: [] }, preferences);
+    await session.sendMessage({ text: 'Baseline', images: [] });
     await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Model changed')).toHaveLength(0);
 
@@ -311,7 +310,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     // A pick is a choice, not a message: nothing has run under it yet.
     expect(dividersOf(session, 'Model changed')).toHaveLength(0);
 
-    await session.sendMessage({ text: 'Runs under the new model', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the new model', images: [] });
     await session.waitUntilIdle(1000);
     const changed = dividersOf(session, 'Model changed');
     expect(changed).toHaveLength(1);
@@ -332,12 +331,12 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     };
     session = new AgentSessionController(runtime);
 
-    await session.sendMessage({ text: 'Baseline', images: [] }, preferences);
+    await session.sendMessage({ text: 'Baseline', images: [] });
     await session.waitUntilIdle(1000);
     expect(dividersOf(session, 'Reasoning effort')).toHaveLength(0);
 
     session.setReasoningPreference('high');
-    await session.sendMessage({ text: 'Runs under the new effort', images: [] }, preferences);
+    await session.sendMessage({ text: 'Runs under the new effort', images: [] });
     await session.waitUntilIdle(1000);
     expect(seen).toEqual(['default', 'high']);
     const changed = dividersOf(session, 'Reasoning effort');
@@ -363,7 +362,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     session.setReasoningPreference('high');
     expect(dividersOf(session, 'Reasoning effort')).toHaveLength(0);
 
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     // The first message already runs with the picked effort.
     expect(seen).toEqual(['high']);
@@ -391,7 +390,7 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     ]);
     expect(dividersOf(session, 'Model changed')).toHaveLength(0);
 
-    await session.sendMessage({ text: 'First message', images: [] }, preferences);
+    await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     const changed = dividersOf(session, 'Model changed');
     expect(changed).toHaveLength(1);

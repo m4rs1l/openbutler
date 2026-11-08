@@ -176,7 +176,7 @@ describe('live runtime settings', () => {
       expect(controller.getSnapshot().session.entries).toEqual([]);
       await deferred.reloadSettings!(true);
       expect(calls.reloadMcp).not.toHaveBeenCalled();
-      const turn = controller.sendMessage({ text: 'First message', images: [] }, { reasoningVariantId: 'default', showReasoning: false });
+      const turn = controller.sendMessage({ text: 'First message', images: [] });
       await vi.waitFor(() => expect(calls.reloadMcp).toHaveBeenCalledWith(settings.loadSettings().mcpServers));
       expect(stream).not.toHaveBeenCalled();
       release(true);

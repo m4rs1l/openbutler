@@ -64,6 +64,7 @@ function runtime(): RuntimeViewData {
     reasoningMetadataSource: null,
     reasoningSupport: 'available',
     reasoningDefault: 'low',
+    reasoningPreference: 'low',
     showReasoningDefault: true,
   };
 }

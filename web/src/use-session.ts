@@ -417,7 +417,7 @@ export function useSession() {
       operation.current = false;
     }
   };
-  const send = async (text: string, images: DraftImage[] = [], reasoningVariantId?: string) => {
+  const send = async (text: string, images: DraftImage[] = []) => {
     const draft = draftChat.current;
     if (!sessionId || status !== 'open' || (operation.current && !draft?.creation)) throw new Error('Wait until the chat is connected.');
     let target = sessionId;
@@ -452,7 +452,7 @@ export function useSession() {
         setChanging(false);
       }
     }
-    await api.sendMessage(text, target, images, reasoningVariantId);
+    await api.sendMessage(text, target, images);
     // Only a successful send requests the tail. Paging in an older user message
     // or reconnecting the stream must not steal the reader's position.
     setFollowRequest((value) => value + 1);

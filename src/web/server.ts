@@ -1279,22 +1279,15 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const currentSession = client.getSnapshot().session;
       if (!currentSession.project && !currentSession.hasUserMessage && client.selectProject && client.runtime.supportsProjects)
         await client.selectProject(null, currentSession.id);
-      const reasoningVariantId =
-        typeof body.reasoningVariantId === 'string' ? body.reasoningVariantId : (client.runtime.reasoningDefault ?? 'default');
-      // The picker offered this chat's own levels. The runtime is shared and may
-      // still be bound to another chat's model, so its list must not refuse a
-      // send whose effort this session does offer.
-      const offered = currentSession.reasoningVariants ?? client.runtime.reasoningVariants;
-      if (body.reasoningVariantId !== undefined && !offered.some((variant) => variant.id === reasoningVariantId))
-        return sendJson(res, 400, { error: 'Choose a supported reasoning level.' });
+      // The chat owns its effort and visibility: the picker records them with
+      // the session, so a message carries neither and no surface can move the
+      // chat from the outside.
       // The run outlives this request. Waiting for it here made a phone browser
       // abandon the request with a network error on any long turn, so the message
       // is handed over and the answer returns at once; progress arrives over SSE.
-      void client
-        .sendMessage({ text, images }, { reasoningVariantId, showReasoning: client.runtime.showReasoningDefault })
-        .catch((problem: unknown) => {
-          logger.warn('web.message.failed', { error: problem instanceof Error ? problem.message : String(problem) });
-        });
+      void client.sendMessage({ text, images }).catch((problem: unknown) => {
+        logger.warn('web.message.failed', { error: problem instanceof Error ? problem.message : String(problem) });
+      });
       return sendJson(res, 200, { ok: true });
     }
 
@@ -1354,16 +1347,9 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const commands = client as CommandCapableClient;
       if (!commands.command) return sendJson(res, 409, { error: 'Commands require an updated host.' });
       const payload: Record<string, unknown> = {};
-      // A compaction carries turn preferences, and they belong to this session's
-      // runtime rather than to the browser: the host builds them exactly as
-      // `/api/message` does, so a client cannot pick the effort a summary runs
-      // with. The host is authoritative for what a command means and how it runs.
-      if (daemonCommandAction(body.name) === 'session.compact') {
-        payload.preferences = {
-          reasoningVariantId: client.runtime.reasoningDefault ?? 'default',
-          showReasoning: client.runtime.showReasoningDefault,
-        };
-      }
+      // A compaction runs with the chat's own effort and visibility. The
+      // browser declares nothing about them: the host is authoritative for
+      // what a command means and how it runs.
       if (body.keepQueue !== undefined) payload.keepQueue = body.keepQueue;
       if (body.holdQueue !== undefined) payload.holdQueue = body.holdQueue;
       await commands.command(body.name, payload);

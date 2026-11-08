@@ -87,13 +87,15 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
       (variant) => !catalogVariants.some((existing) => existing.id === variant.id),
     ),
   ];
-  const reasoningDefault = resolveReasoningVariant(variants, settings.reasoning ?? 'default').id;
+  const reasoningPreference = normalizeReasoningVariantId(settings.reasoning ?? 'default');
+  const reasoningDefault = resolveReasoningVariant(variants, reasoningPreference).id;
   const routing = routingProviderOptions(built.resolved, providerModelRouting(provider, assignment.modelId));
   // Only this model's state, and only on this view: flipping it must not touch
   // the chat session sharing the underlying runtime.
   const local = {
     supportsVision: modelSupportsVision(assignment.providerId, assignment.modelId, built.resolved),
     reasoningDefault,
+    reasoningPreference,
   };
   // The role's model as a model state. A session asks the runtime for the
   // state of the model it wants; a role-bound session's answer is always
@@ -148,6 +150,12 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
     set reasoningDefault(value: string) {
       local.reasoningDefault = value;
     },
+    get reasoningPreference() {
+      return local.reasoningPreference;
+    },
+    set reasoningPreference(value: string) {
+      local.reasoningPreference = value;
+    },
     reasoningTitles: reasoningSummaryTitles(built.resolved),
     getReasoningProviderOptions: (variantId: string, visible: boolean) => {
       const effective = resolveReasoningVariant(variants, variantId);
@@ -155,7 +163,8 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
     },
     saveReasoningPreference: (variantId: string) => {
       saveSettings({ ...loadSettings(), reasoning: normalizeReasoningVariantId(variantId) });
-      local.reasoningDefault = resolveReasoningVariant(variants, normalizeReasoningVariantId(variantId)).id;
+      local.reasoningPreference = normalizeReasoningVariantId(variantId);
+      local.reasoningDefault = resolveReasoningVariant(variants, local.reasoningPreference).id;
     },
     disableImageInput: () => {
       local.supportsVision = false;

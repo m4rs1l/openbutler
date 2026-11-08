@@ -137,24 +137,18 @@ export function createScheduleService<W extends { runtime: AgentEnvironment }>(d
     if (isClosing()) throw new Error('Host is shutting down.');
     if ((stopGenerations.get(key) ?? 0) !== stopGeneration) throw new Error('Run cancelled before execution.');
     writeScheduleRunStarted(ledger, schedule.id, Date.now());
-    await controller.sendMessage(
-      {
-        text: opening,
-        images: [],
-        eventId: event.id,
-        communication: { source: 'schedule' },
-        reviewAuthorization: {
-          kind: 'schedule',
-          name: schedule.name,
-          instruction: schedule.instruction,
-          triggerFacts: event.payload.facts,
-        },
+    await controller.sendMessage({
+      text: opening,
+      images: [],
+      eventId: event.id,
+      communication: { source: 'schedule' },
+      reviewAuthorization: {
+        kind: 'schedule',
+        name: schedule.name,
+        instruction: schedule.instruction,
+        triggerFacts: event.payload.facts,
       },
-      {
-        reasoningVariantId: workspace.runtime.reasoningDefault,
-        showReasoning: workspace.runtime.showReasoningDefault,
-      },
-    );
+    });
     await controller.flushSave();
     const turnResult = controller.takeEventRunResult(event.id);
     const error = turnResult ? turnResult.error : controller.getLastRunError();
