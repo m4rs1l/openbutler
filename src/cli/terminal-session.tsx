@@ -58,6 +58,10 @@ type MouseInputEvent = {
   kind: 'press' | 'drag' | 'release' | 'wheel-up' | 'wheel-down';
   x: number;
   y: number;
+  /** Modifier keys held during the mouse event (X10/SGR modifier bits, kept on press, drag and release). */
+  shift?: boolean;
+  meta?: boolean;
+  ctrl?: boolean;
 };
 
 export async function runTerminalSession(controller: AgentSessionClient): Promise<void> {
@@ -153,14 +157,20 @@ export function createMouseInputBridge(
         const button = Number(match[1]);
         const released = match[4] === 'm';
         const event = { x: Number(match[2]) - 1, y: Number(match[3]) - 1 };
+        // SGR modifier bits ride along on press, drag and release alike.
+        const modifiers = {
+          ...((button & 4) !== 0 ? { shift: true } : {}),
+          ...((button & 8) !== 0 ? { meta: true } : {}),
+          ...((button & 16) !== 0 ? { ctrl: true } : {}),
+        };
         if ((button & 64) !== 0) {
-          handler?.({ ...event, kind: (button & 1) === 0 ? 'wheel-up' : 'wheel-down' });
+          handler?.({ ...event, ...modifiers, kind: (button & 1) === 0 ? 'wheel-up' : 'wheel-down' });
         } else if (released) {
-          if ((button & 3) === 0) handler?.({ ...event, kind: 'release' });
+          if ((button & 3) === 0) handler?.({ ...event, ...modifiers, kind: 'release' });
         } else if ((button & 32) !== 0) {
-          if ((button & 3) === 0) handler?.({ ...event, kind: 'drag' });
+          if ((button & 3) === 0) handler?.({ ...event, ...modifiers, kind: 'drag' });
         } else if ((button & 3) === 0) {
-          handler?.({ ...event, kind: 'press' });
+          handler?.({ ...event, ...modifiers, kind: 'press' });
         }
       }
       pendingInput = consumed > 0 ? pendingInput.slice(consumed) : pendingInput.slice(-64);
