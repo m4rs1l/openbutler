@@ -157,6 +157,10 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
         return fixtureText('Completed answer');
       },
     });
+    const otherModel = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: async () => fixtureText('Answer under the other model'),
+    });
     const runtime = runtimeFor(model);
     const activated: string[] = [];
     const restored: string[] = [];
@@ -170,6 +174,25 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
       runtime.providerId = providerId;
       runtime.modelId = modelId;
     };
+    // The runtime builds one state per (provider, model) pair, the shape
+    // the real runtime has: a chat asks for the state of the model it wants.
+    runtime.modelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: modelId,
+      providerName: providerId,
+      model: modelId === 'other-model' ? otherModel : model,
+      contextWindowTokens: null,
+      outputLimitTokens: null,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: runtime.reasoningVariants,
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'available' as const,
+      getReasoningProviderOptions: () => ({}),
+      registry: runtime.registry,
+    });
     session = new AgentSessionController(runtime);
 
     const turn = session.sendMessage({ text: 'Runs under the old model', images: [] }, preferences);
@@ -193,7 +216,13 @@ describe('a model or effort picked during a run belongs to the next turn', () =>
     // The next message runs with the picked model, and the transcript says so.
     await session.sendMessage({ text: 'Runs under the new model', images: [] }, preferences);
     await session.waitUntilIdle(1000);
-    expect(restored).toEqual(['other-model']);
+    // The picked model ran the turn...
+    expect(otherModel.doStreamCalls.length).toBeGreaterThan(0);
+    // ...and the shared runtime never moved: a chat asks for a model state,
+    // it does not rebind the runtime that other chats share.
+    expect(activated).toEqual([]);
+    expect(restored).toEqual([]);
+    expect(runtime.modelId).toBe('fixture');
     const changed = dividersOf(session, 'Model changed');
     expect(changed).toHaveLength(1);
     expect(changed[0]!.text).toBe('Model changed from "fixture" to "other-model"');

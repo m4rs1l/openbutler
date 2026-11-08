@@ -1,6 +1,7 @@
 import { TURN_SOURCES } from './communication.js';
 import type { FileAttachment } from './attachments.js';
 import type { SessionProject } from './projects/types.js';
+import type { ReasoningSupport } from './provider/registry.js';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -147,6 +148,16 @@ export interface SavedSession {
    * it reports can actually take.
    */
   reasoningVariants?: Array<{ id: string; label: string }>;
+  /**
+   * The model facts this session runs with, written with the model switch.
+   * A workspace runtime is shared, so its capabilities describe whichever
+   * model it is bound to; these describe the model THIS chat reports and
+   * uses, so the chat stays correct while another chat runs another model.
+   */
+  supportsVision?: boolean;
+  reasoningSupport?: ReasoningSupport;
+  reasoningMetadataSource?: string | null;
+  reasoningTitles?: boolean;
   /** Canonical workspace that supplied this session's tool and memory scope. */
   workspaceRoot?: string;
   contextTokens?: number;
@@ -577,6 +588,10 @@ export function saveSession(session: SavedSession, options: { allowEmpty?: boole
     ...(session.reasoning === undefined ? {} : { reasoning: session.reasoning }),
     ...(session.showReasoning === undefined ? {} : { showReasoning: session.showReasoning }),
     ...(session.reasoningVariants === undefined ? {} : { reasoningVariants: session.reasoningVariants }),
+    ...(session.supportsVision === undefined ? {} : { supportsVision: session.supportsVision }),
+    ...(session.reasoningSupport === undefined ? {} : { reasoningSupport: session.reasoningSupport }),
+    ...(session.reasoningMetadataSource === undefined ? {} : { reasoningMetadataSource: session.reasoningMetadataSource }),
+    ...(session.reasoningTitles === undefined ? {} : { reasoningTitles: session.reasoningTitles }),
     ...(session.workspaceRoot === undefined ? {} : { workspaceRoot: session.workspaceRoot }),
     ...(session.project === undefined ? {} : { project: session.project }),
     ...(session.contextTokens === undefined ? {} : { contextTokens: session.contextTokens }),
@@ -651,6 +666,15 @@ function isSavedSession(value: unknown): value is SavedSession {
         value.reasoningVariants.every(
           (variant) => isRecord(variant) && typeof variant.id === 'string' && typeof variant.label === 'string',
         ))) &&
+    (value.supportsVision === undefined || typeof value.supportsVision === 'boolean') &&
+    (value.reasoningSupport === undefined ||
+      value.reasoningSupport === 'available' ||
+      value.reasoningSupport === 'model-unsupported' ||
+      value.reasoningSupport === 'adapter-unmapped') &&
+    (value.reasoningMetadataSource === undefined ||
+      value.reasoningMetadataSource === null ||
+      typeof value.reasoningMetadataSource === 'string') &&
+    (value.reasoningTitles === undefined || typeof value.reasoningTitles === 'boolean') &&
     (value.keyPositions === undefined ||
       (isRecord(value.keyPositions) &&
         Object.entries(value.keyPositions).every(

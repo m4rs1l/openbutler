@@ -782,7 +782,7 @@ describe('owner replies and safe steering', () => {
 });
 
 describe('restored session model identity', () => {
-  it('does not overwrite the saved selection while a default-model runtime is active', async () => {
+  it('keeps the saved selection on the chat and leaves the shared runtime alone', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const { loadSavedSession } = await import('../src/session-store.js');
     const runtime = runtimeFor(
@@ -805,8 +805,12 @@ describe('restored session model identity', () => {
     session.flushSave();
     expect(loadSavedSession(id, runtime.workspaceRoot)?.modelId).toBe('fixture');
     await session.restoreSessionModel();
-    expect(runtime.modelId).toBe('fixture');
-    expect(runtime.restoreModel).toHaveBeenCalledWith('fixture', 'fixture');
+    // The chat runs with the model it saved...
+    expect(session.getSnapshot().session.modelId).toBe('fixture');
+    // ...and the old rebind path is gone: a chat asks for the state of its
+    // model, it does not restore one onto the runtime other chats share.
+    expect(runtime.modelId).toBe('default-model');
+    expect(runtime.restoreModel).not.toHaveBeenCalled();
   });
 });
 

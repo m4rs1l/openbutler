@@ -22,10 +22,10 @@ import {
 } from './session-store.js';
 import { isToolRequestWhitelisted, rememberToolRequest } from './tool-permissions.js';
 import { daemonCommandAction } from './commands/registry.js';
-import type { ModelState } from './model-state.js';
 import { ensureHostOwnedRoots } from './host-owned-paths.js';
 import { consumeApproval, recordDeniedAction } from './review-overrides.js';
 import { resolveReasoningVariant, type ReasoningSupport, type ReasoningVariant } from './provider/registry.js';
+import type { ModelState } from './model-state.js';
 import { geminiToolSchemaSanitizer } from './provider/gemini-schema.js';
 import { isProviderCommand, runProviderCommand } from './provider/provider-command.js';
 import { loadSettings, type ApprovalMode } from './settings.js';
@@ -448,7 +448,40 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   getSnapshot = (): AgentSessionSnapshot => this.snapshot;
-  private sessionModel(model: LanguageModel = this.runtime.model): LanguageModel {
+  /**
+   * The model state this chat runs with.
+   *
+   * A runtime used to hold ONE current model for everybody sharing it, so a
+   * chat that picked a model moved the workspace's model with it. The chat
+   * carries its own state instead: the running turn's snapshot first, then
+   * the state the chat will run with next.
+   */
+  private currentState(): ModelState | null {
+    return this.activeModelState ?? this.modelState;
+  }
+  private stateModel(): LanguageModel {
+    return this.currentState()?.model ?? this.runtime.model;
+  }
+  private stateRegistry(): ToolRegistry {
+    return this.currentState()?.registry ?? this.runtime.registry;
+  }
+  private stateVariants(): ReasoningVariant[] {
+    return this.currentState()?.reasoningVariants ?? this.runtime.reasoningVariants;
+  }
+  private stateReasoningOptions(variantId: string, visible: boolean): ReasoningVariant['providerOptions'] {
+    const state = this.currentState();
+    return state ? state.getReasoningProviderOptions(variantId, visible) : this.runtime.getReasoningProviderOptions(variantId, visible);
+  }
+  private stateContextWindowTokens(): number | null {
+    return this.currentState()?.contextWindowTokens ?? this.runtime.contextWindowTokens;
+  }
+  private stateSupportsVision(): boolean {
+    return this.currentState()?.supportsVision ?? this.runtime.supportsVision;
+  }
+  private stateSupportsImageToolResult(): boolean {
+    return this.currentState()?.supportsImageToolResult ?? this.runtime.supportsImageToolResult;
+  }
+  private sessionModel(model: LanguageModel = this.stateModel()): LanguageModel {
     return bindSessionKeyRotation(model, (this.session.keyPositions ??= {}));
   }
   /** The provider-boundary schema rebuild for this run's model, absent where no strict subset applies. */
@@ -670,7 +703,11 @@ export class AgentSessionController implements AgentSessionClient {
    * authority; the runtime value is only the fallback for a chat that never chose.
    */
   private sessionReasoning(): string {
-    return this.session.reasoning ?? this.runtime.reasoningDefault;
+    if (this.session.reasoning !== undefined) return this.session.reasoning;
+    // The machine default is an effort id; the levels that exist are this
+    // chat's model's, so the default is resolved against THIS chat's model.
+    const variants = this.stateVariants();
+    return variants.length > 0 ? resolveReasoningVariant(variants, this.runtime.reasoningDefault).id : this.runtime.reasoningDefault;
   }
 
   /** The session's reasoning-visibility choice, with the machine default as fallback. */
@@ -749,7 +786,7 @@ export class AgentSessionController implements AgentSessionClient {
       entries: stampCompactionOutput(
         session.entries.map((entry) => {
           if (entry.kind !== 'tool' || entry.toolTitle !== undefined || !entry.tool) return entry;
-          const title = this.runtime.registry.getDisplayTitle(entry.tool);
+          const title = this.stateRegistry().getDisplayTitle(entry.tool);
           return title !== undefined ? { ...entry, toolTitle: title } : entry;
         }),
       ),
@@ -879,7 +916,7 @@ export class AgentSessionController implements AgentSessionClient {
       return 'Compaction was skipped: the checkpoint would not shrink the active context, so it was not applied. The turn continues with the original context.';
     return (
       `Compaction does not fit the budget: the conversation needs about ${refusal.estimatedTokens} tokens but the configured window is ${refusal.window} tokens, so the summarization request itself would overflow by ${refusal.shortfallTokens} tokens. ` +
-      `Raise providers.${this.runtime.providerId}.modelSpecs.${this.runtime.modelId}.context in settings above the conversation size, or remove it to use the catalog value, or start a new chat with /new. ` +
+      `Raise providers.${this.session.providerId}.modelSpecs.${this.session.modelId}.context in settings above the conversation size, or remove it to use the catalog value, or start a new chat with /new. ` +
       (refusal.cause ? `The sliced fallback tried first and stopped: ${refusal.cause}. ` : '') +
       'The turn continues with the original context.'
     );
@@ -896,29 +933,69 @@ export class AgentSessionController implements AgentSessionClient {
   private effectiveContextWindowTokensForCompaction(): number | null {
     return compactionContextWindowTokens(
       this.session.id,
-      this.runtime.contextWindowTokens,
+      this.stateContextWindowTokens(),
       this.lastContextUsage ?? this.lastContextEstimate,
       this.runtime.custodianContextLimitTokens,
     );
   }
 
+  /**
+   * The state of the model this chat runs with.
+   *
+   * The runtime builds one state per (provider, model) pair and hands it over
+   * without touching its own model slot. A runtime without that factory is a
+   * test double or an older host: its own fields are the state.
+   */
+  private async resolveModelState(providerId: string, modelId: string): Promise<ModelState> {
+    if (this.runtime.modelFor) return this.runtime.modelFor(providerId, modelId);
+    if (!this.busy && (this.runtime.providerId !== providerId || this.runtime.modelId !== modelId)) {
+      await this.runtime.selectModel(providerId, modelId);
+    }
+    return {
+      providerId,
+      modelId,
+      modelName: this.runtime.modelName,
+      providerName: this.runtime.providerName ?? '',
+      model: this.runtime.model,
+      contextWindowTokens: this.runtime.contextWindowTokens,
+      outputLimitTokens: this.runtime.outputLimitTokens,
+      supportsVision: this.runtime.supportsVision,
+      supportsImageToolResult: this.runtime.supportsImageToolResult,
+      reasoningVariants: this.runtime.reasoningVariants,
+      reasoningTitles: this.runtime.reasoningTitles === true,
+      reasoningMetadataSource: this.runtime.reasoningMetadataSource,
+      reasoningSupport: this.runtime.reasoningSupport,
+      getReasoningProviderOptions: this.runtime.getReasoningProviderOptions,
+      registry: this.runtime.registry,
+    };
+  }
+
   async restoreSessionModel(): Promise<void> {
-    // The runtime now matches this chat again, so its list is this chat's list.
-    // A model picked while a run was going becomes real here, at the turn
-    // boundary, and the chat's effort is re-mapped onto that model's levels:
-    // an effort the new model does not offer cannot stay the choice it shows.
-    if (this.runtime.providerId !== this.session.providerId || this.runtime.modelId !== this.session.modelId) {
-      if (!this.runtime.restoreModel) throw new Error('This runtime cannot restore the saved session model.');
-      await this.runtime.restoreModel(this.session.providerId, this.session.modelId);
+    // This chat runs with its OWN model state. The shared runtime is never
+    // rebound to a chat's pick, so two chats in one workspace cannot move
+    // each other's model - the failure a single runtime slot has.
+    const providerId = this.session.providerId;
+    const modelId = this.session.modelId;
+    if (!this.modelState || this.modelState.providerId !== providerId || this.modelState.modelId !== modelId) {
+      this.modelState = await this.resolveModelState(providerId, modelId);
     }
-    if (this.runtime.reasoningVariants.length > 0) {
-      const variants = this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
-      this.session = {
-        ...this.session,
-        reasoningVariants: variants,
-        ...(this.session.reasoning !== undefined ? { reasoning: remapEffort(variants, this.session.reasoning) } : {}),
-      };
-    }
+    const state = this.modelState;
+    const variants = state.reasoningVariants.map(({ id, label }) => ({ id, label }));
+    this.session = {
+      ...this.session,
+      // The state IS the model this chat runs with, so the chat reports
+      // the model it actually uses - a role-bound session reports the
+      // model its role pins, not the one its transcript recorded.
+      providerId: state.providerId,
+      modelId: state.modelId,
+      ...(variants.length > 0 ? { reasoningVariants: variants } : {}),
+      ...(this.session.reasoning !== undefined && variants.length > 0 ? { reasoning: remapEffort(variants, this.session.reasoning) } : {}),
+      ...(state.contextWindowTokens === null ? {} : { contextWindowTokens: state.contextWindowTokens }),
+      supportsVision: state.supportsVision,
+      reasoningSupport: state.reasoningSupport,
+      reasoningMetadataSource: state.reasoningMetadataSource,
+      reasoningTitles: state.reasoningTitles,
+    };
     this.publish();
   }
 
@@ -933,10 +1010,11 @@ export class AgentSessionController implements AgentSessionClient {
    */
   async selectModel(providerId: string, modelId: string, pendingVariants?: ReadonlyArray<{ id: string; label: string }>): Promise<void> {
     const sameModel = modelId === this.session.modelId;
-    // While a run is going the shared runtime belongs to that turn: switching
-    // it now would move the model under the running request. The pick waits
-    // for the turn boundary, where restoreSessionModel() activates it.
-    if (!this.busy) await this.runtime.selectModel(providerId, modelId);
+    // The pick belongs to THIS chat: it resolves a model state for this chat
+    // and never moves the shared runtime, so another chat in the same
+    // workspace keeps the model it runs with. A pick made while a run is
+    // going waits for the turn boundary, where the state is adopted.
+    this.modelState = await this.resolveModelState(providerId, modelId);
     // No divider here on purpose: the switch is a choice, not a message. The
     // transcript records it above the first message that runs with it, which is
     // where a reader can tell what the following request was made with.
@@ -945,23 +1023,25 @@ export class AgentSessionController implements AgentSessionClient {
       this.lastContextUsage = undefined;
       this.lastContextEstimate = undefined;
     }
-    // The levels belong to a model, not to a runtime. The host hands over the
-    // target model's own levels; without them the running model's list would
-    // be recorded and the picker would offer levels the new model refuses.
+    // The levels belong to a model, not to a runtime. This chat records the
+    // levels of the model it will run with next, so the picker answers for
+    // that model even while another chat runs a different one.
     const variants =
-      pendingVariants && pendingVariants.length > 0
-        ? pendingVariants.map(({ id, label }) => ({ id, label }))
-        : this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
+      this.modelState.reasoningVariants.length > 0
+        ? this.modelState.reasoningVariants.map(({ id, label }) => ({ id, label }))
+        : (pendingVariants ?? []).map(({ id, label }) => ({ id, label }));
     this.session = {
       ...this.session,
-      providerId,
-      modelId,
-      // The runtime is shared, so its list belongs to whichever session last
-      // activated a model. Recording this chat's own list here is what lets the
-      // picker answer for the model this chat reports, even while another chat
-      // has the runtime bound to a different one.
+      // The resolved state is the model this chat runs with from now on;
+      // the pick only named it.
+      providerId: this.modelState.providerId,
+      modelId: this.modelState.modelId,
       ...(variants.length > 0 ? { reasoningVariants: variants } : {}),
-      ...(this.runtime.contextWindowTokens === null ? {} : { contextWindowTokens: this.runtime.contextWindowTokens }),
+      ...(this.modelState.contextWindowTokens === null ? {} : { contextWindowTokens: this.modelState.contextWindowTokens }),
+      supportsVision: this.modelState.supportsVision,
+      reasoningSupport: this.modelState.reasoningSupport,
+      reasoningMetadataSource: this.modelState.reasoningMetadataSource,
+      reasoningTitles: this.modelState.reasoningTitles,
     };
     if (!sameModel) {
       delete this.session.contextTokens;
@@ -973,7 +1053,7 @@ export class AgentSessionController implements AgentSessionClient {
       if (this.session.reasoning !== undefined && variants.length > 0)
         this.session = { ...this.session, reasoning: remapEffort(variants, this.session.reasoning) };
     }
-    if (this.runtime.contextWindowTokens === null) delete this.session.contextWindowTokens;
+    if (this.modelState.contextWindowTokens === null) delete this.session.contextWindowTokens;
     this.publish();
   }
 
@@ -1242,6 +1322,10 @@ export class AgentSessionController implements AgentSessionClient {
 
   /** The admitted turn's own message preferences; cleared when the run settles. */
   private activeTurnPreferences: AgentTurnPreferences | null = null;
+  /** The model state this chat runs with. It belongs to this chat alone. */
+  private modelState: ModelState | null = null;
+  /** The state the running turn was admitted with: a pick made during a run belongs to the NEXT turn. */
+  private activeModelState: ModelState | null = null;
   /** Last effort announced in the transcript; null until the first admission pins it. */
   private announcedEffort: string | null = null;
   /**
@@ -1284,7 +1368,7 @@ export class AgentSessionController implements AgentSessionClient {
    * prefix is what makes the largest request of a session miss.
    */
   private frozenSystemPrompt(build: (workspaceRoot: string, basePolicy?: AgentBase) => string): string {
-    const key = `${this.runtime.workspaceRoot}\u0000${this.runtime.providerId}\u0000${this.runtime.modelId}\u0000${this.session.id}`;
+    const key = `${this.runtime.workspaceRoot}\u0000${this.session.providerId}\u0000${this.session.modelId}\u0000${this.session.id}`;
     if (this.frozenSystem?.key !== key) {
       this.frozenSystem = { key, text: build(this.runtime.workspaceRoot, this.options.basePolicy) };
     }
@@ -1541,7 +1625,7 @@ export class AgentSessionController implements AgentSessionClient {
       try {
         await this.runtime.reloadSettings?.();
         outcome = await (this.options.autoReviewer ?? reviewToolRequest)({
-          model: this.sessionModel(this.runtime.reviewModel ?? this.runtime.model),
+          model: this.sessionModel(this.runtime.reviewModel ?? this.stateModel()),
           request,
           messages: [...this.currentReviewMessages],
           workspaceRoot: this.runtime.workspaceRoot,
@@ -1575,8 +1659,8 @@ export class AgentSessionController implements AgentSessionClient {
       const { decision } = outcome;
       await this.recordAutoReviewState(request, 'reviewed', {
         reviewer: 'auto-review',
-        providerId: this.runtime.providerId,
-        modelId: this.runtime.modelId,
+        providerId: this.session.providerId,
+        modelId: this.session.modelId,
         verdict: decision.verdict,
         confidence: decision.confidence,
         risk: decision.risk,
@@ -2023,6 +2107,9 @@ export class AgentSessionController implements AgentSessionClient {
         // the middle of a running request: a pick made while a run was going
         // becomes real here, and the chat's effort is re-mapped onto it.
         await this.restoreSessionModel();
+        // The admitted turn owns the model it runs with: a pick made while
+        // this turn runs belongs to the NEXT turn, never to this one.
+        this.activeModelState = this.modelState;
         // The admitted turn's own message preferences govern it, but a session
         // that recorded its own effort always wins: the session is the single
         // authority, so a wake-up or another channel carrying the machine
@@ -2083,7 +2170,7 @@ export class AgentSessionController implements AgentSessionClient {
           await this.runtime.prepareForTurn?.();
           await this.runtime.reloadSettings?.();
           const schemaSanitizer = this.toolSchemaSanitizer();
-          const tools = await (this.options.registry ?? this.runtime.registry).createModelTools({
+          const tools = await (this.options.registry ?? this.stateRegistry()).createModelTools({
             approve: (request, signal) => this.requestApproval(request, signal),
             approvalMode: () => this.runtime.approvalMode ?? 'workspace',
             autoApprove: (request) => this.options.autoApprove?.(request) ?? isToolRequestWhitelisted(this.runtime.workspaceRoot, request),
@@ -2125,8 +2212,8 @@ export class AgentSessionController implements AgentSessionClient {
                 return this.sessionModel();
               },
               workspaceRoot: this.runtime.workspaceRoot,
-              supportsVision: this.runtime.supportsVision,
-              supportsImageToolResult: this.runtime.supportsImageToolResult,
+              supportsVision: this.stateSupportsVision(),
+              supportsImageToolResult: this.stateSupportsImageToolResult(),
               abortSignal: abortController.signal,
               messages: this.conversation,
               system: this.frozenSystemPrompt(buildAgentSystem),
@@ -2151,7 +2238,7 @@ export class AgentSessionController implements AgentSessionClient {
                       ? {
                           force: true,
                           ...(pendingCompaction.recovery ? { recovery: true } : {}),
-                          providerOptions: this.runtime.getReasoningProviderOptions(
+                          providerOptions: this.stateReasoningOptions(
                             pendingCompaction.preferences.reasoningVariantId,
                             pendingCompaction.preferences.showReasoning,
                           ),
@@ -2253,7 +2340,7 @@ export class AgentSessionController implements AgentSessionClient {
               },
               getProviderOptions: () => {
                 const live = this.liveTurnPreferences();
-                return this.runtime.getReasoningProviderOptions(live.reasoningVariantId, live.showReasoning);
+                return this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
               },
               onTextDelta: (delta) => {
                 streamedTextReceived = true;
@@ -2324,8 +2411,8 @@ export class AgentSessionController implements AgentSessionClient {
               sessionId: this.session.id,
               model: this.sessionModel(),
               workspaceRoot: this.runtime.workspaceRoot,
-              supportsVision: this.runtime.supportsVision,
-              supportsImageToolResult: this.runtime.supportsImageToolResult,
+              supportsVision: this.stateSupportsVision(),
+              supportsImageToolResult: this.stateSupportsImageToolResult(),
               messages: this.conversation,
               tools: {},
               maxRetries: 0,
@@ -2336,7 +2423,7 @@ export class AgentSessionController implements AgentSessionClient {
               },
               getProviderOptions: () => {
                 const live = this.liveTurnPreferences();
-                return this.runtime.getReasoningProviderOptions(live.reasoningVariantId, live.showReasoning);
+                return this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
               },
               onTextDelta: (delta) => {
                 this.activeEventAssistantText += delta;
@@ -2409,6 +2496,7 @@ export class AgentSessionController implements AgentSessionClient {
         activeTurn = null;
       }
     } finally {
+      this.activeModelState = null;
       this.finishTurn(runTurnId, abortController.signal.aborted);
       if (this.approvalResolver) this.approveToolCall('deny');
       if (this.questionResolver) this.answerQuestion(null);
@@ -2459,9 +2547,9 @@ export class AgentSessionController implements AgentSessionClient {
         // with the chat's own reasoning settings, as it always did.
         const providerOptions = this.runtime.titleModel
           ? (this.runtime.getTitleProviderOptions?.() ?? {})
-          : this.runtime.getReasoningProviderOptions(live.reasoningVariantId, live.showReasoning);
+          : this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
         // Metadata must not rotate the active conversation's keys or report retries into its next turn.
-        const model = bindSessionKeyRotation(this.runtime.titleModel ?? this.runtime.model, { ...this.session.keyPositions }, () => {});
+        const model = bindSessionKeyRotation(this.runtime.titleModel ?? this.stateModel(), { ...this.session.keyPositions }, () => {});
         const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
         const title = await generateSessionTitle(model, request.message, signal, providerOptions);
         if (!this.closed && !signal.aborted && this.session.id === request.sessionId && this.session.title === fallback) {
@@ -2537,14 +2625,14 @@ export class AgentSessionController implements AgentSessionClient {
         this.runtime.supportsImageToolResult,
         this.runtime.workspaceRoot,
         this.options.basePolicy,
-        this.runtime.supportsVision,
+        this.stateSupportsVision(),
         // The session's frozen prompt: the compaction request shares its prefix
         // with the turn that triggered it, so only the appended prompt is new.
         this.frozenSystemPrompt(buildAgentSystem),
         this.session.id,
       );
       const schemaSanitizer = this.toolSchemaSanitizer();
-      const tools = await this.runtime.registry.createModelTools({
+      const tools = await this.stateRegistry().createModelTools({
         approve: async () => false,
         onResult: () => {},
         ...(schemaSanitizer ? { schemaSanitizer } : {}),
@@ -2558,7 +2646,7 @@ export class AgentSessionController implements AgentSessionClient {
         outputLimitTokens: this.runtime.outputLimitTokens,
         ...(this.lastContextUsage !== undefined ? { previousContextTokens: this.lastContextUsage } : {}),
         ...(this.lastContextEstimate !== undefined ? { previousContextEstimateTokens: this.lastContextEstimate } : {}),
-        providerOptions: this.runtime.getReasoningProviderOptions(preferences.reasoningVariantId, preferences.showReasoning),
+        providerOptions: this.stateReasoningOptions(preferences.reasoningVariantId, preferences.showReasoning),
         onStepUsage: (report) => this.onStepUsage(report, 'compaction'),
         onStart: () => {
           this.flushStreamedEntries();
@@ -2658,8 +2746,8 @@ export class AgentSessionController implements AgentSessionClient {
         ...(this.activeEventId ? { eventId: this.activeEventId } : {}),
         runKind,
         ...(this.runtime.workspaceRoot ? { workspaceRoot: this.runtime.workspaceRoot } : {}),
-        providerId: this.runtime.providerId,
-        modelId: this.runtime.modelId,
+        providerId: this.session.providerId,
+        modelId: this.session.modelId,
         atMs: report.startedAt,
         endedMs: report.endedAt,
         attempt: report.attempt,

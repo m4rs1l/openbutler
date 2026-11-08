@@ -12,6 +12,7 @@
  */
 import { requireModelContextWindow } from './agent-runtime.js';
 import type { AgentEnvironment } from './agent-session.js';
+import type { ModelState } from './model-state.js';
 import { getCatalogIndex, isCatalogLoaded } from './provider/catalog.js';
 import { resolveModelName, resolveProviderName } from './provider/model-presentation.js';
 import {
@@ -94,6 +95,35 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
     supportsVision: modelSupportsVision(assignment.providerId, assignment.modelId, built.resolved),
     reasoningDefault,
   };
+  // The role's model as a model state. A session asks the runtime for the
+  // state of the model it wants; a role-bound session's answer is always
+  // the role's model, never the shared runtime's.
+  const roleState: ModelState = {
+    providerId: assignment.providerId,
+    modelId: assignment.modelId,
+    modelName: resolveModelName(assignment.providerId, assignment.modelId),
+    providerName: resolveProviderName(assignment.providerId),
+    model: built.model,
+    contextWindowTokens,
+    outputLimitTokens: budget.output,
+    get supportsVision() {
+      return local.supportsVision;
+    },
+    get supportsImageToolResult() {
+      return supportsImageToolResult(built.resolved, assignment.modelId);
+    },
+    reasoningVariants: variants,
+    reasoningTitles: reasoningSummaryTitles(built.resolved),
+    reasoningMetadataSource: catalog.inferred ? catalog.sourceProviderId : null,
+    reasoningSupport: reasoningSupportStatus(built.resolved, catalog.model),
+    getReasoningProviderOptions: (variantId: string, visible: boolean) => {
+      const effective = resolveReasoningVariant(variants, variantId);
+      return mergeProviderOptions(withReasoningVisibility(built.resolved, effective.providerOptions, visible), routing);
+    },
+    get registry() {
+      return base.registry;
+    },
+  };
   const overrides: Record<string, unknown> = {
     model: built.model,
     providerId: assignment.providerId,
@@ -130,6 +160,10 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
     disableImageInput: () => {
       local.supportsVision = false;
     },
+    // A session asks for the state of the model it wants. A role-bound
+    // session's answer is the role's model: the role decides which model
+    // this session runs with, and the shared runtime's model is not it.
+    modelFor: async () => roleState,
     // The role's model is the session's model; it does not switch and saved
     // conversation models do not override it - that is what "bound" means here.
     selectModel: async (nextProviderId: string, nextModelId: string) => {
