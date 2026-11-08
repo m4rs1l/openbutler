@@ -9,6 +9,7 @@ import stringWidth from 'string-width';
 import { readClipboardImageBase64 } from '../clipboard-image.js';
 import { writeClipboardText } from '../clipboard-text.js';
 import { FrameSelectionTracker, decorate } from './frame-selection.js';
+import { isSubagentToolEntry, lastWorkerEntryIndex, workerViewAttach } from '../worker-view.js';
 import { mergeMarkdownTokenSegments } from './markdown-merge.js';
 import { displayFilePath, parseHref } from '../web/link-protocol.js';
 import type { ApprovalDecision } from '../agent-session.js';
@@ -252,6 +253,7 @@ export function SessionScreen({
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   const activeSession = snapshot.session;
   const entries = activeSession.entries;
+  const lastWorkerIndex = useMemo(() => lastWorkerEntryIndex(entries), [entries]);
   const pending = snapshot.pendingApproval;
   const pendingApprovalId = snapshot.pendingApprovalId;
   const pendingQuestion = snapshot.pendingQuestion;
@@ -1126,20 +1128,16 @@ export function SessionScreen({
   const openSubagentView = useCallback(
     async (index: number) => {
       if (subagentClientRef.current) return;
-      const entry = subagentCall(entries[index]);
-      if (!entry) return;
-      const running = entry.running === true || entry.preparing === true;
-      const workerSessionId = running ? null : subagentWorkerSessionId(entry);
-      if (!running && !workerSessionId) {
+      const entry = entries[index];
+      if (!isSubagentToolEntry(entry)) return;
+      const attach = workerViewAttach(entry, activeSession.id);
+      if (!attach) {
         parentController.addEntry({ kind: 'notice', text: 'This subagent call did not open a worker session.' });
         return;
       }
       try {
         const { connectDaemonSession } = await import('../daemon-client.js');
-        const client = await connectDaemonSession(
-          parentController.runtime.workspaceRoot,
-          running ? { runningWorkerOf: activeSession.id } : { workerSessionId: workerSessionId! },
-        );
+        const client = await connectDaemonSession(parentController.runtime.workspaceRoot, attach);
         if (subagentClientRef.current) {
           void client.close();
           return;
@@ -1233,15 +1231,12 @@ export function SessionScreen({
         return;
       }
       for (const [index, element] of toolRefs.current) {
-        const entry = subagentCall(state.entries[index]);
-        if (!entry) continue;
+        // Worker rows are the worker view: a plain click opens it and Ctrl+click
+        // toggles disclosure, matching the modifier convention elsewhere.
+        if (!isSubagentToolEntry(state.entries[index])) continue;
+        if (event.ctrl) break;
         const bounds = measureElement(element);
         const top = bounds.y - scrollTopRef.current;
-        // The input toggles disclosure; the result still opens the worker view.
-        const inputRows = state.expandedTools.has(index)
-          ? estimateTranscriptEntryHeight({ ...entry, result: '', running: false, preparing: false }, state.width, true) - 1
-          : 1;
-        if (entry.input && y < top + inputRows) continue;
         if (x >= bounds.x && x < bounds.x + bounds.width && y >= top && y < top + bounds.height) {
           void openSubagentViewRef.current(index);
           return;
@@ -1401,6 +1396,20 @@ export function SessionScreen({
       if (key.upArrow) closeSubagentViewRef.current();
     },
     { isActive: subagentView !== null },
+  );
+
+  // Ctrl+O toggles the worker view for the newest subagent call, the one on screen now.
+  useInput(
+    (input, key) => {
+      if (!key.ctrl || input.toLowerCase() !== 'o') return;
+      if (subagentView !== null) {
+        closeSubagentViewRef.current();
+        return;
+      }
+      const index = lastWorkerEntryIndex(entries);
+      if (index !== null) void openSubagentViewRef.current(index);
+    },
+    { isActive: !popupOpen && pending === null && pendingQuestion === null },
   );
 
   useInput(
@@ -1649,7 +1658,7 @@ export function SessionScreen({
       {subagentView ? (
         <Box ref={composerSlotRef} width={composerWidth} flexDirection="column" marginBottom={1} flexShrink={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, composerWidth))}</Text>
-          <Text dimColor>{`${glyphs.bullet} subagent session · view only · ↑ returns to the parent session`}</Text>
+          <Text dimColor>{`${glyphs.bullet} subagent session · view only · ↑/Ctrl+O returns to the parent session`}</Text>
         </Box>
       ) : pending ? (
         <Box ref={composerSlotRef} width={composerWidth} height={COMPOSER_SLOT_HEIGHT} marginBottom={1} flexShrink={0}>
@@ -1693,6 +1702,9 @@ export function SessionScreen({
               }}
             />
           </Box>
+          {lastWorkerIndex !== null && !popupOpen && !pending ? (
+            <Text dimColor>click the worker row to open · Ctrl+O · Ctrl+click expands</Text>
+          ) : null}
         </Box>
       )}
       {queuedMessageCount > 0 && !pending ? (
@@ -2748,26 +2760,6 @@ function displayableCommand(command: string): string {
     /[\u0000-\u0009\u000b-\u001f\u007f]/g,
     (character) => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`,
   );
-}
-
-/** A tool entry that is a `subagent` call, or null. */
-function subagentCall(entry: Entry | undefined): Extract<Entry, { kind: 'tool' }> | null {
-  if (!entry || entry.kind !== 'tool') return null;
-  if (entry.tool !== undefined) return entry.tool === 'host:subagent' ? entry : null;
-  return /^subagent (explorer|executor)\b/.test(toolEntryCommand(entry)) ? entry : null;
-}
-
-/** The worker session id from a subagent-family entry: the entry field first, then the legacy JSON result. */
-function subagentWorkerSessionId(entry: Extract<Entry, { kind: 'tool' }>): string | null {
-  if (typeof entry.session === 'string' && entry.session) return entry.session;
-  try {
-    const parsed: unknown = JSON.parse(entry.result);
-    if (parsed && typeof parsed === 'object' && 'session' in parsed && typeof (parsed as { session?: unknown }).session === 'string')
-      return (parsed as { session: string }).session;
-  } catch {
-    /* results that are not JSON cannot carry a worker id */
-  }
-  return null;
 }
 
 function toolActivity(entry: Extract<Entry, { kind: 'tool' }>): { active: boolean; label: string } {
