@@ -26,6 +26,7 @@ import {
   withReasoningVisibility,
 } from './provider/registry.js';
 import { modelReasoningVariants } from './provider/model-view.js';
+import { modelStateKey, type ModelState } from './model-state.js';
 import { createPayloadFetch } from './provider/request-payload.js';
 import { resolveRoleModel, roleModelAssignment, roleModelConfig, type ModelRole } from './model-roles.js';
 import {
@@ -274,7 +275,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         memoryIndex: scopeMemoryIndex,
         mcp: mcp!,
         onMcpConnectionsChanged: () => {
-          runtime.registry = createRegistry(activeInputModalities);
+          resetRegistries();
         },
         ...(options.backgroundManage ? { backgroundManage: options.backgroundManage } : {}),
         ...(options.inbox ? { inbox: options.inbox } : {}),
@@ -310,6 +311,25 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       if (options.teamWork) registry.register(createTeamWorkTool(options.teamWork));
       return registry;
     }
+    type Registry = ReturnType<typeof createRegistry>;
+    // The tool catalogue is a workspace fact with one model-dependent part:
+    // the input modalities a model accepts. One registry per modality set is
+    // enough, and the set is rebuilt when the workspace or the MCP
+    // connections change - never because a chat picked a model.
+    const registryCache: { [key: string]: Registry } = {};
+    function registryFor(inputModalities: readonly string[]): Registry {
+      const key = inputModalities.join(',');
+      const cached = registryCache[key];
+      if (cached) return cached;
+      const registry = createRegistry(inputModalities);
+      registryCache[key] = registry;
+      return registry;
+    }
+    function resetRegistries(): void {
+      for (const key of Object.keys(registryCache)) delete registryCache[key];
+      runtime.registry = registryFor(activeInputModalities);
+    }
+
     let activeResolved = resolved.resolved;
     let activeCatalog = reasoningCatalog;
     let activeVariants = reasoningVariants;
@@ -320,7 +340,16 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
     let settingsReload = Promise.resolve();
     let appliedMcpRevision = mcp.revision;
     let runtimeClosed = false;
-    async function applyModel(nextSettings: SettingsStore, nextProviderId: string, nextModelId: string) {
+    /**
+     * Resolves a model into the parts every consumer needs: the instance, the
+     * effort levels it offers, the provider options an effort maps to and the
+     * input modalities its tools must accept.
+     *
+     * This is the one place that knows how to build a model. The runtime's own
+     * model and a session's model are two views of the same resolution, so
+     * they cannot drift apart.
+     */
+    async function resolveModelParts(nextSettings: SettingsStore, nextProviderId: string, nextModelId: string) {
       const nextProvider = nextSettings.providers[nextProviderId];
       // Model activation uses the last committed local catalog. An expired TTL
       // must not make a session switch wait for the network refresh timeout.
@@ -351,28 +380,132 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         nextProvider.modelSpecs?.[nextModelId]?.reasoning?.efforts ?? [],
       );
       const nextInputModalities = modelInputModalities(nextProviderId, nextModelId, next.resolved);
-      const nextRegistry = createRegistry(nextInputModalities);
+      return {
+        resolved: next.resolved,
+        model: next.model,
+        catalog: nextCatalog,
+        budget: nextBudget,
+        contextWindowTokens: nextContextWindowTokens,
+        variants: nextVariants,
+        inputModalities: nextInputModalities,
+        routing: routingProviderOptions(next.resolved, providerModelRouting(nextProvider, nextModelId)),
+      };
+    }
 
-      activeResolved = next.resolved;
-      activeCatalog = nextCatalog;
-      activeVariants = nextVariants;
-      activeRouting = routingProviderOptions(next.resolved, providerModelRouting(nextProvider, nextModelId));
-      activeInputModalities = nextInputModalities;
-      runtime.model = next.model;
+    /**
+     * The state of one model, independent of any runtime that runs it.
+     *
+     * A runtime used to carry ONE current model for everybody sharing it, so a
+     * chat that switched models moved the workspace's model with it. A model
+     * state is the alternative: it is built per (provider, model) pair and
+     * handed to whoever asked, so the model a chat runs with belongs to that
+     * chat and to nobody else.
+     */
+    async function buildModelState(nextSettings: SettingsStore, nextProviderId: string, nextModelId: string): Promise<ModelState> {
+      const parts = await resolveModelParts(nextSettings, nextProviderId, nextModelId);
+      return {
+        providerId: nextProviderId,
+        modelId: nextModelId,
+        modelName: resolveModelName(nextProviderId, nextModelId),
+        providerName: resolveProviderName(nextProviderId),
+        model: parts.model,
+        contextWindowTokens: parts.contextWindowTokens,
+        outputLimitTokens: parts.budget.output,
+        supportsVision: modelSupportsVision(nextProviderId, nextModelId, parts.resolved),
+        supportsImageToolResult: supportsImageToolResult(parts.resolved, nextModelId),
+        reasoningVariants: parts.variants,
+        reasoningTitles: reasoningSummaryTitles(parts.resolved),
+        reasoningMetadataSource: parts.catalog.inferred ? parts.catalog.sourceProviderId : null,
+        reasoningSupport: reasoningSupportStatus(parts.resolved, parts.catalog.model),
+        getReasoningProviderOptions: (variantId: string, visible: boolean) => {
+          const effective = resolveReasoningVariant(parts.variants, variantId);
+          return mergeProviderOptions(withReasoningVisibility(parts.resolved, effective.providerOptions, visible), parts.routing);
+        },
+        get registry() {
+          return registryFor(parts.inputModalities);
+        },
+      };
+    }
+
+    /**
+     * The state of one model, built once per (provider, model) pair.
+     *
+     * The cache carries the provider configuration the state was built from: a
+     * settings change (a new key, a different context limit) produces a
+     * different fingerprint, so the state is rebuilt instead of answering with
+     * a stale one.
+     */
+    const modelStateCache: { [key: string]: { fingerprint: string; state: ModelState } } = {};
+    function modelFingerprint(providerId: string, modelId: string): string {
+      const provider = loadSettings().providers[providerId];
+      return JSON.stringify([provider, provider?.modelSpecs?.[modelId], getCatalogRevision()]);
+    }
+    /**
+     * The state of the model the workspace runtime already runs: its own
+     * fields, live.
+     *
+     * A chat that keeps the workspace's model gets the runtime's own model
+     * object, so one model has one instance instead of two - and a chat that
+     * picks a different model never disturbs this one.
+     */
+    function currentModelState(): ModelState {
+      return {
+        providerId: runtime.providerId,
+        modelId: runtime.modelId,
+        modelName: runtime.modelName,
+        providerName: runtime.providerName ?? '',
+        model: runtime.model,
+        contextWindowTokens: runtime.contextWindowTokens,
+        outputLimitTokens: runtime.outputLimitTokens,
+        supportsVision: runtime.supportsVision,
+        supportsImageToolResult: runtime.supportsImageToolResult,
+        reasoningVariants: runtime.reasoningVariants,
+        reasoningTitles: runtime.reasoningTitles === true,
+        reasoningMetadataSource: runtime.reasoningMetadataSource,
+        reasoningSupport: runtime.reasoningSupport,
+        getReasoningProviderOptions: (variantId: string, visible: boolean) => runtime.getReasoningProviderOptions(variantId, visible),
+        get registry() {
+          return runtime.registry;
+        },
+      };
+    }
+
+    async function modelStateFor(providerId: string, modelId: string): Promise<ModelState> {
+      // The workspace's own model needs no state of its own: the runtime
+      // already carries it, live.
+      if (providerId === runtime.providerId && modelId === runtime.modelId) return currentModelState();
+      const key = modelStateKey(providerId, modelId);
+      const fingerprint = modelFingerprint(providerId, modelId);
+      const cached = modelStateCache[key];
+      if (cached && cached.fingerprint === fingerprint) return cached.state;
+      const state = await buildModelState(loadSettings(), providerId, modelId);
+      modelStateCache[key] = { fingerprint, state };
+      return state;
+    }
+
+    async function applyModel(nextSettings: SettingsStore, nextProviderId: string, nextModelId: string) {
+      const parts = await resolveModelParts(nextSettings, nextProviderId, nextModelId);
+
+      activeResolved = parts.resolved;
+      activeCatalog = parts.catalog;
+      activeVariants = parts.variants;
+      activeRouting = parts.routing;
+      activeInputModalities = parts.inputModalities;
+      runtime.model = parts.model;
       runtime.modelName = resolveModelName(nextProviderId, nextModelId);
       runtime.providerName = resolveProviderName(nextProviderId);
       runtime.providerId = nextProviderId;
       runtime.modelId = nextModelId;
-      runtime.contextWindowTokens = nextContextWindowTokens;
-      runtime.outputLimitTokens = nextBudget.output;
-      runtime.supportsVision = modelSupportsVision(nextProviderId, nextModelId, next.resolved);
-      runtime.supportsImageToolResult = supportsImageToolResult(next.resolved, nextModelId);
-      runtime.reasoningVariants = nextVariants;
-      runtime.reasoningTitles = reasoningSummaryTitles(next.resolved);
-      runtime.reasoningMetadataSource = nextCatalog.inferred ? nextCatalog.sourceProviderId : null;
-      runtime.reasoningSupport = reasoningSupportStatus(next.resolved, nextCatalog.model);
-      runtime.reasoningDefault = resolveReasoningVariant(nextVariants, nextSettings.reasoning ?? 'default').id;
-      runtime.registry = nextRegistry;
+      runtime.contextWindowTokens = parts.contextWindowTokens;
+      runtime.outputLimitTokens = parts.budget.output;
+      runtime.supportsVision = modelSupportsVision(nextProviderId, nextModelId, parts.resolved);
+      runtime.supportsImageToolResult = supportsImageToolResult(parts.resolved, nextModelId);
+      runtime.reasoningVariants = parts.variants;
+      runtime.reasoningTitles = reasoningSummaryTitles(parts.resolved);
+      runtime.reasoningMetadataSource = parts.catalog.inferred ? parts.catalog.sourceProviderId : null;
+      runtime.reasoningSupport = reasoningSupportStatus(parts.resolved, parts.catalog.model);
+      runtime.reasoningDefault = resolveReasoningVariant(parts.variants, nextSettings.reasoning ?? 'default').id;
+      runtime.registry = registryFor(parts.inputModalities);
       appliedModelConfig = modelConfig(nextSettings);
     }
     const runtime: AgentEnvironment = {
@@ -400,7 +533,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         runtime.supportsVision = false;
         if (!activeInputModalities.includes('image')) return;
         const nextInputModalities = activeInputModalities.filter((modality) => modality !== 'image');
-        const nextRegistry = createRegistry(nextInputModalities);
+        const nextRegistry = registryFor(nextInputModalities);
         activeInputModalities = nextInputModalities;
         runtime.registry = nextRegistry;
       },
@@ -443,7 +576,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
             : (minimalReasoningOptions(activeResolved, activeCatalog.model) ?? {}),
           reviewer.resolved ? reviewer.routing : activeRouting,
         ),
-      registry: createRegistry(activeInputModalities),
+      registry: registryFor(activeInputModalities),
       ...(options.recordUsage ? { recordUsage: options.recordUsage } : {}),
 
       getPeerCapabilities: () => ({
@@ -469,12 +602,18 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
           const previousMemoryIndex = memoryIndex;
           workspaceRoot = nextRoot;
           memoryIndex = nextMemoryIndex;
+          // Every cached registry was built for the previous scope.
+          for (const key of Object.keys(registryCache)) delete registryCache[key];
+          registryCache[activeInputModalities.join(',')] = nextRegistry;
           runtime.registry = nextRegistry;
           await previousMemoryIndex.close();
         });
         workspaceSwitch = run.catch(() => {});
         await run;
       },
+      // A session asks for the state of the model it wants; the runtime builds
+      // or hands back that state without moving its own model slot.
+      modelFor: (providerId: string, modelId: string) => modelStateFor(providerId, modelId),
       restoreModel: async (nextProviderId, nextModelId) => {
         const restore = settingsReload.then(async () => {
           if (runtimeClosed) throw new Error('The runtime is closed.');
@@ -533,7 +672,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
           runtime.approvalMode = latest.approvalMode;
           const toolsChanged = reloadTools && mcpReady && (await mcp!.reload(latest.mcpServers));
           if (toolsChanged || mcp!.revision !== appliedMcpRevision) {
-            runtime.registry = createRegistry(activeInputModalities);
+            resetRegistries();
             appliedMcpRevision = mcp!.revision;
           }
         });

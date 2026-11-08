@@ -22,6 +22,7 @@ import {
 } from './session-store.js';
 import { isToolRequestWhitelisted, rememberToolRequest } from './tool-permissions.js';
 import { daemonCommandAction } from './commands/registry.js';
+import type { ModelState } from './model-state.js';
 import { ensureHostOwnedRoots } from './host-owned-paths.js';
 import { consumeApproval, recordDeniedAction } from './review-overrides.js';
 import { resolveReasoningVariant, type ReasoningSupport, type ReasoningVariant } from './provider/registry.js';
@@ -131,6 +132,15 @@ export interface AgentEnvironment extends AgentSessionRuntimeView {
   selectWorkspaceRoot?: (workspaceRoot: string) => Promise<void>;
   /** Accounting sink; absent when nothing owns a ledger (tests, one-off runs). */
   recordUsage?: (input: UsageRecordInput, id: string) => void;
+
+  /**
+   * The state of one model, built per (provider, model) pair.
+   *
+   * A session asks for the model it wants; the runtime hands back a state
+   * without moving its own model slot, so two chats in one workspace cannot
+   * move each other's model.
+   */
+  modelFor?: (providerId: string, modelId: string) => Promise<ModelState>;
 
   selectModel: (providerId: string, modelId: string) => Promise<void>;
   /** Activate a saved conversation's model without changing global defaults. */
