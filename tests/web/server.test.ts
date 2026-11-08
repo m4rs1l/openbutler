@@ -93,6 +93,12 @@ const client = {
     Object.assign(client.runtime, { providerId, modelId });
     publish();
   }),
+  // The effort belongs to this chat: it is recorded with the session, never
+  // with the machine default.
+  setReasoningPreference: vi.fn(async (variantId: string) => {
+    Object.assign(client.runtime, { reasoningDefault: variantId });
+    snapshot = { ...snapshot, session: { ...snapshot.session, reasoning: variantId } };
+  }),
   close: vi.fn(),
 } as unknown as AgentSessionClient;
 let server: WebServer;
@@ -255,10 +261,10 @@ describe('browser session controls', () => {
       });
     const modelChange = await postDefault('/api/model', { providerId: 'local', modelId: 'model-a', sessionId: 'session-a' });
     expect(modelChange.status).toBe(409);
-    // The effort is a preference: no busy gate, and the payload carries the new default.
+    // The effort is a preference of this chat: it is recorded with the chat.
     const effort = await postDefault('/api/reasoning', { reasoningVariantId: 'high', sessionId: 'session-a' });
     expect(effort.status).toBe(200);
-    expect(client.runtime.saveReasoningPreference).toHaveBeenCalledWith('high');
+    expect(client.setReasoningPreference).toHaveBeenCalledWith('high');
     expect(((await effort.json()) as { runtime: { reasoningDefault: string } }).runtime.reasoningDefault).toBe('high');
     const unsupported = await postDefault('/api/reasoning', { reasoningVariantId: 'nope', sessionId: 'session-a' });
     expect(unsupported.status).toBe(400);

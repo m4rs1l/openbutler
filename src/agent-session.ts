@@ -24,7 +24,7 @@ import { isToolRequestWhitelisted, rememberToolRequest } from './tool-permission
 import { daemonCommandAction } from './commands/registry.js';
 import { ensureHostOwnedRoots } from './host-owned-paths.js';
 import { consumeApproval, recordDeniedAction } from './review-overrides.js';
-import type { ReasoningSupport, ReasoningVariant } from './provider/registry.js';
+import { resolveReasoningVariant, type ReasoningSupport, type ReasoningVariant } from './provider/registry.js';
 import { geminiToolSchemaSanitizer } from './provider/gemini-schema.js';
 import { isProviderCommand, runProviderCommand } from './provider/provider-command.js';
 import { loadSettings, type ApprovalMode } from './settings.js';
@@ -96,6 +96,20 @@ export interface AgentSessionRuntimeView {
   reportRetry?: (handler: ((event: RetryEvent) => void) | null) => void;
   approvalMode?: ApprovalMode;
   saveApprovalModePreference?: (mode: ApprovalMode) => void;
+}
+
+/**
+ * The stored effort expressed in the levels a model offers.
+ *
+ * A level the model does not offer cannot stay the choice the picker shows, so
+ * it is degraded to the nearest level below - never raised. The stored value
+ * itself is kept by the caller, so switching back restores the choice.
+ */
+function remapEffort(variants: ReadonlyArray<{ id: string; label: string }>, stored: string): string {
+  return resolveReasoningVariant(
+    variants.map((variant) => ({ ...variant, providerOptions: {} })),
+    stored,
+  ).id;
 }
 
 export interface AgentEnvironment extends AgentSessionRuntimeView {
@@ -228,6 +242,12 @@ export interface AgentSessionClient {
   sendMessage(message: QueuedMessage, preferences: AgentTurnPreferences): Promise<void>;
   compact(preferences: AgentTurnPreferences, recovery?: boolean): Promise<void>;
   selectModel(providerId: string, modelId: string): Promise<void>;
+  /**
+   * Records the effort for THIS chat. The machine default in settings.yaml is
+   * never touched, so another chat keeps running its own choice and the two
+   * surfaces cannot disagree about what a chat runs with.
+   */
+  setReasoningPreference(variantId: string): void | Promise<void>;
   setApprovalMode(mode: ApprovalMode): Promise<void>;
   listSessions(): SessionSummary[] | Promise<SessionSummary[]>;
   loadSession(id: string): SavedSession | AgentSessionView | null | Promise<SavedSession | AgentSessionView | null>;
@@ -858,8 +878,8 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   async selectModel(providerId: string, modelId: string): Promise<void> {
-    if (this.busy) return;
     const sameModel = modelId === this.session.modelId;
+    if (this.busy) return;
     await this.runtime.selectModel(providerId, modelId);
     // No divider here on purpose: the switch is a choice, not a message. The
     // transcript records it above the first message that runs with it, which is
@@ -869,6 +889,7 @@ export class AgentSessionController implements AgentSessionClient {
       this.lastContextUsage = undefined;
       this.lastContextEstimate = undefined;
     }
+    const variants = this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
     this.session = {
       ...this.session,
       providerId,
@@ -877,19 +898,18 @@ export class AgentSessionController implements AgentSessionClient {
       // activated a model. Recording this chat's own list here is what lets the
       // picker answer for the model this chat reports, even while another chat
       // has the runtime bound to a different one.
-      ...(this.runtime.reasoningVariants.length > 0
-        ? { reasoningVariants: this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label })) }
-        : {}),
+      ...(variants.length > 0 ? { reasoningVariants: variants } : {}),
       ...(this.runtime.contextWindowTokens === null ? {} : { contextWindowTokens: this.runtime.contextWindowTokens }),
     };
     if (!sameModel) {
       delete this.session.contextTokens;
       delete this.session.contextEstimateTokens;
-      // An effort the new model cannot take is dropped rather than shown as a
-      // selection the model will not honour; the chat then reports the runtime's
-      // default, which resolveReasoningVariant already proved is in this model's list.
-      if (this.session.reasoning !== undefined && !this.runtime.reasoningVariants.some((variant) => variant.id === this.session.reasoning))
-        delete this.session.reasoning;
+      // The chat's own effort is RE-MAPPED onto the new model's levels, never
+      // dropped: a dropped choice falls back to the machine default, so the
+      // chat silently changes how it runs and the picker shows an effort the
+      // owner never picked.
+      if (this.session.reasoning !== undefined && variants.length > 0)
+        this.session = { ...this.session, reasoning: remapEffort(variants, this.session.reasoning) };
     }
     if (this.runtime.contextWindowTokens === null) delete this.session.contextWindowTokens;
     this.publish();
@@ -1160,7 +1180,6 @@ export class AgentSessionController implements AgentSessionClient {
 
   /** The admitted turn's own message preferences; cleared when the run settles. */
   private activeTurnPreferences: AgentTurnPreferences | null = null;
-  private reasoningDefaultAtTurnStart = 'default';
   /** Last effort announced in the transcript; null until the first admission pins it. */
   private announcedEffort: string | null = null;
   /** Last model announced in the transcript; null until the first admission pins it. */
@@ -1169,10 +1188,10 @@ export class AgentSessionController implements AgentSessionClient {
 
   /**
    * Turn preferences as they are right now. The admitted turn's message owns
-   * them; an explicit change to this session's effort made while it runs (a
-   * picker save on any attached client) still applies immediately by
-   * overriding them for the rest of the turn instead of waiting for it to end.
-   * The session record is the source of both values.
+   * them and keeps them for its whole life: an effort changed while the turn
+   * runs belongs to the NEXT turn, which is where the transcript announces it.
+   * Moving the ground under a request that is already in flight is what made
+   * a chat answer with an effort nobody picked.
    */
   private liveTurnPreferences(): AgentTurnPreferences {
     const turn = this.activeTurnPreferences;
@@ -1181,10 +1200,9 @@ export class AgentSessionController implements AgentSessionClient {
         reasoningVariantId: this.sessionReasoning(),
         showReasoning: this.sessionShowReasoning(),
       };
-    const changed = this.sessionReasoning() !== this.reasoningDefaultAtTurnStart;
     const visibilityChanged = this.sessionShowReasoning() !== this.showReasoningAtTurnStart;
     return {
-      reasoningVariantId: changed ? this.sessionReasoning() : turn.reasoningVariantId,
+      reasoningVariantId: turn.reasoningVariantId,
       showReasoning: visibilityChanged ? this.sessionShowReasoning() : turn.showReasoning,
     };
   }
@@ -1953,7 +1971,6 @@ export class AgentSessionController implements AgentSessionClient {
         // selected model at the turn boundary, never silently use another
         // session's most recently activated model.
         await this.restoreSessionModel();
-        this.reasoningDefaultAtTurnStart = this.sessionReasoning();
         this.showReasoningAtTurnStart = this.sessionShowReasoning();
         if (current.workspaceRoot) {
           if (this.runtime.selectWorkspaceRoot) await this.runtime.selectWorkspaceRoot(current.workspaceRoot);

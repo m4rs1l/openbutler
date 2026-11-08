@@ -1493,7 +1493,10 @@ export function SessionScreen({
         if (variant) {
           setReasoningVariantId(variant.id);
           try {
-            runtime.saveReasoningPreference(variant.id);
+            // The chat owns its effort, exactly as the web chat does. Writing
+            // the machine default here made the same concept live in two
+            // places, and the two surfaces disagreed about what a chat runs with.
+            controller.setReasoningPreference(variant.id);
           } catch (error) {
             addEntry({ kind: 'notice', text: error instanceof Error ? error.message : String(error) });
           }

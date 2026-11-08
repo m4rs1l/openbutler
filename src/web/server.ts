@@ -896,7 +896,11 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const provider = providerId ? settings.providers[providerId] : undefined;
       if (!providerId || !modelId || !provider?.enabled || !(provider.models ?? []).includes(modelId))
         return sendJson(res, 400, { error: 'Choose a configured model.' });
-      const described = describeModelReasoning(providerId, modelId, provider, settings.reasoning);
+      // The CHAT owns its effort. The machine default in settings.yaml only
+      // seeds a chat that never chose one; answering from it here is what made
+      // the picker show one effort while the next request ran with another.
+      const preferred = client.getSnapshot().session.reasoning ?? settings.reasoning;
+      const described = describeModelReasoning(providerId, modelId, provider, preferred);
       if (!described) return sendJson(res, 400, { error: 'That provider is not configured.' });
       return sendJson(res, 200, {
         reasoningVariants: described.variants.map(({ id, label }) => ({ id, label })),
@@ -1102,7 +1106,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     }
 
     // Unlike the model, the effort is a preference: it may change while a run
-    // is going, and the next model request picks it up from the runtime.
+    // is going, and it belongs to the next turn, not to the running one.
     if (url.pathname === '/api/reasoning' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)) || '{}') as { reasoningVariantId?: unknown; sessionId?: unknown };
       if (body.sessionId !== client.getSnapshot().session.id) return sendJson(res, 409, { error: 'The active chat changed. Try again.' });
@@ -1116,7 +1120,10 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         !offered.some((variant) => variant.id === body.reasoningVariantId)
       )
         return sendJson(res, 400, { error: 'Choose a supported effort level.' });
-      client.runtime.saveReasoningPreference(body.reasoningVariantId);
+      // The effort is recorded with this chat and takes effect on its next
+      // turn, never in the middle of the running one. The host's answer is
+      // awaited so the response carries the view the chat now runs with.
+      await client.setReasoningPreference(body.reasoningVariantId);
       const entries = client.getServerEntries();
       const from = tailWindowStart(entries);
       return sendJson(res, 200, snapshotPayload(entries.slice(from), true, from, client));

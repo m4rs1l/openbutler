@@ -274,6 +274,15 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.request('session.select-model', { providerId, modelId }).then(() => undefined);
   }
 
+  /**
+   * The effort belongs to this chat: the host records it with the session and
+   * answers with the view that session now runs with. The machine default is
+   * never written from here.
+   */
+  setReasoningPreference(variantId: string): Promise<void> {
+    return this.request('runtime.save-reasoning', { variantId }).then(() => undefined);
+  }
+
   setApprovalMode(mode: ApprovalMode): Promise<void> {
     return this.request('runtime.save-approval-mode', { mode }).then(() => undefined);
   }
