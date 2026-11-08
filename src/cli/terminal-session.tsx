@@ -17,7 +17,13 @@ import type { AgentSessionClient } from '../agent-session.js';
 import { commandMenu } from '../commands/registry.js';
 import { getCatalogIndex, getProvider, listProviderSummaries } from '../provider/catalog.js';
 import { resolveModelName } from '../provider/model-presentation.js';
-import { listSupportedPackages, listCatalogModels, providerIsConfigured, resolveReasoningVariant } from '../provider/registry.js';
+import {
+  listSupportedPackages,
+  listCatalogModels,
+  providerIsConfigured,
+  resolveReasoningVariant,
+  type ReasoningVariant,
+} from '../provider/registry.js';
 import { loadSettings, rememberProviderModel } from '../settings.js';
 import { listSavedSessions, type SessionEntry, type SessionSummary, type NoticeTone } from '../session-store.js';
 import { upsertProvider, writeSettings } from './config-edit.js';
@@ -252,6 +258,12 @@ export function SessionScreen({
   const runtime = controller.runtime;
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   const activeSession = snapshot.session;
+  // The effort levels belong to the model this chat runs with, and the chat
+  // records its own list. The runtime's list describes whichever model the
+  // shared runtime holds, which is not necessarily this chat's model.
+  const reasoningLevels: ReasoningVariant[] = activeSession.reasoningVariants
+    ? activeSession.reasoningVariants.map((variant) => ({ ...variant, providerOptions: {} }))
+    : runtime.reasoningVariants;
   const entries = activeSession.entries;
   const lastWorkerIndex = useMemo(() => lastWorkerEntryIndex(entries), [entries]);
   const pending = snapshot.pendingApproval;
@@ -306,9 +318,7 @@ export function SessionScreen({
   const [sessionSelection, setSessionSelection] = useState(0);
   const [selectedTheme, setSelectedTheme] = useState<UiTheme>(initialTheme);
   const [settingsSelection, setSettingsSelection] = useState(0);
-  const [reasoningVariantId, setReasoningVariantId] = useState(
-    () => resolveReasoningVariant(runtime.reasoningVariants, runtime.reasoningDefault).id,
-  );
+  const [reasoningVariantId, setReasoningVariantId] = useState(() => resolveReasoningVariant(reasoningLevels, runtime.reasoningDefault).id);
   const [reasoningSelection, setReasoningSelection] = useState(0);
   const [thinkingSelection, setThinkingSelection] = useState(runtime.showReasoningDefault ? 1 : 0);
   const [showReasoning, setShowReasoning] = useState(runtime.showReasoningDefault);
@@ -349,7 +359,7 @@ export function SessionScreen({
   }, []);
   const [layoutMetrics, setLayoutMetrics] = useState({ contentHeight: 0, viewportHeight: 0, composerTop: 0, hasMeasured: false });
   const [transcriptHeightRevision, setTranscriptHeightRevision] = useState(0);
-  const activeReasoningLabel = runtime.reasoningVariants.find((variant) => variant.id === reasoningVariantId)?.label ?? reasoningVariantId;
+  const activeReasoningLabel = reasoningLevels.find((variant) => variant.id === reasoningVariantId)?.label ?? reasoningVariantId;
   const maxScrollTop = Math.max(0, layoutMetrics.contentHeight - layoutMetrics.viewportHeight);
   const scrollTop = Math.min(requestedScrollTop, maxScrollTop);
   // Folding a block shortens the transcript under a reader who is not following
@@ -628,12 +638,17 @@ export function SessionScreen({
       const settings = loadSettings();
       rememberProviderModel(settings, providerId, modelId);
       writeSettings(settings);
-      const reasoning = resolveReasoningVariant(runtime.reasoningVariants, runtime.reasoningDefault).id;
+      // The levels of the model this chat will run with next are the
+      // chat's own, not the runtime's.
+      const levels = controller.getSnapshot().session.reasoningVariants;
+      const picked = levels ? levels.map((variant) => ({ ...variant, providerOptions: {} })) : runtime.reasoningVariants;
+      const chosen = controller.getSnapshot().session.reasoning;
+      const reasoning = chosen ?? resolveReasoningVariant(picked, runtime.reasoningDefault).id;
       setReasoningVariantId(reasoning);
       setReasoningSelection(
         Math.max(
           0,
-          runtime.reasoningVariants.findIndex((variant) => variant.id === reasoning),
+          picked.findIndex((variant) => variant.id === reasoning),
         ),
       );
       setProviderOpen(false);
@@ -725,7 +740,7 @@ export function SessionScreen({
         return;
       }
       if (commandOnly && text === '/reasoning') {
-        const index = runtime.reasoningVariants.findIndex((variant) => variant.id === reasoningVariantId);
+        const index = reasoningLevels.findIndex((variant) => variant.id === reasoningVariantId);
         setReasoningSelection(Math.max(0, index));
         setReasoningOpen(true);
         return;
@@ -1485,11 +1500,11 @@ export function SessionScreen({
         return;
       }
       if (reasoningOpen && key.upArrow) {
-        setReasoningSelection((index) => (index + runtime.reasoningVariants.length - 1) % runtime.reasoningVariants.length);
+        setReasoningSelection((index) => (index + reasoningLevels.length - 1) % reasoningLevels.length);
       } else if (reasoningOpen && key.downArrow) {
-        setReasoningSelection((index) => (index + 1) % runtime.reasoningVariants.length);
+        setReasoningSelection((index) => (index + 1) % reasoningLevels.length);
       } else if (reasoningOpen && key.return) {
-        const variant = runtime.reasoningVariants[reasoningSelection];
+        const variant = reasoningLevels[reasoningSelection];
         if (variant) {
           setReasoningVariantId(variant.id);
           try {
@@ -1859,14 +1874,14 @@ export function SessionScreen({
           subtitle={`${runtime.providerId}/${runtime.modelId}`}
           hint="↑/↓ move · Enter select · Esc close"
         >
-          {runtime.reasoningVariants.length <= 1 ? (
+          {reasoningLevels.length <= 1 ? (
             <Text dimColor>
               {(runtime.reasoningSupport ?? 'model-unsupported') === 'adapter-unmapped'
                 ? 'This model lists reasoning support, but OpenButler has no reasoning mapping for this adapter yet.'
                 : 'No selectable reasoning variants are listed for this model.'}
             </Text>
           ) : (
-            runtime.reasoningVariants.map((variant, index) => (
+            reasoningLevels.map((variant, index) => (
               <Box key={variant.id} width="100%" {...(reasoningSelection === index ? { backgroundColor: tokens.accent } : {})}>
                 <Text {...(reasoningSelection === index ? { color: tokens.onAccent } : { color: tokens.accent })}>
                   {reasoningSelection === index ? `${glyphs.prompt} ` : '  '}

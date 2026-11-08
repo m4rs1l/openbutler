@@ -53,6 +53,7 @@ export { workerLimitError } from './host/worker-service.js';
 import {
   loadSettings,
   loadSecrets,
+  rememberProviderModel,
   saveSettings,
   type ApprovalMode,
   type SettingsStore,
@@ -3352,6 +3353,17 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           const provider = loadSettings().providers[providerId];
           const described = provider ? describeModelReasoning(providerId, modelId, provider) : null;
           await controller.selectModel(providerId, modelId, described?.variants);
+          // The pick teaches the settings which model id this workspace
+          // uses, so the model keeps showing up in the picker. The runtime
+          // used to record this when it activated a model; a chat no longer
+          // activates the runtime's model, so the daemon records it here.
+          try {
+            const latest = loadSettings();
+            rememberProviderModel(latest, providerId, modelId);
+            saveSettings(latest);
+          } catch (error) {
+            options.log(`Could not record the picked model ${providerId}/${modelId}: ${String(error)}`);
+          }
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         }
@@ -3561,7 +3573,19 @@ export function toRuntimeView(
   runtime: AgentEnvironment,
   workspaceRoot = runtime.workspaceRoot,
   session?: Pick<SavedSession, 'providerId' | 'modelId'> &
-    Partial<Pick<SavedSession, 'reasoning' | 'showReasoning' | 'contextWindowTokens' | 'reasoningVariants'>>,
+    Partial<
+      Pick<
+        SavedSession,
+        | 'reasoning'
+        | 'showReasoning'
+        | 'contextWindowTokens'
+        | 'reasoningVariants'
+        | 'supportsVision'
+        | 'reasoningSupport'
+        | 'reasoningMetadataSource'
+        | 'reasoningTitles'
+      >
+    >,
 ): RuntimeViewData {
   // The session is the authority for what THIS chat runs with. The shared
   // runtime may still be bound to another session's model until the next turn
@@ -3600,13 +3624,18 @@ export function toRuntimeView(
     providerId,
     modelId,
     contextWindowTokens: active ? runtime.contextWindowTokens : (session?.contextWindowTokens ?? null),
-    supportsVision: runtime.supportsVision,
+    // The facts of a model belong to the model, and the session records
+    // the ones of the model THIS chat runs with. The runtime's facts
+    // describe whichever model the workspace runtime holds, and a chat no
+    // longer moves that model - so the session's facts win.
+    supportsVision: session?.supportsVision ?? runtime.supportsVision,
     reasoningVariants,
-    reasoningMetadataSource: runtime.reasoningMetadataSource,
-    reasoningSupport: runtime.reasoningSupport,
+    reasoningMetadataSource:
+      session?.reasoningMetadataSource !== undefined ? session.reasoningMetadataSource : runtime.reasoningMetadataSource,
+    reasoningSupport: session?.reasoningSupport ?? runtime.reasoningSupport,
     reasoningDefault,
     showReasoningDefault: session?.showReasoning ?? runtime.showReasoningDefault,
-    reasoningTitles: runtime.reasoningTitles === true,
+    reasoningTitles: (session?.reasoningTitles ?? runtime.reasoningTitles) === true,
     approvalMode: runtime.approvalMode ?? 'workspace',
   };
 }
