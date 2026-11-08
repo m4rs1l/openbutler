@@ -718,30 +718,57 @@ export function normalizeReasoningVariantId(variantId: string): string {
 }
 
 /**
+ * The effort levels a model can offer, cheapest first. This is the order the
+ * providers use, so "the nearest level below" is a well-defined distance.
+ */
+const EFFORT_LADDER = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/** The shape a model without any listed effort is governed by. */
+const DEFAULT_REASONING_VARIANT: ReasoningVariant = { id: 'default', label: 'Default', providerOptions: {} };
+
+/**
  * The variant that actually governs a request.
  *
  * A stored preference goes stale whenever the default model changes, the
  * catalog updates, or an adapter mapping changes: the id is then absent from
  * the list, and resolving it at the call site used to send empty options
  * while the UI still showed the stored choice. Resolve at every read
- * instead: the listed preference wins; otherwise the strongest available
- * effort preserves the intent (a stale xhigh degrades to high, never to
- * nothing); models without reasoning stay on Default. The stored value is
- * kept as-is so switching back to a capable model restores the choice.
+ * instead.
+ *
+ * A stale id is degraded to the nearest level BELOW it, never raised to the
+ * strongest level the model offers: a stored "minimal" must not turn into
+ * "max", and a stored "xhigh" degrades to "high" rather than to whatever is
+ * loudest. A model with its own scale (budget variants) has no ladder to walk
+ * down, so it keeps the strongest offered effort; the same holds for an id
+ * that cannot be placed on the ladder at all. Models without reasoning stay
+ * on Default. The stored value is kept as-is so switching back to a capable
+ * model restores the choice.
  */
 export function resolveReasoningVariant(variants: readonly ReasoningVariant[], preferredId: string): ReasoningVariant {
   const preferred = normalizeReasoningVariantId(preferredId);
   const listed = variants.find((variant) => variant.id === preferred);
   if (listed) return listed;
-  const strongest = [...variants].reverse().find((variant) => variant.id !== 'default' && variant.id !== 'none');
-  return (
-    strongest ??
-    variants.find((variant) => variant.id === 'default') ?? {
-      id: 'default',
-      label: 'Default',
-      providerOptions: {},
+  const rank = EFFORT_LADDER.indexOf(preferred);
+  if (rank > 0) {
+    // A model that speaks the ladder can be degraded along it. "None" is not a
+    // lower effort but a different thing - reasoning switched off - so it never
+    // answers a degraded effort.
+    const speaksLadder = variants.some((variant) => variant.id !== 'default' && EFFORT_LADDER.includes(variant.id));
+    if (speaksLadder) {
+      for (let index = rank - 1; index >= 0; index -= 1) {
+        const id = EFFORT_LADDER[index];
+        if (id === 'none') continue;
+        const candidate = variants.find((variant) => variant.id === id);
+        if (candidate) return candidate;
+      }
+      return variants.find((variant) => variant.id === 'default') ?? DEFAULT_REASONING_VARIANT;
     }
-  );
+  }
+  // A model with its own scale (budget variants), or an id that cannot be
+  // placed on the ladder at all: the strongest offered effort preserves the
+  // intent, because there is no ladder to walk down.
+  const strongest = [...variants].reverse().find((variant) => variant.id !== 'default' && variant.id !== 'none');
+  return strongest ?? variants.find((variant) => variant.id === 'default') ?? DEFAULT_REASONING_VARIANT;
 }
 
 /**
