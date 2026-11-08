@@ -67,13 +67,13 @@ beforeEach(async () => {
   const settings = await import('../src/settings.js');
   const catalog = await import('../src/provider/catalog.js');
   catalog.writeCatalogSnapshot(
-    { vercel: { npm: '@ai-sdk/gateway', models: { mimo: { tool_call: true, limit: { context: 100_000 } } } } },
+    { fixture: { npm: '@ai-sdk/gateway', models: { modelx: { tool_call: true, limit: { context: 100_000 } } } } },
     new Date().toISOString(),
   );
   const store = settings.defaultSettings();
-  store.providers.vercel = { enabled: true, keys: ['fixture-a'], models: ['mimo'] };
-  store.defaultProvider = 'vercel';
-  store.defaultModel = 'mimo';
+  store.providers.fixture = { enabled: true, keys: ['fixture-a'], models: ['modelx'] };
+  store.defaultProvider = 'fixture';
+  store.defaultModel = 'modelx';
   settings.saveSettings(store);
 });
 
