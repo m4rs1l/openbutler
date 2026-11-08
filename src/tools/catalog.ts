@@ -17,17 +17,6 @@ import { createInboxTool } from './inbox.js';
 import { createSubagentStopTool } from './subagent-stop.js';
 import { createSubagentTool, type SubagentRequest } from './subagent.js';
 import type { ToolDefinition } from './registry.js';
-import { createTeamProfileTool, createTeamWorkTool } from './team-coordination.js';
-import {
-  createTeamFilesTool,
-  createTeamGroupTool,
-  createTeamHistoryTool,
-  createTeamReceiveFileTool,
-  createTeamSendFileTool,
-  createTeamSendTool,
-  createTeamDeliveryTool,
-  createTeamStatusTool,
-} from './team-communication.js';
 
 export interface ToolCatalogueOptions {
   workspaceRoot: string;
@@ -38,16 +27,6 @@ export interface ToolCatalogueOptions {
   onMcpConnectionsChanged: () => void;
   backgroundManage?: (input: Record<string, unknown>, workspaceRoot: string, senderSessionId: string | undefined) => Promise<unknown>;
   inbox?: (request: InboxRequest, sessionId: string | undefined) => Promise<unknown>;
-  teamDelivery?: (input: Record<string, unknown>) => Promise<unknown>;
-  teamSend?: (input: { recipient: string; text: string; replyTo?: string }) => Promise<unknown>;
-  teamGroup?: (limit: number, acknowledge?: number) => Promise<unknown>;
-  teamHistory?: (query: { scope: 'group' | 'dm'; peer?: string; before?: number; limit?: number }) => Promise<unknown>;
-  teamStatus?: () => Promise<unknown>;
-  teamSendFile?: (input: { path: string; to: string }) => Promise<unknown>;
-  teamReceiveFile?: (input: { id: string; to?: string }) => Promise<unknown>;
-  teamFiles?: () => Promise<unknown>;
-  teamProfile?: (input: Record<string, unknown>) => Promise<unknown>;
-  teamWork?: (input: Record<string, unknown>) => Promise<unknown>;
   subagent?: (request: SubagentRequest, senderSessionId: string | undefined, signal?: AbortSignal) => Promise<unknown> | unknown;
   subagentStop?: (input: { session: string }, senderSessionId: string | undefined) => Promise<unknown> | unknown;
 }
@@ -64,12 +43,13 @@ export interface ToolCatalogueOptions {
  * its own, built from what its spawn granted; that narrowing is containment, not
  * a condition on sessions.)
  *
- * Tools that address one layer are not in here at all. The owner channel belongs
- * to the custodian, and messaging is named after its addressee, so those are
- * registered by the runtime that owns them (`src/agent-runtime.ts`), and every
- * other runtime is
- * unaware of the name rather than told it is unavailable. A tool listed but
- * refused is a promise with small print.
+ * Tools that address one layer are not in here at all. The owner channel and the
+ * team surface belong to the custodian, and messaging is named after its
+ * addressee, so those are registered by the runtime that owns them
+ * (`src/agent-runtime.ts`) and every other runtime is unaware of the name rather
+ * than told it is unavailable. A tool listed but refused is a promise with small
+ * print: a chat that carried team_send could promise a peer something this
+ * machine would not stand behind, and a peer could not tell which layer spoke.
  */
 export function createToolCatalogue(options: ToolCatalogueOptions): ToolDefinition[] {
   const unavailable = (name: string) => async () => ({
@@ -90,16 +70,6 @@ export function createToolCatalogue(options: ToolCatalogueOptions): ToolDefiniti
     createSessionSearchTool(options.workspaceRoot),
     createSessionReadTool(),
     createInboxTool(options.inbox ?? unavailable('inbox')),
-    createTeamDeliveryTool(options.teamDelivery ?? (async () => ({ status: 'unavailable', error: 'Team delivery is not available.' }))),
-    createTeamSendTool(options.teamSend ?? unavailable('team_send')),
-    createTeamGroupTool(options.teamGroup ?? unavailable('team_group')),
-    createTeamHistoryTool(options.teamHistory ?? unavailable('team_history')),
-    createTeamStatusTool(options.teamStatus ?? unavailable('team_status')),
-    createTeamSendFileTool(options.teamSendFile ?? unavailable('team_send_file')),
-    createTeamReceiveFileTool(options.teamReceiveFile ?? unavailable('team_receive_file')),
-    createTeamFilesTool(options.teamFiles ?? unavailable('team_files')),
-    createTeamProfileTool(options.teamProfile ?? unavailable('team_profile')),
-    createTeamWorkTool(options.teamWork ?? unavailable('team_work')),
     createSubagentTool(options.subagent ?? (async () => ({ status: 'unavailable' as const }))),
     createSubagentStopTool(options.subagentStop ?? (async () => ({ status: 'unavailable' as const }))),
     createScheduleTool(

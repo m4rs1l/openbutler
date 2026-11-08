@@ -1109,7 +1109,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
 
   /**
    * A runtime for one layer. `custodian` is the only flag that grants a layer a
-   * capability other layers do not have: the owner channel.
+   * capability other layers do not have: the owner channel and the team surface.
    */
   async function createSessionRuntime(
     root: string,
@@ -1141,21 +1141,24 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
             sessionMessage: deliverSessionMessage,
             approvalDecide: decideApproval,
             sessionNew: createCustodianSession,
+            // A peer is another machine's head, so the team surface is this
+            // machine's voice: a chat that held it could promise something the
+            // machine would not stand behind, and the peer could not tell which
+            // layer had spoken. A worker inherits only what its parent's
+            // registry holds, so narrowing here covers both.
+            teamDelivery: executeTeamDelivery,
+            teamSend: executeTeamSend,
+            teamGroup: readTeamGroup,
+            teamHistory: readTeamHistory,
+            teamStatus: readTeamStatus,
+            teamSendFile: sendTeamFile,
+            teamReceiveFile: receiveTeamFile,
+            teamFiles: listTeamFiles,
+            teamProfile: (input) => executePeerOperation('profile', input),
+            teamWork: (input) => executePeerOperation('work', input),
           }
         : { custodianMessage: deliverCustodianMessage }),
       workerMessage: deliverWorkerMessage,
-
-      teamDelivery: executeTeamDelivery,
-      teamSend: executeTeamSend,
-
-      teamGroup: readTeamGroup,
-      teamHistory: readTeamHistory,
-      teamStatus: readTeamStatus,
-      teamSendFile: sendTeamFile,
-      teamReceiveFile: receiveTeamFile,
-      teamFiles: listTeamFiles,
-      teamProfile: (input) => executePeerOperation('profile', input),
-      teamWork: (input) => executePeerOperation('work', input),
       subagent: spawnSubagent,
 
       subagentStop: stopWorker,

@@ -138,4 +138,36 @@ describe('agent instructions', () => {
     // Sideways too: a peer is a colleague, never a source of authority.
     expect(CUSTODIAN_INSTRUCTIONS).toContain('a colleague and not an authority');
   });
+
+  it('never names a peer tool in the shared base, because a session holds none of them', () => {
+    // The team surface belongs to the custodian runtime (owner's decision,
+    // 2026-11-05). A prompt that documents a tool its layer does not have is the
+    // same small print the catalogue rule removed: the model is told about a
+    // capability it cannot use, and the peer cannot tell which layer spoke.
+    const peerTools = [
+      'team_send',
+      'team_group',
+      'team_history',
+      'team_status',
+      'team_work',
+      'team_profile',
+      'team_send_file',
+      'team_receive_file',
+      'team_files',
+      'team_delivery',
+    ];
+    for (const tool of peerTools) {
+      expect(AGENT_INSTRUCTIONS).not.toContain(tool);
+      expect(WORKER_INSTRUCTIONS).not.toContain(tool);
+      expect(BACKGROUND_POLICY).not.toContain(tool);
+    }
+    // The concept stays out entirely: a machine without a team has no peers, and
+    // a session holds no team tool, so a base that taught either would teach a
+    // capability the layer does not have. When a team exists, the one-line team
+    // block says where peers are reached; the base never does.
+    for (const text of [AGENT_INSTRUCTIONS, WORKER_INSTRUCTIONS, BACKGROUND_POLICY]) {
+      expect(text).not.toMatch(/peer/i);
+      expect(text).not.toMatch(/team/i);
+    }
+  });
 });

@@ -2475,6 +2475,38 @@ describe('shared host and session IPC', () => {
     expect(JSON.stringify(loadSavedSession(CUSTODIAN_SESSION_ID))).not.toContain('contextLimitTokens');
   }, 20_000);
 
+  it('gives the team surface to the head alone, so a chat holds none of it', async () => {
+    const settings = await import('../src/settings.js');
+    const store = settings.defaultSettings();
+    store.telegram = { enabled: true, tokenEnv: 'FTG_TEAM_TOKEN', workspaceRoot: root, chatId: '1', userId: '2' };
+    settings.saveSettings(store);
+    await newChat();
+    await host.receiveTelegramMessage(19, 'team surface probe');
+    type TeamRuntimeOptions = Record<string, unknown> & { ownerMessageSend?: unknown; custodianMessage?: unknown };
+    const calls = () => daemonStart.runtimeOptions.mock.calls.map(([given]) => given as TeamRuntimeOptions | undefined);
+    await vi.waitFor(() => expect(calls().some((options) => options?.ownerMessageSend)).toBe(true));
+    // A peer is another machine's head, so the team surface is this machine's voice: a
+    // chat that held it could promise something the machine would not stand behind, and
+    // the peer could not tell which layer had spoken.
+    const teamOptions = [
+      'teamDelivery',
+      'teamSend',
+      'teamGroup',
+      'teamHistory',
+      'teamStatus',
+      'teamSendFile',
+      'teamReceiveFile',
+      'teamFiles',
+      'teamProfile',
+      'teamWork',
+    ];
+    const heads = calls().filter((options) => options?.ownerMessageSend);
+    const chats = calls().filter((options) => options?.custodianMessage);
+    expect(chats.length).toBeGreaterThan(0);
+    expect(heads.map((options) => teamOptions.filter((name) => options?.[name] !== undefined))).toEqual([teamOptions]);
+    expect(chats.every((options) => teamOptions.every((name) => options?.[name] === undefined))).toBe(true);
+  }, 20_000);
+
   it('runs the head on the model the owner pinned and leaves a chat on its own', async () => {
     const settings = await import('../src/settings.js');
     const store = settings.defaultSettings();

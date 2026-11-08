@@ -47,6 +47,17 @@ import { createSessionMessageTool } from './tools/session-message.js';
 import { createWorkerMessageTool } from './tools/worker-message.js';
 import { createApprovalDecideTool } from './tools/approval-decide.js';
 import { createSessionNewTool } from './tools/session-new.js';
+import { createTeamProfileTool, createTeamWorkTool } from './tools/team-coordination.js';
+import {
+  createTeamDeliveryTool,
+  createTeamFilesTool,
+  createTeamGroupTool,
+  createTeamHistoryTool,
+  createTeamReceiveFileTool,
+  createTeamSendFileTool,
+  createTeamSendTool,
+  createTeamStatusTool,
+} from './tools/team-communication.js';
 
 /** A session cannot manage its context safely without a verified model limit.
  * Never silently invent an arbitrary 8k/32k window for unknown providers.
@@ -87,6 +98,11 @@ export interface CreateAgentRuntimeOptions {
   inbox?: (request: InboxRequest, sessionId: string | undefined) => Promise<unknown>;
   /** Owner-channel writer. Only the custodian runtime is given one, and its presence is what registers the tool. */
   ownerMessageSend?: (input: Record<string, unknown>, workspaceRoot: string) => Promise<unknown>;
+  /**
+   * Team surface. The custodian runtime is the only one given these, and a
+   * handler's presence is what registers its tool: the peers are other machines'
+   * heads, so a chat or a worker holding one would speak for this machine.
+   */
   teamDelivery?: (input: Record<string, unknown>) => Promise<unknown>;
   teamSend?: (input: { recipient: string; text: string; replyTo?: string }) => Promise<unknown>;
   teamGroup?: (limit: number, acknowledge?: number) => Promise<unknown>;
@@ -262,16 +278,6 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         },
         ...(options.backgroundManage ? { backgroundManage: options.backgroundManage } : {}),
         ...(options.inbox ? { inbox: options.inbox } : {}),
-        ...(options.teamDelivery ? { teamDelivery: options.teamDelivery } : {}),
-        ...(options.teamSend ? { teamSend: options.teamSend } : {}),
-        ...(options.teamGroup ? { teamGroup: options.teamGroup } : {}),
-        ...(options.teamHistory ? { teamHistory: options.teamHistory } : {}),
-        ...(options.teamStatus ? { teamStatus: options.teamStatus } : {}),
-        ...(options.teamSendFile ? { teamSendFile: options.teamSendFile } : {}),
-        ...(options.teamReceiveFile ? { teamReceiveFile: options.teamReceiveFile } : {}),
-        ...(options.teamFiles ? { teamFiles: options.teamFiles } : {}),
-        ...(options.teamProfile ? { teamProfile: options.teamProfile } : {}),
-        ...(options.teamWork ? { teamWork: options.teamWork } : {}),
         ...(options.subagent ? { subagent: options.subagent } : {}),
         ...(options.subagentStop ? { subagentStop: options.subagentStop } : {}),
       })) {
@@ -288,6 +294,20 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
       if (options.workerMessage) registry.register(createWorkerMessageTool(options.workerMessage));
       if (options.approvalDecide) registry.register(createApprovalDecideTool(options.approvalDecide));
       if (options.sessionNew) registry.register(createSessionNewTool(options.sessionNew));
+      // The team surface belongs to the head alone. A peer is another machine's
+      // custodian, so a chat or a worker that could address one would speak for
+      // this machine without standing behind what it promised, and the peer could
+      // not tell which layer had spoken.
+      if (options.teamDelivery) registry.register(createTeamDeliveryTool(options.teamDelivery));
+      if (options.teamSend) registry.register(createTeamSendTool(options.teamSend));
+      if (options.teamGroup) registry.register(createTeamGroupTool(options.teamGroup));
+      if (options.teamHistory) registry.register(createTeamHistoryTool(options.teamHistory));
+      if (options.teamStatus) registry.register(createTeamStatusTool(options.teamStatus));
+      if (options.teamSendFile) registry.register(createTeamSendFileTool(options.teamSendFile));
+      if (options.teamReceiveFile) registry.register(createTeamReceiveFileTool(options.teamReceiveFile));
+      if (options.teamFiles) registry.register(createTeamFilesTool(options.teamFiles));
+      if (options.teamProfile) registry.register(createTeamProfileTool(options.teamProfile));
+      if (options.teamWork) registry.register(createTeamWorkTool(options.teamWork));
       return registry;
     }
     let activeResolved = resolved.resolved;

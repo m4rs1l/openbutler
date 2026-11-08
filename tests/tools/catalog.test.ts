@@ -74,13 +74,6 @@ const ALWAYS_OFFERED = [
   'session_search',
   'session_read',
   'inbox',
-  'team_send',
-  'team_group',
-  'team_history',
-  'team_status',
-  'team_send_file',
-  'team_receive_file',
-  'team_files',
   'subagent',
   'subagent_stop',
   'mcp_manage',
@@ -103,6 +96,27 @@ describe('tool catalogue', () => {
     const names = catalogueNames();
     for (const layered of ['send_message_to_owner', 'session_message', 'custodian_message', 'worker_message', 'parent_message'])
       expect(names).not.toContain(layered);
+  });
+
+  it('leaves the team surface out of the shared catalogue', () => {
+    // A peer is another machine's head, so the team tools are this machine's
+    // voice. Listing them here would hand every chat and worker a way to promise
+    // a peer something the machine would not stand behind, and the peer could not
+    // tell which layer had spoken. The custodian's runtime registers them.
+    const names = catalogueNames();
+    for (const team of [
+      'team_delivery',
+      'team_send',
+      'team_group',
+      'team_history',
+      'team_status',
+      'team_send_file',
+      'team_receive_file',
+      'team_files',
+      'team_profile',
+      'team_work',
+    ])
+      expect(names).not.toContain(team);
   });
 
   it('never puts the owner-channel tool in the shared catalogue', () => {

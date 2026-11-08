@@ -132,6 +132,11 @@ export class ToolRegistry {
     return this.definitions.get(identity)?.title;
   }
 
+  /** Every registered tool's own name, so composition is readable from outside. */
+  names(): string[] {
+    return [...this.definitions.values()].map((definition) => definition.name);
+  }
+
   /**
    * A registry holding only the named host tools of this one. Names that do not
    * exist here are skipped, so a caller states what a session may use and gets
