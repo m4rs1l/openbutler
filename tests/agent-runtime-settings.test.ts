@@ -411,3 +411,33 @@ describe('live runtime settings', () => {
     expect(execute).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('a chat owns its model', () => {
+  it('keeps the shared runtime on its own model while one chat picks another', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const first = new AgentSessionController(runtime);
+    const second = new AgentSessionController(runtime);
+    try {
+      expect(first.getSnapshot().session.modelId).toBe('modelx');
+      expect(second.getSnapshot().session.modelId).toBe('modelx');
+
+      // One chat picks a different model.
+      await first.selectModel('fixture', 'minimax');
+
+      // That chat runs with the model it picked...
+      expect(first.getSnapshot().session.modelId).toBe('minimax');
+      // ...and the other chat keeps the model it had.
+      expect(second.getSnapshot().session.modelId).toBe('modelx');
+      // The shared runtime never moved: a chat asks for the state of the
+      // model it wants, it does not rebind the runtime that every other
+      // chat in the workspace shares.
+      expect(runtime.modelId).toBe('modelx');
+      expect(runtime.providerId).toBe('fixture');
+      // The machine default is untouched too.
+      expect(settings.loadSettings().defaultModel).toBe('modelx');
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+});
