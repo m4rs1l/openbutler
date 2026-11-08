@@ -111,6 +111,13 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     pendingWorkerReads,
   } = deps;
   const INBOX_REMINDER_MS = deps.inboxReminderMs;
+  /**
+   * How often a notification nobody opens may re-arm its own wake before the
+   * event is closed. Every retry delivers the same notice text, so an
+   * unbounded retry turns one unread notification into permanent noise: the
+   * parent sees the identical reminder every few minutes, forever.
+   */
+  const MAX_UNREAD_REMINDERS = 12;
 
   /** Worker write leases (parallel-write policy): normalized path -> the worker that claimed it for its current run. */
   const workerFileLeases = new Map<string, string>();
@@ -122,6 +129,41 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       ledger.setState(`worker:retry:${event.id}`, String(due));
       scheduleEventRetry(due);
     }
+  }
+
+  /**
+   * Defer a wake that re-arms a notification the parent has not opened.
+   *
+   * Every deferral delivers the same notice text again, so a parent that
+   * never opens the notification would be woken by it forever: one unread
+   * notification turns into permanent noise, repeating the identical
+   * reminder every few minutes. Count the reminders and close the event at
+   * the ceiling. The notification itself stays in the inbox and stays
+   * readable - only the wake loop ends.
+   */
+  function deferReminderOrClose(event: ObservedEventRow, reason: string): void {
+    const remindKey = `worker:remind:${event.id}`;
+    const reminders = Number(ledger.getState(remindKey) ?? '0') || 0;
+    ledger.setState(remindKey, String(reminders + 1));
+    deferWorkerEvent(event, INBOX_REMINDER_MS, reason);
+  }
+
+  /**
+   * Close a notification event that has already used up its reminders.
+   *
+   * The ceiling is checked before the wake is delivered, so the last
+   * reminder is the last thing the parent sees: an event past the ceiling
+   * is closed silently instead of waking the parent one more time with the
+   * same notice. The notification itself stays in the inbox and stays
+   * readable - only the wake loop ends.
+   */
+  function closeUnreadEvent(event: ObservedEventRow): boolean {
+    const remindKey = `worker:remind:${event.id}`;
+    const reminders = Number(ledger.getState(remindKey) ?? '0') || 0;
+    if (reminders < MAX_UNREAD_REMINDERS) return false;
+    ledger.setEventState(event.id, 'ignored', 'The parent did not open the notification; it stays in the inbox and no longer wakes it.');
+    ledger.setState(remindKey, '0');
+    return true;
   }
 
   async function processWorkerEvent(event: ObservedEventRow): Promise<void> {
@@ -190,6 +232,9 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       deferWorkerEvent(event, 0, 'Automatic wake is held by the owner.');
       return;
     }
+    // Past the reminder ceiling the event is closed without another wake:
+    // the parent has already seen the same notice MAX_UNREAD_REMINDERS times.
+    if (closeUnreadEvent(event)) return;
     const controller = parent;
     const attemptId = `${event.id}:attempt:${event.attempts}`;
     try {
@@ -211,8 +256,8 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       else if (controller.getSnapshot().session.id !== parentId)
         deferWorkerEvent(event, 30_000, 'The original parent is no longer selected.');
       else if (result?.skipped) deferWorkerEvent(event, 1000, 'Waiting for the parent tool result to be saved.');
-      else if (error) deferWorkerEvent(event, controller.automaticWakeHeld ? 0 : INBOX_REMINDER_MS, error);
-      else deferWorkerEvent(event, INBOX_REMINDER_MS, 'The subagent notification is still unread.');
+      else if (error) deferReminderOrClose(event, error);
+      else deferReminderOrClose(event, 'The subagent notification is still unread.');
     } catch (error) {
       if (isClosing()) ledger.setEventState(event.id, 'pending', 'Host stopped before parent delivery completed.');
       else
