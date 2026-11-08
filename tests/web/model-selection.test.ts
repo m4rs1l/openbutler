@@ -9,6 +9,7 @@ const runtime = {
   providerId: 'first',
   modelId: 'model',
   reasoningDefault: 'medium',
+  reasoningPreference: 'medium',
   reasoningVariants: [
     { id: 'low', label: 'Az' },
     { id: 'medium', label: 'Orta' },
@@ -39,18 +40,13 @@ describe('composer model capabilities', () => {
     });
     expect(projectModelSelection(undefined, models)).toBeNull();
   });
-  it('shows a pending mid-run pick immediately while the runtime stays on the running model', () => {
-    // A run blocks the switch: the session remembers the pick and the view follows
-    // it at once, while runtime (the next request's real input) keeps model A.
-    const view = projectModelSelection(runtime, models, models[1])!;
-    expect(view.deferred).toBe(true);
+  it('shows the model this chat runs with, with no second source of truth', () => {
+    // The host publishes the model THIS chat runs with, so the projection has
+    // exactly one input: there is no pending pick to follow or to defer.
+    const view = projectModelSelection({ ...runtime, providerId: 'second', modelId: 'model' }, models)!;
     expect(view.modelLabel).toBe('Other route');
     expect(view.providerLabel).toBe('second');
     expect(view.models.map((model) => model.selected)).toEqual([false, true]);
-    // Once the server accepts the pick the pending argument is dropped: nothing is deferred.
-    expect(projectModelSelection(runtime, models, models[0])!.deferred).toBe(false);
-    expect(projectModelSelection(runtime, models)!.deferred).toBe(false);
-    // A pick the catalog no longer lists cannot be shown as chosen.
-    expect(projectModelSelection(runtime, models, { providerId: 'gone', modelId: 'gone' })!.deferred).toBe(false);
+    expect('deferred' in view).toBe(false);
   });
 });

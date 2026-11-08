@@ -4,8 +4,6 @@ import type { ModelChoice, RuntimeInfo } from './types.js';
 export interface ModelSelectionView {
   modelLabel: string;
   providerLabel: string;
-  /** True while a picked model is remembered by the session but the server has not accepted it yet. */
-  deferred: boolean;
   models: Array<{ route: ModelChoice; label: string; description: string; selected: boolean; disabled: boolean }>;
   reasoning: {
     value: string | null;
@@ -28,34 +26,24 @@ export function modelRouteKey(runtime?: Pick<RuntimeInfo, 'providerId' | 'modelI
   return JSON.stringify([runtime?.providerId, runtime?.modelId]);
 }
 
-export function projectModelSelection(
-  runtime: RuntimeInfo | undefined,
-  models: ModelChoice[],
-  pending?: Pick<ModelChoice, 'providerId' | 'modelId'> | null,
-): ModelSelectionView | null {
+export function projectModelSelection(runtime: RuntimeInfo | undefined, models: ModelChoice[]): ModelSelectionView | null {
   if (!runtime?.modelId || !runtime.providerId) return null;
   const runtimeRoute = modelRouteKey(runtime);
   const current = models.find((model) => modelRouteKey(model) === runtimeRoute);
-  // A mid-run pick is remembered by the session but cannot reach the runtime while
-  // the run blocks the switch: the projection follows the pick so the menu shows the
-  // chosen model at once, while the running model stays untouched until the run ends.
-  const pendingRoute = pending ? modelRouteKey(pending) : null;
-  const deferred = pendingRoute !== null && pendingRoute !== runtimeRoute && models.some((model) => modelRouteKey(model) === pendingRoute);
-  const chosen = deferred ? models.find((model) => modelRouteKey(model) === pendingRoute) : undefined;
-  const route = deferred ? pendingRoute : runtimeRoute;
+  // The host publishes the model THIS chat runs with, so the projection has a
+  // single authority to read: no pending pick, no deferred route.
   const options = (runtime.reasoningVariants ?? []).map(({ id, label }) => ({ value: id, label }));
   const defaultOption = options.find((option) => option.value === runtime.reasoningDefault) ?? options[0];
-  const modelLabel = (chosen ?? current)?.name ?? runtime.modelId;
+  const modelLabel = current?.name ?? runtime.modelId;
   const label = defaultOption?.label ?? 'Default';
   return {
     modelLabel,
-    providerLabel: chosen?.providerId ?? runtime.providerId,
-    deferred,
+    providerLabel: runtime.providerId,
     models: models.map((model) => ({
       route: model,
       label: model.name,
       description: model.providerId,
-      selected: modelRouteKey(model) === route,
+      selected: modelRouteKey(model) === runtimeRoute,
       disabled: false,
     })),
     reasoning: {

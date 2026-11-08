@@ -3,15 +3,13 @@ import type { ModelChoice, RuntimeInfo } from './types.js';
 import { projectModelSelection } from './model-selection.js';
 
 /**
- * The selector edits two runtime facts through their server commands: the model
- * and the effort. Neither lives in component state; the one local view is the
- * session's pending model pick, which the projection shows at once while a run
- * defers the change and drops the moment the server accepts it.
+ * The selector edits two facts through their server commands: the model and the
+ * effort. Neither lives in component state; the host publishes the values this
+ * chat runs with, so the projection always reads one authority.
  */
 export function useModelSelection(
   runtime: RuntimeInfo | undefined,
   models: ModelChoice[],
-  pendingModel: ModelChoice | null,
   onModel: (model: ModelChoice) => Promise<boolean>,
   onReasoning: (value: string) => Promise<boolean>,
 ) {
@@ -21,7 +19,7 @@ export function useModelSelection(
   const inFlight = useRef(false);
   const retryModel = useRef<ModelChoice | null>(null);
   const retryReasoning = useRef<string | null>(null);
-  const projection = projectModelSelection(runtime, models, pendingModel);
+  const projection = projectModelSelection(runtime, models);
   async function selectModel(model: Pick<ModelChoice, 'providerId' | 'modelId'>) {
     if (inFlight.current) return false;
     const choice = models.find((item) => modelRouteKeyEquals(item, model));

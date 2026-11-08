@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import { Feedback } from './feedback.js';
 import { Icon } from './icon.js';
 import type { ModelSelectionView } from '../model-selection.js';
-import type { ModelChoice } from '../types.js';
 import { Dropdown, type DropdownItem } from './selection/dropdown.js';
 import { StepSlider } from './selection/step-slider.js';
 import './model-selector.css';
@@ -19,7 +18,6 @@ export interface ComposerModelSelectorControl {
 
 interface Props extends ComposerModelSelectorControl {
   disabled: boolean;
-  pendingModel?: ModelChoice | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   resetKey: unknown;
@@ -33,7 +31,6 @@ export function ModelSelector({
   pending,
   error,
   disabled,
-  pendingModel,
   open,
   onOpenChange,
   resetKey,
@@ -58,9 +55,7 @@ export function ModelSelector({
     id: JSON.stringify([model.route.providerId, model.route.modelId]),
     label: model.label,
     description: model.description ?? undefined,
-    selected: pendingModel
-      ? model.route.providerId === pendingModel.providerId && model.route.modelId === pendingModel.modelId
-      : model.selected,
+    selected: model.selected,
     disabled: model.disabled,
     onSelect: async () => {
       const session = navigationSession.current;

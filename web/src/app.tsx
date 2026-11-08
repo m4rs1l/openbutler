@@ -396,7 +396,6 @@ export function App() {
                     queuedMessages={payload?.queuedMessages}
                     onQueueAction={session.manageQueue}
                     models={session.models}
-                    pendingModel={session.pendingModel}
                     draft={drafts[id] || ''}
                     history={messageHistory}
                     images={draftImages[id] || []}

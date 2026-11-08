@@ -19,14 +19,13 @@ const runtime = {
   ],
 };
 
-function render(pending: ModelChoice | null) {
+function render(current: { providerId: string; modelId: string }) {
   return renderToStaticMarkup(
     createElement(ModelSelector, {
-      projection: projectModelSelection(runtime, models, pending),
+      projection: projectModelSelection({ ...runtime, ...current }, models),
       pending: false,
       error: null,
       disabled: false,
-      pendingModel: pending,
       open: false,
       onOpenChange: () => {},
       resetKey: undefined,
@@ -38,13 +37,13 @@ function render(pending: ModelChoice | null) {
 }
 
 describe('model selector trigger', () => {
-  it('labels the accepted model without a waiting mark', () => {
-    const markup = render(null);
+  it('labels the model this chat runs with, without a waiting mark', () => {
+    const markup = render({ providerId: 'first', modelId: 'model' });
     expect(markup).toContain('>Model<');
     expect(markup).not.toContain('composer-model-selector__pending-dot');
   });
-  it('labels a pending mid-run pick immediately without a waiting mark nobody asked for', () => {
-    const markup = render(models[1]);
+  it('labels the chat own model even when another route exists', () => {
+    const markup = render({ providerId: 'second', modelId: 'model' });
     expect(markup).toContain('>Other route<');
     expect(markup).not.toContain('composer-model-selector__pending-dot');
   });

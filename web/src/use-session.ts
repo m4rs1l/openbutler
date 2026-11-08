@@ -497,9 +497,7 @@ export function useSession() {
     retrySessions: () => setReload((value) => value + 1),
     models,
     modelsRevision,
-    // The host answers with the model this chat runs with next, so no
-    // separate pending state is needed here.
-    pendingModel: null,
+
     notice,
     clearNotice: () => setNotice(null),
     changing,

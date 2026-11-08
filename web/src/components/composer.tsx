@@ -22,7 +22,6 @@ interface ComposerProps {
   runtime?: RuntimeInfo;
   contextTokens?: number | null;
   models: ModelChoice[];
-  pendingModel: ModelChoice | null;
   draft: string;
   history: readonly string[];
   images: DraftImage[];
@@ -61,7 +60,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
   const [approvalOpen, setApprovalOpen] = useState(false);
   const [modelPage, setModelPage] = useState<'reasoning' | 'models' | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const modelSelection = useModelSelection(props.runtime, props.models, props.pendingModel, props.onModel, props.onReasoning);
+  const modelSelection = useModelSelection(props.runtime, props.models, props.onModel, props.onReasoning);
   const dictation = useDictation((text) => props.onDraft([props.draft, text].filter(Boolean).join(' ')), setError);
   useLayoutEffect(() => {
     const node = input.current;
@@ -366,7 +365,6 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
               modelSelection.onOpenChange(next);
             }}
             disabled={props.disabled || pending || modelSelection.pending}
-            pendingModel={props.pendingModel}
           />
           <IconButton
             icon="mic"
