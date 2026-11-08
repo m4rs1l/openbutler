@@ -26,6 +26,7 @@ import {
 import { createMcpConnectionManager } from './tools/mcp.js';
 import { CATALOG_FILENAMES } from './provider/catalog.js';
 import { resolveModelName, resolveProviderName } from './provider/model-presentation.js';
+import { describeModelReasoning } from './provider/model-view.js';
 import { resolveReasoningVariant, type ReasoningVariant } from './provider/registry.js';
 import { resolveProjectSelection } from './projects/store.js';
 import { recordUsage as recordUsageRow } from './usage/recorder.js';
@@ -3341,10 +3342,16 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         case 'session.select-model': {
-          if (controller.isBusy) throw new Error('Wait for the current run before changing its model.');
           const providerId = requireString(request.providerId, 'providerId', 256);
           const modelId = requireString(request.modelId, 'modelId', 512);
-          await controller.selectModel(providerId, modelId);
+          // A pick is accepted while a run is going: it is recorded and takes
+          // effect at the next turn boundary, never under the running request.
+          // The target model's own effort levels are computed here without
+          // activating it, so the chat answers with the levels of the model it
+          // will run with next instead of the running model's list.
+          const provider = loadSettings().providers[providerId];
+          const described = provider ? describeModelReasoning(providerId, modelId, provider) : null;
+          await controller.selectModel(providerId, modelId, described?.variants);
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         }

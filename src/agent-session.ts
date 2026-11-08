@@ -431,6 +431,9 @@ export class AgentSessionController implements AgentSessionClient {
     this.lastContextUsage = this.session.contextTokens;
     this.lastContextEstimate = this.session.contextEstimateTokens;
     this.lastPersistedChoice = this.persistableChoiceKey(this.session);
+    // A chat announces its model and effort from the state it opens in, so a
+    // pick made before the first message is marked above that message.
+    this.resetAnnouncementBaseline();
     this.snapshot = this.makeSnapshot();
   }
 
@@ -630,7 +633,25 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   private reasoningLabel(variantId: string): string {
-    return this.runtime.reasoningVariants.find((variant) => variant.id === variantId)?.label ?? variantId;
+    // The label belongs to the model THIS chat runs with: its own recorded
+    // levels first, the shared runtime's list only when this chat has none.
+    // After a model change the runtime's list is already the new model's, and
+    // an effort the new model does not offer would lose its readable name and
+    // be reported as a bare id.
+    const levels = this.session.reasoningVariants?.length ? this.session.reasoningVariants : this.runtime.reasoningVariants;
+    return levels.find((variant) => variant.id === variantId)?.label ?? variantId;
+  }
+
+  /**
+   * The baseline the transcript announces against: the model and the effort
+   * this chat runs with at this moment. It is taken when the chat opens, not
+   * at its first message, so a pick made before any message still gets marked
+   * above that message instead of being silently absorbed.
+   */
+  private resetAnnouncementBaseline(): void {
+    this.announcedEffort = this.sessionReasoning();
+    this.announcedEffortLabel = this.reasoningLabel(this.announcedEffort);
+    this.announcedModel = this.session.modelId ?? this.runtime.modelId;
   }
 
   /**
@@ -656,8 +677,11 @@ export class AgentSessionController implements AgentSessionClient {
     const current = this.sessionReasoning();
     if (current === this.announcedEffort) return;
     if (this.announcedEffort !== null)
-      this.addDivider(`Reasoning effort changed from "${this.reasoningLabel(this.announcedEffort)}" to "${this.reasoningLabel(current)}"`);
+      this.addDivider(
+        `Reasoning effort changed from "${this.announcedEffortLabel ?? this.reasoningLabel(this.announcedEffort)}" to "${this.reasoningLabel(current)}"`,
+      );
     this.announcedEffort = current;
+    this.announcedEffortLabel = this.reasoningLabel(current);
   }
 
   /**
@@ -736,9 +760,10 @@ export class AgentSessionController implements AgentSessionClient {
     this.pendingApprovalId = null;
     this.streamedAssistantEntry = null;
     this.streamedReasoningEntry = null;
-    // Each session announces its own model and effort from a clean baseline.
-    this.announcedEffort = null;
-    this.announcedModel = null;
+    // Each session announces its own model and effort from the state it opens
+    // in: a pick made before the first message must still be marked above
+    // that message, so the baseline is taken here and not at the first message.
+    this.resetAnnouncementBaseline();
     this.runningToolEntry = null;
     this.currentReviewAuthorization = null;
     this.currentReviewMessages = [];
@@ -786,6 +811,9 @@ export class AgentSessionController implements AgentSessionClient {
     this.lastContextUsage = undefined;
     this.lastContextEstimate = undefined;
     this.sessionHasUserMessage = false;
+    // A new chat announces against the state it opens in, not against the
+    // previous chat's last announcement: the baseline belongs to this chat.
+    this.resetAnnouncementBaseline();
     this.lastPersistedChoice = this.persistableChoiceKey(this.session);
     this.pendingApproval = null;
     this.pendingApprovalId = null;
@@ -865,22 +893,40 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   async restoreSessionModel(): Promise<void> {
-    if (this.runtime.providerId === this.session.providerId && this.runtime.modelId === this.session.modelId) return;
-    if (!this.runtime.restoreModel) throw new Error('This runtime cannot restore the saved session model.');
-    await this.runtime.restoreModel(this.session.providerId, this.session.modelId);
     // The runtime now matches this chat again, so its list is this chat's list.
-    if (this.runtime.reasoningVariants.length > 0)
+    // A model picked while a run was going becomes real here, at the turn
+    // boundary, and the chat's effort is re-mapped onto that model's levels:
+    // an effort the new model does not offer cannot stay the choice it shows.
+    if (this.runtime.providerId !== this.session.providerId || this.runtime.modelId !== this.session.modelId) {
+      if (!this.runtime.restoreModel) throw new Error('This runtime cannot restore the saved session model.');
+      await this.runtime.restoreModel(this.session.providerId, this.session.modelId);
+    }
+    if (this.runtime.reasoningVariants.length > 0) {
+      const variants = this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
       this.session = {
         ...this.session,
-        reasoningVariants: this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label })),
+        reasoningVariants: variants,
+        ...(this.session.reasoning !== undefined ? { reasoning: remapEffort(variants, this.session.reasoning) } : {}),
       };
+    }
     this.publish();
   }
 
-  async selectModel(providerId: string, modelId: string): Promise<void> {
+  /**
+   * Records the model this chat runs with.
+   *
+   * A pick is accepted at any moment, including while a run is going: it is
+   * recorded here and takes effect at the next turn boundary, never in the
+   * middle of a running request. The host hands over the target model's own
+   * effort levels, so the picker answers with the levels of the model this
+   * chat will run with next.
+   */
+  async selectModel(providerId: string, modelId: string, pendingVariants?: ReadonlyArray<{ id: string; label: string }>): Promise<void> {
     const sameModel = modelId === this.session.modelId;
-    if (this.busy) return;
-    await this.runtime.selectModel(providerId, modelId);
+    // While a run is going the shared runtime belongs to that turn: switching
+    // it now would move the model under the running request. The pick waits
+    // for the turn boundary, where restoreSessionModel() activates it.
+    if (!this.busy) await this.runtime.selectModel(providerId, modelId);
     // No divider here on purpose: the switch is a choice, not a message. The
     // transcript records it above the first message that runs with it, which is
     // where a reader can tell what the following request was made with.
@@ -889,7 +935,13 @@ export class AgentSessionController implements AgentSessionClient {
       this.lastContextUsage = undefined;
       this.lastContextEstimate = undefined;
     }
-    const variants = this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
+    // The levels belong to a model, not to a runtime. The host hands over the
+    // target model's own levels; without them the running model's list would
+    // be recorded and the picker would offer levels the new model refuses.
+    const variants =
+      pendingVariants && pendingVariants.length > 0
+        ? pendingVariants.map(({ id, label }) => ({ id, label }))
+        : this.runtime.reasoningVariants.map(({ id, label }) => ({ id, label }));
     this.session = {
       ...this.session,
       providerId,
@@ -1182,6 +1234,12 @@ export class AgentSessionController implements AgentSessionClient {
   private activeTurnPreferences: AgentTurnPreferences | null = null;
   /** Last effort announced in the transcript; null until the first admission pins it. */
   private announcedEffort: string | null = null;
+  /**
+   * The label the announced effort carried when it was announced. A later model
+   * may no longer offer that level, and the raw id would then read as a second
+   * kind of name next to the new level's label.
+   */
+  private announcedEffortLabel: string | null = null;
   /** Last model announced in the transcript; null until the first admission pins it. */
   private announcedModel: string | null = null;
   private showReasoningAtTurnStart = true;
@@ -1951,6 +2009,10 @@ export class AgentSessionController implements AgentSessionClient {
           nextTurn = this.queuedMessages.shift() ?? null;
           continue;
         }
+        // The model this chat picked is bound at the turn boundary, never in
+        // the middle of a running request: a pick made while a run was going
+        // becomes real here, and the chat's effort is re-mapped onto it.
+        await this.restoreSessionModel();
         // The admitted turn's own message preferences govern it, but a session
         // that recorded its own effort always wins: the session is the single
         // authority, so a wake-up or another channel carrying the machine
@@ -1970,7 +2032,6 @@ export class AgentSessionController implements AgentSessionClient {
         // Private and persistent sessions can share a runtime. Rebind the
         // selected model at the turn boundary, never silently use another
         // session's most recently activated model.
-        await this.restoreSessionModel();
         this.showReasoningAtTurnStart = this.sessionShowReasoning();
         if (current.workspaceRoot) {
           if (this.runtime.selectWorkspaceRoot) await this.runtime.selectWorkspaceRoot(current.workspaceRoot);

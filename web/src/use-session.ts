@@ -59,7 +59,6 @@ export function useSession() {
   const [reload, setReload] = useState(0);
   const [models, setModels] = useState<ModelChoice[]>([]);
   const [modelsRevision, setModelsRevision] = useState(0);
-  const [deferredModel, setDeferredModel] = useState<{ sessionId: string; model: ModelChoice } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [changing, setChanging] = useState(false);
   // A blank new chat exists only in the browser. Creating the daemon session
@@ -274,41 +273,6 @@ export function useSession() {
       }
     }
   };
-  const deferredPick = useRef<{ sessionId: string; model: ModelChoice } | null>(null);
-  /**
-   * Publish the effort levels of a model whose switch is waiting for the run to
-   * end, keeping the identity untouched. The picker names the pending model at
-   * once, so until its own levels arrive the running model's list reads as the
-   * new model's choices - which is how a fresh pick showed the old effort.
-   */
-  const applyPendingEffort = (target: string, model: ModelChoice) => {
-    deferredPick.current = { sessionId: target, model };
-    void (async () => {
-      try {
-        const described = await api.fetchModelReasoning(model.providerId, model.modelId);
-        const held = deferredPick.current;
-        if (held?.sessionId !== target || held.model !== model) return;
-        const payload = state.payload;
-        const runtime = payload?.runtime;
-        // A switch that already landed has the server's own answer; do not overwrite it.
-        if (!payload || !runtime || sessionId !== target) return;
-        if (runtime.providerId === model.providerId && runtime.modelId === model.modelId) return;
-        const current = runtime.reasoningDefault;
-        const kept = current != null && described.reasoningVariants.some((level) => level.id === current);
-        const chosen = kept && current != null ? current : described.reasoningDefault;
-        dispatch({
-          type: 'payload',
-          payload: {
-            ...payload,
-            runtime: { ...runtime, reasoningVariants: described.reasoningVariants, reasoningDefault: chosen },
-          },
-          receivedAt: performance.now(),
-        });
-      } catch (error) {
-        report(error);
-      }
-    })();
-  };
   const selectModel = async (model: ModelChoice) => {
     if (operation.current || !sessionId || status !== 'open') return false;
     const draft = draftChat.current;
@@ -351,24 +315,15 @@ export function useSession() {
         return true;
       }
     }
-    if (model.providerId === state.payload?.runtime?.providerId && model.modelId === state.payload?.runtime?.modelId) {
-      setDeferredModel(null);
-      return true;
-    }
-    if (busy || (state.payload?.queuedMessageCount ?? 0) > 0) {
-      setDeferredModel({ sessionId, model });
-      applyPendingEffort(sessionId, model);
-      return true;
-    }
+    if (model.providerId === state.payload?.runtime?.providerId && model.modelId === state.payload?.runtime?.modelId) return true;
     operation.current = true;
     setChanging(true);
     setNotice(null);
     try {
+      // The host records the pick even while a run is going and answers with
+      // the model this chat will run with next, so the picker never has to
+      // guess or defer: the server owns the answer.
       applyNow(await api.changeModel(model, sessionId));
-      // Only a server-accepted switch ends the deferral. Clearing it before the
-      // call snapped the picker back to the old model whenever the call lost.
-      setDeferredModel(null);
-      deferredPick.current = null;
       return true;
     } catch (error) {
       report(error);
@@ -405,15 +360,6 @@ export function useSession() {
       return false;
     }
   };
-  useEffect(() => {
-    if (!deferredModel) return;
-    if (deferredModel.sessionId !== sessionId) {
-      setDeferredModel(null);
-      return;
-    }
-    if (!busy && (state.payload?.queuedMessageCount ?? 0) === 0 && !changing && status === 'open' && !operation.current)
-      void selectModel(deferredModel.model);
-  }, [deferredModel, sessionId, busy, state.payload?.queuedMessageCount, changing, status]);
   const loadOlder = async () => {
     if (!sessionId || olderRequest.current || state.base <= 0) return;
     const epoch = streamEpoch.current;
@@ -551,7 +497,9 @@ export function useSession() {
     retrySessions: () => setReload((value) => value + 1),
     models,
     modelsRevision,
-    pendingModel: deferredModel && deferredModel.sessionId === sessionId ? deferredModel.model : null,
+    // The host answers with the model this chat runs with next, so no
+    // separate pending state is needed here.
+    pendingModel: null,
     notice,
     clearNotice: () => setNotice(null),
     changing,

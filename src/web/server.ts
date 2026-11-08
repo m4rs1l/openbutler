@@ -1092,8 +1092,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     if (url.pathname === '/api/model' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)) || '{}') as { providerId?: unknown; modelId?: unknown; sessionId?: unknown };
       if (body.sessionId !== client.getSnapshot().session.id) return sendJson(res, 409, { error: 'The active chat changed. Try again.' });
-      if (client.isBusy || client.getSnapshot().queuedMessageCount > 0)
-        return sendJson(res, 409, { error: 'Wait for the current run before changing models.' });
+      // A model pick is accepted while a run is going: it is recorded and
+      // takes effect at the next turn boundary, where the transcript marks it.
       if (typeof body.providerId !== 'string' || typeof body.modelId !== 'string')
         return sendJson(res, 400, { error: 'Choose a configured model.' });
       const provider = loadSettings().providers[body.providerId];

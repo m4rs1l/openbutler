@@ -249,18 +249,21 @@ describe('browser session controls', () => {
     expect(browserWebAddress('::1', 45278)).toBe('http://[::1]:45278');
   });
 
-  it('applies an effort change while a run is going, unlike a model change', async () => {
+  it('records a model and an effort change while a run is going, for the next turn', async () => {
     snapshot.busy = true;
     publish();
-    // No session header: the busy gate must hold on the default client itself.
+    // No session header: the gate must hold on the default client itself.
     const postDefault = (path: string, body: unknown) =>
       fetch(`${server.url}${path}`, {
         method: 'POST',
         headers: { cookie, origin: server.url, 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
-    const modelChange = await postDefault('/api/model', { providerId: 'local', modelId: 'model-a', sessionId: 'session-a' });
-    expect(modelChange.status).toBe(409);
+    // Both are accepted now: a pick belongs to the next turn, never to the
+    // running one, so there is nothing to wait for.
+    const modelChange = await postDefault('/api/model', { providerId: 'local', modelId: 'model-b', sessionId: 'session-a' });
+    expect(modelChange.status).toBe(200);
+    expect(client.selectModel).toHaveBeenCalledWith('local', 'model-b');
     // The effort is a preference of this chat: it is recorded with the chat.
     const effort = await postDefault('/api/reasoning', { reasoningVariantId: 'high', sessionId: 'session-a' });
     expect(effort.status).toBe(200);
