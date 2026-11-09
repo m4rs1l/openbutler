@@ -7,7 +7,7 @@
  * travels with the content, and the host turns the declaration into a durable
  * receipt when the session is saved.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActivityLedger } from '../src/activity-ledger.js';
 import { DELIVERIES_KEY, deliveriesOf } from '../src/delivery.js';
 import { acknowledgeSessionDeliveries, workerHasUnread } from '../src/worker-receipts.js';
@@ -134,6 +134,35 @@ describe('a handover declares itself', () => {
     acknowledgeSessionDeliveries(ledger, sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] }));
 
     expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBeUndefined();
+  });
+});
+
+describe('a receipt that is already written is not written again', () => {
+  it('does not touch the ledger on a second save of the same session', () => {
+    // A session is saved more than once per turn, and a conversation only
+    // grows. The handover is seen again on every later save, so the receipt
+    // must not be rewritten: the durable record already is the truth.
+    finishedWorker();
+    const session = sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] });
+    acknowledgeSessionDeliveries(ledger, session);
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+
+    const writes = vi.spyOn(ledger, 'setState');
+    acknowledgeSessionDeliveries(ledger, session);
+
+    expect(writes).not.toHaveBeenCalled();
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+  });
+
+  it('still writes when the durable state does not cover the handover', () => {
+    // The skip must never hide a receipt that is genuinely missing, or a
+    // notification would stay open forever.
+    finishedWorker();
+    const writes = vi.spyOn(ledger, 'setState');
+    acknowledgeSessionDeliveries(ledger, sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] }));
+
+    expect(writes).toHaveBeenCalled();
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
   });
 });
 

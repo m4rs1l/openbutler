@@ -23,7 +23,7 @@
 import type { ActivityLedger } from './activity-ledger.js';
 import { deliveriesOf, type ToolDelivery } from './delivery.js';
 import type { SavedSession } from './session-store.js';
-import { acknowledgeWorkerRead, type WorkerOutbox, type WorkerRecord } from './worker-records.js';
+import { acknowledgeWorkerRead, readWorkerOutbox, readWorkerRecord, type WorkerOutbox, type WorkerRecord } from './worker-records.js';
 
 /** The delivery kind a worker report uses. */
 export const WORKER_DELIVERY = 'worker';
@@ -84,7 +84,7 @@ export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: Sa
       // The declaration is the proof, so nothing else has to be consulted.
       for (const delivery of deliveriesOf(output)) {
         if (delivery.kind !== WORKER_DELIVERY) continue;
-        acknowledgeWorkerRead(ledger, session.id, delivery.id, delivery.revision, delivery.cursor ?? 0);
+        writeReceipt(ledger, session.id, delivery);
         acknowledged.push(delivery);
         handled.add(delivery.id);
       }
@@ -98,7 +98,12 @@ export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: Sa
         if (handled.has(legacy.session)) continue;
         const held = options.heldWorkerIds?.includes(legacy.session) === true;
         if (!held && legacy.session !== options.recoveryWorkerId) continue;
-        acknowledgeWorkerRead(ledger, session.id, legacy.session, legacy.revision, legacy.notesCursor);
+        writeReceipt(ledger, session.id, {
+          kind: WORKER_DELIVERY,
+          id: legacy.session,
+          revision: legacy.revision,
+          cursor: legacy.notesCursor,
+        });
         acknowledged.push({
           kind: WORKER_DELIVERY,
           id: legacy.session,
@@ -110,6 +115,56 @@ export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: Sa
     }
   }
   return acknowledged;
+}
+
+/**
+ * Whether the durable state already says everything a receipt write would say.
+ *
+ * A session is saved more than once per turn, and a conversation only grows,
+ * so the same handover is seen again on every later save. Rewriting a receipt
+ * that is already on disk buys nothing and costs a write each time.
+ *
+ * The durable record is the single truth about what was read, so it is also
+ * the thing that decides whether a write is needed at all. The conditions
+ * below mirror the write in `acknowledgeWorkerRead` exactly, so skipping can
+ * never lose a change:
+ *
+ * - the completion revision is only written for a finished worker, and only
+ *   when the revision is that worker's completion revision, and
+ * - the notes cursor is only ever moved forward.
+ */
+export function durableStateCovers(ledger: ActivityLedger, workerId: string, revision: number, notesCursor: number): boolean {
+  const record = readWorkerRecord(ledger, workerId);
+  if (!record) return false;
+  const outbox = readWorkerOutbox(ledger, workerId);
+  const revisionCovered = !record.finished || revision !== record.completionRevision || (record.reportedRevision ?? 0) >= revision;
+  const notesCovered = outbox.read >= Math.min(notesCursor, outbox.notes.length);
+  return revisionCovered && notesCovered;
+}
+
+/**
+ * Writes the durable receipt for one handover.
+ *
+ * Two things are deliberate here.
+ *
+ * The first is the skip: a receipt that is already on disk is not rewritten.
+ * The durable record is the truth about what was read, so consulting it first
+ * keeps a long conversation from rewriting the same receipt on every save.
+ *
+ * The second is the error handling. A receipt that cannot be written must not
+ * fail the save of the session that holds the content: the session is already
+ * on disk by then, and the worst case of a lost receipt is one extra wake-up,
+ * which the host repairs from the saved conversation. Failing the save
+ * instead would turn a receipt problem into a session that is never persisted.
+ */
+function writeReceipt(ledger: ActivityLedger, parentId: string, delivery: ToolDelivery): void {
+  if (durableStateCovers(ledger, delivery.id, delivery.revision, delivery.cursor ?? 0)) return;
+  try {
+    acknowledgeWorkerRead(ledger, parentId, delivery.id, delivery.revision, delivery.cursor ?? 0);
+  } catch {
+    // The unread rule is derived from the durable record, so a receipt that
+    // did not land leaves the notification unread and the host asks again.
+  }
 }
 
 interface LegacyWorkerValue {
