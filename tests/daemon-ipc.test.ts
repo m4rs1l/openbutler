@@ -3415,7 +3415,7 @@ describe('shared host and session IPC', () => {
   }, 20_000);
 });
 
-async function automaticWorkerFixture(options: { fail?: boolean; question?: boolean } = {}) {
+async function automaticWorkerFixture(options: { fail?: boolean; question?: boolean; longReport?: boolean } = {}) {
   const viewer = await newChat();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -3451,7 +3451,10 @@ async function automaticWorkerFixture(options: { fail?: boolean; question?: bool
         }),
       ]);
       if (options.fail) throw new Error('WORKER_FAILURE_FIXTURE');
-      return textStream('AUTOMATIC_WORKER_REPORT');
+      // A report longer than the inline limit is the case that used to break
+      // the receipt: the tool result was replaced by a preview, the preview
+      // held no handover, and the notification could never be closed.
+      return textStream(options.longReport ? `AUTOMATIC_WORKER_REPORT${'z'.repeat(40_000)}` : 'AUTOMATIC_WORKER_REPORT');
     }
     parentCalls++;
     if (parentCalls > 20) return textStream(`FIXTURE_STALLED: ${serialized.slice(-1800)}`);
@@ -3666,6 +3669,37 @@ it('reconciles a saved poll after a crash before its ledger receipt without waki
   const reconnected = await openChat(parentId);
   expect(parentCalls()).toBe(calls);
   expect(reconnected.getSnapshot().session.entries.filter((entry) => entry.kind === 'user' && entry.source === 'inbox')).toHaveLength(1);
+}, 20_000);
+
+it('closes the notification for a report too long to inline', async () => {
+  // The defect this pins: a worker report longer than the inline limit was
+  // replaced by a preview before it reached the conversation, and the preview
+  // carried no handover. Without a receipt the host kept waking the parent
+  // about a report it had already read, every few minutes, forever.
+  const { viewer, release, workerId, parentCalls } = await automaticWorkerFixture({ longReport: true });
+  release();
+  await vi.waitFor(() =>
+    expect(
+      viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant' && entry.text === 'PARENT_RESULT_INTEGRATED'),
+    ).toBe(true),
+  );
+  const { ActivityLedger } = await import('../src/activity-ledger.js');
+  const { readWorkerRecord } = await import('../src/worker-records.js');
+  const reader = new ActivityLedger(join(root, 'state.db'), { readOnly: true });
+  try {
+    // The receipt is written when the session is saved, so the report cannot
+    // be "read" before its content is durable.
+    await vi.waitFor(() => expect(readWorkerRecord(reader, workerId)?.reportedRevision).toBe(1));
+    const event = reader.listEvents().find((entry) => entry.source === 'worker' && entry.payload.workerId === workerId)!;
+    expect(event.status).toBe('delivered');
+  } finally {
+    reader.close();
+  }
+  // One wake, and no second one: the parent is not called about a report it
+  // has already read.
+  const calls = parentCalls();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  expect(parentCalls()).toBe(calls);
 }, 20_000);
 
 it.each(['terminal', 'telegram'])(

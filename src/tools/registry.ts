@@ -10,6 +10,7 @@ import type { ApprovalMode } from '../settings.js';
 import type { WorkspaceScope } from '../workspace-scope.js';
 import { runWithToolTimeout, toolTimeoutSeconds, ToolTimeoutError, TOOL_TIMEOUT_FIELD, withToolTimeoutSchema } from './timeout.js';
 import { TOOL_OUTPUT_INLINE_CHARS, spillToolOutput, toolOutputNotice } from '../tool-output.js';
+import { DELIVERIES_KEY, deliveriesOf, type ToolDelivery } from '../delivery.js';
 
 const MAX_INPUT_CHARS = 50_000;
 /** Default inline budget; a tool may lower it with maxResultChars. */
@@ -446,10 +447,15 @@ export class ToolRegistry {
           return null;
         }
         const inlineLimit = definition.maxResultChars ?? MAX_TOOL_RESULT_CHARS;
+        // A tool result may declare what it handed to the caller. Those
+        // declarations are structured facts rather than prose, so they survive
+        // the cut: a receipt that disappears together with a long report is a
+        // receipt that never happened.
+        const declared = deliveriesOf(result);
         const bounded =
           serialized.length <= inlineLimit
             ? result
-            : truncatedResult(serialized, inlineLimit, options.sessionId, `${request.providerId}:${request.name}`);
+            : truncatedResult(serialized, inlineLimit, options.sessionId, `${request.providerId}:${request.name}`, declared);
         await options.onAction?.(request, toolOutcome(result), { result: bounded });
         resultRecorded = true;
         reportResult(bounded);
@@ -661,8 +667,17 @@ function toolOutcome(result: unknown): ToolActionState {
  * text on disk. The model gets a readable preview plus the path, so recovering
  * the rest is one `file_read` instead of guessing at narrower commands.
  */
-function truncatedResult(serialized: string, inlineLimit: number, sessionId: string | undefined, tool: string): Record<string, unknown> {
+function truncatedResult(
+  serialized: string,
+  inlineLimit: number,
+  sessionId: string | undefined,
+  tool: string,
+  declared: readonly ToolDelivery[] = [],
+): Record<string, unknown> {
   const preview = serialized.slice(0, inlineLimit);
+  // The preview is lossy on purpose. What the caller was handed is not prose,
+  // so it is carried outside the preview and stays readable after the cut.
+  const declaredSlot = declared.length > 0 ? { [DELIVERIES_KEY]: [...declared] } : {};
   try {
     const spilled = spillToolOutput({ ...(sessionId === undefined ? {} : { sessionId }), tool, text: serialized });
     return {
@@ -671,6 +686,7 @@ function truncatedResult(serialized: string, inlineLimit: number, sessionId: str
       originalChars: serialized.length,
       spilledTo: spilled.path,
       note: toolOutputNotice(spilled.path, serialized.length, spilled.droppedChars),
+      ...declaredSlot,
     };
   } catch (error) {
     return {
@@ -678,6 +694,7 @@ function truncatedResult(serialized: string, inlineLimit: number, sessionId: str
       resultPreview: preview,
       originalChars: serialized.length,
       note: `The rest of this result could not be saved to disk (${error instanceof Error ? error.message : String(error)}). Narrow the request to see it.`,
+      ...declaredSlot,
     };
   }
 }

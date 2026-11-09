@@ -8,6 +8,7 @@ import type { SubagentRequest } from '../tools/subagent.js';
 import { WORKER_INSTRUCTIONS } from '../agent-instructions.js';
 import type { WorkerNoteKind, WorkerRecord } from '../worker-records.js';
 import { appendWorkerNote, completeWorker, readWorkerOutbox } from '../worker-records.js';
+import type { ToolDelivery } from '../delivery.js';
 import { resolveRestoreScope } from '../workspace-origin.js';
 import { inboxId, inboxNotice } from '../inbox.js';
 import { isToolRequestWhitelisted } from '../tool-permissions.js';
@@ -66,7 +67,15 @@ export interface WorkerServiceDeps {
   options: { log: (message: string) => void };
   scheduleEventRetry: (at: number) => void;
   pumpEvents: () => void;
-  pendingWorkerReads: Map<string, Map<string, { revision: number; notesCursor: number }>>;
+  /**
+   * Handovers that are on their way to a session but are not saved yet.
+   *
+   * This is not a read state: it records that a poll happened, so a wake is
+   * not repeated in the short window before the turn that contains it is
+   * saved. Whether the report was read is answered by the durable receipt in
+   * the worker record.
+   */
+  inFlightWorkerDeliveries: Map<string, Map<string, { revision: number; notesCursor: number }>>;
   findSessionController: (sessionId: string) => AgentSessionController | undefined;
   findLiveSessionById: (sessionId: string) => { workspace: WorkspaceHost; controller: AgentSessionController; main: boolean } | null;
   getCustodianWorkspace: (scopeRoot: string) => Promise<WorkspaceHost>;
@@ -108,7 +117,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     redactSensitiveText,
     workspaces,
     isClosing,
-    pendingWorkerReads,
+    inFlightWorkerDeliveries,
   } = deps;
   const INBOX_REMINDER_MS = deps.inboxReminderMs;
   /**
@@ -512,6 +521,21 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     return { status: 'stopped', session: workerId };
   }
 
+  /**
+   * The handover of a worker record to the session that asked for it.
+   *
+   * It says what the caller now holds: this revision of the report, and this
+   * far into the notes. The host records it as the receipt, so the caller is
+   * never asked about the same worker again and the host never has to look at
+   * the report text to find out whether it was already read.
+   */
+  const workerDelivery = (workerId: string, revision: number, cursor: number): ToolDelivery => ({
+    kind: 'worker',
+    id: workerId,
+    revision,
+    cursor,
+  });
+
   /** Subagent inbox content: only the recorded parent may read its own worker. */
   function pollWorker(input: { session: string }, senderSessionId: string | undefined): unknown {
     if (!senderSessionId) return { status: 'denied', error: 'The polling session could not be identified.' };
@@ -544,13 +568,16 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     if (record.parentSessionId !== senderSessionId)
       return { status: 'denied', error: 'Only the parent session that started this worker may poll it.' };
     const outbox = readWorkerOutbox(ledger, workerId);
-    const pending = pendingWorkerReads.get(senderSessionId) ?? new Map<string, { revision: number; notesCursor: number }>();
-    const previous = pending.get(workerId);
+    // The handover is marked as in flight here: the caller holds this content
+    // now, and the receipt is written when the session is saved. Until then
+    // the worker must not wake the parent again about the same revision.
+    const inFlight = inFlightWorkerDeliveries.get(senderSessionId) ?? new Map<string, { revision: number; notesCursor: number }>();
+    const previous = inFlight.get(workerId);
     const notes = outbox.notes.slice(Math.max(outbox.read, previous?.notesCursor ?? 0));
     const completionRevision = record.finished ? (record.completionRevision ?? 0) : 0;
     const notesCursor = outbox.notes.length;
-    pending.set(workerId, { revision: completionRevision, notesCursor });
-    pendingWorkerReads.set(senderSessionId, pending);
+    inFlight.set(workerId, { revision: completionRevision, notesCursor });
+    inFlightWorkerDeliveries.set(senderSessionId, inFlight);
 
     const live = [...workspaces.values()]
       .map((candidate) => candidate.privateSessions.get(workerId))
@@ -569,6 +596,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
         notes,
         completionRevision,
         notesCursor,
+        delivery: workerDelivery(workerId, completionRevision, notesCursor),
         report: finished ? (record.result?.report ?? lastAssistantReport(liveEntries)) : null,
         error: finished ? (record.result?.error ?? error) : error,
         toolCalls: activity.toolCalls,
@@ -588,6 +616,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       notes,
       completionRevision,
       notesCursor,
+      delivery: workerDelivery(workerId, completionRevision, notesCursor),
       report: record.result?.report ?? (savedEntries.length > 0 ? lastAssistantReport(savedEntries) : null),
       error: record.result?.error ?? null,
       toolCalls: savedActivity.toolCalls,

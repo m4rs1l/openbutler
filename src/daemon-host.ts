@@ -68,7 +68,6 @@ import {
   writeWorkerRecord,
   workerSignalPending,
   recoverWorkers,
-  acknowledgeWorkerRead,
   type WorkerRecord,
 } from './worker-records.js';
 import { TelegramAdapter, TelegramApiError, splitTelegramText } from './telegram.js';
@@ -102,6 +101,8 @@ import { createParentMessageTool } from './tools/parent-message.js';
 import { getDataPath } from './paths.js';
 import { imageTypeFromBytes, decodeBase64Image } from './image.js';
 import { AgentInbox, inboxNotice, type InboxItem } from './inbox.js';
+import { deliveryOf } from './delivery.js';
+import { acknowledgeSessionDeliveries, workerHasUnread } from './worker-receipts.js';
 import { pendingReportLine, reportsNeedWake } from './report-summary.js';
 
 const MAX_MESSAGE_TEXT_BYTES = 8 * 1024 * 1024;
@@ -214,45 +215,67 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   }
   /** Worker lineage for subagent sessions: parent link, nesting depth, and mode (P4). */
   const workers = new Map<string, WorkerRecord>();
-  const pendingWorkerReads = new Map<string, Map<string, { revision: number; notesCursor: number }>>();
+  /**
+   * Handovers that are on their way to a session but are not saved yet.
+   *
+   * This is NOT a read state. It answers one narrow question: "is the parent
+   * already holding this and the conversation has simply not been written
+   * back yet?" It exists so a wake is not repeated in the short window between
+   * a poll and the save of the turn that contains it.
+   *
+   * Whether a report has actually been read is answered by the durable
+   * receipt in the worker record (reportedRevision), and by nothing else.
+   * Two answers for one question is how a notification comes back after a
+   * restart: one truth lived in memory, the other on disk, and the restart
+   * kept only the one that was missing.
+   */
+  const inFlightWorkerDeliveries = new Map<string, Map<string, { revision: number; notesCursor: number }>>();
 
+  /**
+   * Whether the parent still has to be woken about this event.
+   *
+   * The durable receipt decides it; the in-flight map only removes the
+   * duplicate wake for a handover the parent is already holding.
+   */
   function signalStillNeeded(event: ObservedEventRow): boolean {
     if (!workerSignalPending(ledger, event)) return false;
-    const read = pendingWorkerReads.get(String(event.payload.parentSessionId))?.get(String(event.payload.workerId));
+    const inFlight = inFlightWorkerDeliveries.get(String(event.payload.parentSessionId))?.get(String(event.payload.workerId));
     return typeof event.payload.note === 'number'
-      ? (read?.notesCursor ?? 0) < event.payload.note
-      : (read?.revision ?? 0) < Number(event.payload.revision);
+      ? (inFlight?.notesCursor ?? 0) < event.payload.note
+      : (inFlight?.revision ?? 0) < Number(event.payload.revision);
   }
 
-  /** A poll becomes a durable receipt only after its tool result is saved in the parent's conversation. */
+  /**
+   * Turns a handover the session already holds into a durable receipt.
+   *
+   * "Read" has to mean "the content is in the conversation and stays there",
+   * so the receipt is written when the session is saved - never when the tool
+   * runs. The order matters and is the whole point: the session is saved
+   * first and the receipt second, so a crash in between costs one extra wake
+   * and never a receipt for content that was lost. The recovery path repairs
+   * that case by reading the parent session back from disk and writing the
+   * receipt from the declaration that is still in it.
+   *
+   * The declaration itself is read by `acknowledgeSessionDeliveries`, which
+   * owns the receipt rules. This function only keeps the in-flight book
+   * straight: a handover leaves the book once the receipt for it is written.
+   */
   function acknowledgeSavedWorkerReads(session: SavedSession, recoveryWorkerId?: string): void {
     if (closing) return;
-    const pending = pendingWorkerReads.get(session.id);
-    if (!pending?.size && !recoveryWorkerId) return;
-    for (const message of [...session.conversation, ...(session.conversationArchive ?? [])]) {
-      if (message.role !== 'tool') continue;
-      for (const part of message.content) {
-        if (part.type !== 'tool-result' || part.output.type !== 'json') continue;
-        const output = part.output.value;
-        // Old saved conversations remain valid receipts after the tool migration.
-        const values =
-          part.toolName === 'subagent_poll'
-            ? [output]
-            : part.toolName === 'inbox' && isRecord(output) && Array.isArray(output.items)
-              ? output.items.flatMap((item) => (isRecord(item) && item.source === 'Subagent' ? [item.content] : []))
-              : [];
-        for (const value of values) {
-          if (!isRecord(value) || typeof value.session !== 'string' || (!pending?.has(value.session) && value.session !== recoveryWorkerId))
-            continue;
-          const revision = typeof value.completionRevision === 'number' ? value.completionRevision : 0;
-          const notesCursor = typeof value.notesCursor === 'number' ? value.notesCursor : 0;
-          acknowledgeWorkerRead(ledger, session.id, value.session, revision, notesCursor);
-          const staged = pending?.get(value.session);
-          if (staged && revision >= staged.revision && notesCursor >= staged.notesCursor) pending?.delete(value.session);
-        }
-      }
+    const inFlight = inFlightWorkerDeliveries.get(session.id);
+    const acknowledged = acknowledgeSessionDeliveries(ledger, session, {
+      ...(inFlight ? { heldWorkerIds: [...inFlight.keys()] } : {}),
+      ...(recoveryWorkerId ? { recoveryWorkerId } : {}),
+    });
+    if (!inFlight) return;
+    for (const delivery of acknowledged) {
+      const staged = inFlight.get(delivery.id);
+      // The book entry clears when the receipt covers what the handover
+      // promised, and stays when it does not: a handover for a newer revision
+      // than the one that was acknowledged must still suppress its wake.
+      if (staged && delivery.revision >= staged.revision && (delivery.cursor ?? 0) >= staged.notesCursor) inFlight.delete(delivery.id);
     }
-    if (pending?.size === 0) pendingWorkerReads.delete(session.id);
+    if (inFlight.size === 0) inFlightWorkerDeliveries.delete(session.id);
   }
 
   const scheduler = new ScheduleRunner(ledger, receiveEvent, options.log);
@@ -318,7 +341,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     inboxReminderMs: INBOX_REMINDER_MS,
     isClosing: () => closing,
     workspaces,
-    pendingWorkerReads,
+    inFlightWorkerDeliveries,
   });
   const mcpManager = createMcpConnectionManager({
     onError: (id, message) => options.log(`MCP server ${id}: ${redactSensitiveText(message)}`),
@@ -578,10 +601,13 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           const record = readWorkerRecord(ledger, id);
           if (!record?.background || record.parentSessionId !== sessionId) continue;
           const notes = readWorkerOutbox(ledger, id);
-          const staged = pendingWorkerReads.get(sessionId)?.get(id);
-          const hasReport =
-            record.finished && (record.completionRevision ?? 0) > Math.max(record.reportedRevision ?? 0, staged?.revision ?? 0);
-          if (hasReport || notes.notes.length > Math.max(notes.read, staged?.notesCursor ?? 0))
+          // One question, one answer: the durable receipt says whether the
+          // parent has this report, and the outbox cursor says how far it has
+          // read the notes. Nothing else is allowed to answer "is it read",
+          // because a second answer is a second truth, and the two truths
+          // drift apart the moment the host restarts.
+          const hasReport = record.finished && (record.completionRevision ?? 0) > (record.reportedRevision ?? 0);
+          if (workerHasUnread(record, notes))
             items.push({
               reference: id,
               receivedAt: new Date(record.startedAt).toISOString(),
@@ -592,10 +618,20 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         }
         return { items };
       },
-      // Reading stages the content; the save that puts it in the conversation is
-      // what consumes the notification, so no second step is needed here.
+      /**
+       * Opening the notification hands the report over and says so.
+       *
+       * The declaration travels with the content, so the host can record the
+       * handover later without recognising the content again. The receipt is
+       * written when the session is saved, not here: "read" has to mean the
+       * content survives in the conversation.
+       */
       read: async (references, sessionId) =>
-        references.map((reference) => ({ reference, content: pollWorker({ session: reference }, sessionId) })),
+        references.map((reference) => {
+          const content = pollWorker({ session: reference }, sessionId);
+          const delivery = isRecord(content) ? deliveryOf(content.delivery) : undefined;
+          return { reference, content, ...(delivery ? { delivery } : {}) };
+        }),
     });
     return inbox;
   }

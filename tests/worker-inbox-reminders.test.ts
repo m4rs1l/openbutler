@@ -31,7 +31,7 @@ describe('worker inbox reminder ceiling', () => {
       options: { log: () => {} },
       scheduleEventRetry: () => {},
       pumpEvents: () => {},
-      pendingWorkerReads: new Map(),
+      inFlightWorkerDeliveries: new Map(),
       findSessionController: (id: string) => (id === PARENT_ID ? (controller as never) : undefined),
       findLiveSessionById: () => null,
       getCustodianWorkspace: async () => ({}) as never,

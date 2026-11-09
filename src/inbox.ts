@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { DELIVERIES_KEY, type ToolDelivery } from './delivery.js';
 
 /**
  * One pending notification. The metadata exists so a reader can choose which
@@ -18,8 +19,18 @@ export interface InboxItem {
 export interface InboxSource {
   name: string;
   list: (sessionId: string) => Promise<{ items: InboxItem[]; remaining?: number }>;
-  /** Opens the notification: the content comes back and the item leaves the box. */
-  read: (references: readonly string[], sessionId: string) => Promise<Array<{ reference: string; content: unknown }>>;
+  /**
+   * Opens the notification: the content comes back and the item leaves the box.
+   *
+   * A source that hands over a record the caller must not be asked about
+   * again declares the delivery here. The declaration is what the host records
+   * as "the caller has it", so it travels with the content instead of being
+   * guessed from it afterwards.
+   */
+  read: (
+    references: readonly string[],
+    sessionId: string,
+  ) => Promise<Array<{ reference: string; content: unknown; delivery?: ToolDelivery }>>;
 }
 
 export interface InboxRequest {
@@ -180,12 +191,18 @@ export class AgentInbox {
       grouped.set(source, [...new Set([...(grouped.get(source) ?? []), entry.item.reference])]);
     }
     const opened: Array<{ id: string; source: string; content: unknown }> = [];
+    // Deliveries are the facts about what the caller now holds. They travel
+    // with the content, so the host can record the handover later without
+    // having to recognise the content again.
+    const deliveries: ToolDelivery[] = [];
     // Grouped reads keep each source's attachment and transaction limits intact.
     for (const [source, references] of grouped) {
       try {
         const results = await source.read(references, sessionId);
-        for (const result of results)
+        for (const result of results) {
           opened.push({ id: inboxCodeFor(inboxId(source.name, result.reference)), source: source.name, content: result.content });
+          if (result.delivery) deliveries.push(result.delivery);
+        }
       } catch (error) {
         errors.push({ source: source.name, error: error instanceof Error ? error.message : String(error) });
       }
@@ -196,6 +213,7 @@ export class AgentInbox {
       status: errors.length || unresolved.length ? 'partial' : 'ok',
       action: request.action,
       items: opened,
+      ...(deliveries.length ? { [DELIVERIES_KEY]: deliveries } : {}),
       ...(unresolved.length ? { unresolved } : {}),
       errors,
     };
