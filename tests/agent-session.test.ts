@@ -328,6 +328,107 @@ describe('owner replies and safe steering', () => {
     expect(session.getSnapshot().queuedMessageCount).toBe(0);
   });
 
+  it('steers an owner correction into a run that a wake started', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'Fixture',
+      inputSchema: { type: 'object', properties: {} },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      autoApprove: () => true,
+      execute: async () => {
+        started = true;
+        await gate;
+        return { message: 'Evidence' };
+      },
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi
+        .fn()
+        .mockImplementationOnce(async () =>
+          delayedStream([{ type: 'tool-call', toolCallId: 'one', toolName: 'inspect', input: '{}' }], 'tool-calls'),
+        )
+        .mockImplementationOnce(async () => fixtureText('Handled with the correction.')),
+    });
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    // A workspace-bound controller, like the chats that carry a project.
+    session = new AgentSessionController(runtimeFor(model, registry));
+    // The run was started by a wake. A host signal carries no reply route of
+    // its own, and where that run's answer ends is that run's business.
+    const first = session.sendMessage({ text: 'Read the inbox.', images: [], communication: { source: 'inbox' } });
+    await vi.waitFor(() => expect(started).toBe(true));
+    // The owner writes from the web, where every message carries the terminal route.
+    const correction = session.sendMessage({
+      text: 'Correct the current task.',
+      images: [],
+      communication: { source: 'web', replyTo: { channel: 'terminal' } },
+    });
+    const queued = session.getSnapshot().queuedMessages[0]!;
+    expect(queued.steering).toBe(false);
+    expect(() => session!.manageQueuedMessage(queued.id!, 'steer', session!.getSnapshot().session.id)).not.toThrow();
+    release();
+    await Promise.all([first, correction]);
+    expect(model.doStreamCalls).toHaveLength(2);
+    const prompt = JSON.stringify(model.doStreamCalls[1]!.prompt);
+    expect(prompt).toContain('Correct the current task.');
+    expect(prompt).toContain('follow-up steering for the task already in progress');
+    const users = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'user');
+    expect(users).toHaveLength(2);
+    expect(users[1]!.turnId).toBe(users[0]!.turnId);
+  });
+
+  it('admits a host signal into a workspace-bound run', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'Fixture',
+      inputSchema: { type: 'object', properties: {} },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      autoApprove: () => true,
+      execute: async () => {
+        started = true;
+        await gate;
+        return { message: 'Evidence' };
+      },
+    });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi
+        .fn()
+        .mockImplementationOnce(async () =>
+          delayedStream([{ type: 'tool-call', toolCallId: 'one', toolName: 'inspect', input: '{}' }], 'tool-calls'),
+        )
+        .mockImplementationOnce(async () => fixtureText('Handled the signal.')),
+    });
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    session = new AgentSessionController(runtimeFor(model, registry));
+    const first = session.sendMessage({
+      text: 'Initial task',
+      images: [],
+      communication: { source: 'web', replyTo: { channel: 'terminal' } },
+    });
+    await vi.waitFor(() => expect(started).toBe(true));
+    // A host signal steers the live run without waiting for the next turn.
+    const signal = session.sendMessage({ text: 'TEAM_SIGNAL', images: [], communication: { source: 'team' } });
+    release();
+    await Promise.all([first, signal]);
+    expect(model.doStreamCalls).toHaveLength(2);
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('TEAM_SIGNAL');
+  });
+
   it.each(['terminal', 'web'] as const)(
     'steers %s owner corrections into workspace-bound runs after a parallel tool batch',
     async (source) => {
@@ -671,7 +772,7 @@ describe('owner replies and safe steering', () => {
     expect(session.takeEventRunResult('hello')).toEqual({ error: null, outputs: [{ kind: 'assistant', text: 'Hello!' }] });
   });
 
-  it('keeps a changed reply route as a followup and gives each route its own output', async () => {
+  it('lets a follow-up with another reply route join the live run and answers on the run route', async () => {
     let next: Promise<void> | undefined;
     const registry = new ToolRegistry();
     registry.register({
@@ -711,10 +812,12 @@ describe('owner replies and safe steering', () => {
       communication: { source: 'telegram', replyTo: { channel: 'telegram', chatId: '42' } },
     });
     await next;
-    expect(model.doStreamCalls).toHaveLength(3);
-    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).not.toContain('Terminal followup');
+    // The route of the follow-up does not keep it out of the live run: the run
+    // answers once, on the route the run itself carries.
+    expect(model.doStreamCalls).toHaveLength(2);
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('Terminal followup');
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('follow-up steering for the task already in progress');
     expect(session.takeEventRunResult('telegram')?.outputs).toEqual([{ kind: 'assistant', text: 'Telegram answer' }]);
-    expect(session.takeEventRunResult('terminal')?.outputs).toEqual([{ kind: 'assistant', text: 'Terminal answer' }]);
   });
 
   it('preserves every assistant segment across tools without including their output or reasoning', async () => {

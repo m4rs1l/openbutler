@@ -28,15 +28,6 @@ export type OwnerInboxMessage = {
   image?: { data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; filename: string };
 };
 
-export function sameReplyRoute(left: OwnerReplyRoute | undefined, right: OwnerReplyRoute | undefined): boolean {
-  return Boolean(
-    left &&
-    right &&
-    left.channel === right.channel &&
-    (left.channel === 'terminal' || (right.channel === 'telegram' && left.chatId === right.chatId)),
-  );
-}
-
 export function resolveOwnerNotificationRoute(
   channel: 'auto' | 'terminal' | 'telegram',
   terminalAttached: boolean,

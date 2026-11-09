@@ -35,7 +35,7 @@ import { ToolInputPreview } from './tool-preview.js';
 import { classifySensitiveEntry, redactSensitive, redactSensitiveText } from './sensitive-data.js';
 import { toolDisplayCommand as displayToolCommand } from './tool-display.js';
 import { reportSessionActivity } from './session-registry.js';
-import { sameReplyRoute, type TurnCommunication } from './communication.js';
+import type { TurnCommunication } from './communication.js';
 import { isUnsupportedImageInputError, omitUnsupportedImageInputs } from './image.js';
 import { attachmentReferences, storeAttachment, type FileAttachment } from './attachments.js';
 import { decodeBase64Image, MAX_IMAGE_BYTES } from './image-data.js';
@@ -1913,20 +1913,16 @@ export class AgentSessionController implements AgentSessionClient {
   /**
    * Why a queued message cannot join the running task right now; null when it
    * can. The live run's effort governs every steered message, so an effort
-   * difference is never a reason to refuse — only a different destination,
-   * workspace or project is.
+   * difference is never a reason to refuse, and where the run's own answer
+   * ends is the run's business, not the steered message's — only the source
+   * of the message and the scope it belongs to can refuse it.
    */
   private steeringRefusal(turn: QueuedTurn, current: QueuedMessage): string | null {
     const source = turn.message.communication?.source;
     const localOwner = !turn.automatic && (source === undefined || source === 'terminal' || source === 'web');
     const notification = source === 'inbox' || source === 'owner-inbox' || source === 'team' || source === 'worker';
-    const currentRoute = current.communication?.replyTo;
-    const nextRoute = turn.message.communication?.replyTo;
-    const sameRoute = sameReplyRoute(currentRoute, nextRoute) || (!currentRoute && !nextRoute && localOwner);
-    if (!(this.options.sessionWorkspaceRoot === null || localOwner || source === 'inbox' || source === 'worker'))
+    if (!(this.options.sessionWorkspaceRoot === null || localOwner || notification))
       return "This message's source cannot steer this task. It stays queued and runs next.";
-    if (!(notification || sameRoute))
-      return 'This message replies to a different destination than the running task. It stays queued and runs next.';
     if ((turn.message.workspaceRoot ?? this.runtime.workspaceRoot) !== (current.workspaceRoot ?? this.runtime.workspaceRoot))
       return 'This message targets a different workspace than the running task. It stays queued and runs next.';
     if (turn.message.projectContext?.id !== current.projectContext?.id)
@@ -2311,7 +2307,7 @@ export class AgentSessionController implements AgentSessionClient {
               shouldStop: tools.shouldStop,
               takeQueuedMessages: async () => {
                 // Steering is admitted only at SDK prepareStep, after the prior tool batch.
-                // Scope/route changes remain FIFO followups so they cannot borrow an active binding.
+                // Scope changes remain FIFO followups so they cannot borrow an active binding.
                 // Owner-inbox and team signals carry no owner reply binding, so they steer any live run.
                 // CLI (terminal) owner messages steer by default — owner decision 2026-10-31;
                 // web owner messages wait for the next turn unless the steer button promotes them.
