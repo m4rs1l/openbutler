@@ -23,23 +23,62 @@
 import type { ActivityLedger } from './activity-ledger.js';
 import { deliveriesOf, type ToolDelivery } from './delivery.js';
 import type { SavedSession } from './session-store.js';
-import { acknowledgeWorkerRead, readWorkerOutbox, readWorkerRecord, type WorkerOutbox, type WorkerRecord } from './worker-records.js';
+import {
+  acknowledgeWorkerRead,
+  closeWorkerReceiptEvents,
+  readWorkerOutbox,
+  readWorkerRecord,
+  type WorkerOutbox,
+  type WorkerRecord,
+} from './worker-records.js';
 
 /** The delivery kind a worker report uses. */
 export const WORKER_DELIVERY = 'worker';
 
 /**
+ * A handover the parent is holding right now.
+ *
+ * The parent read the report, but the turn that holds it has not been saved
+ * yet, so the receipt for it is still to come. This is evidence in flight,
+ * not a second answer about what was read: it can only ever say "the parent
+ * has this in hand", never "the parent never had it".
+ */
+export interface HeldHandover {
+  revision: number;
+  notesCursor: number;
+}
+
+/**
+ * Whether the worker finished with a report the parent has not acknowledged.
+ *
+ * The durable receipt answers this: `reportedRevision` is the revision the
+ * parent has already been given, and it is the only thing that can say the
+ * report was delivered for good. A handover in flight can only subtract,
+ * because a report the parent is holding right now has its receipt still to
+ * come.
+ */
+export function workerReportPending(record: WorkerRecord, held?: HeldHandover): boolean {
+  return record.finished && (record.completionRevision ?? 0) > Math.max(record.reportedRevision ?? 0, held?.revision ?? 0);
+}
+
+/**
  * Whether the parent still has to hear about this worker.
  *
- * One question, one answer. The durable receipt says whether the report was
- * read; the outbox cursor says how far the notes were read. Nothing else may
- * answer this question, because two answers mean two truths, and two truths
- * drift apart the moment the host restarts - and that drift is what made a
- * notification come back after it had already been opened.
+ * This is the one question the inbox listing and the wake both ask, and
+ * they ask it through this function so they cannot disagree. The answer has
+ * two parts, and they are not two truths:
+ *
+ * - the durable receipt says whether the report reached the parent for good,
+ * - a handover in flight says the parent is holding it right now, with the
+ *   receipt still to be written when the turn that read it is saved.
+ *
+ * The second part can only subtract. It never turns "still needed" into "not
+ * needed" on the strength of memory alone: a report that was never received
+ * stays needed, however long ago somebody looked at it.
  */
-export function workerHasUnread(record: WorkerRecord, notes: WorkerOutbox): boolean {
-  if (record.finished && (record.completionRevision ?? 0) > (record.reportedRevision ?? 0)) return true;
-  return notes.notes.length > notes.read;
+export function workerNeedsAttention(record: WorkerRecord, notes: WorkerOutbox, held?: HeldHandover): boolean {
+  const notesPending = notes.notes.length > Math.max(notes.read, held?.notesCursor ?? 0);
+  return workerReportPending(record, held) || notesPending;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -63,6 +102,17 @@ export interface ReceiptOptions {
    * the receipt is repaired from what is on disk.
    */
   recoveryWorkerId?: string;
+  /**
+   * Told about a receipt that could not be written.
+   *
+   * A receipt that fails to land is a real fault: the notification stays
+   * unread, and the state machine that depends on it keeps waiting. It must
+   * not be swallowed - a silent failure is the failure that is discovered
+   * days later, when a notification is stuck and nobody knows why. Reporting
+   * it here keeps the session save intact: the content is already on disk,
+   * and only the bookkeeping failed.
+   */
+  onFailure?: (failure: { delivery: ToolDelivery; error: unknown }) => void;
 }
 
 /**
@@ -73,8 +123,27 @@ export interface ReceiptOptions {
  */
 export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: SavedSession, options: ReceiptOptions = {}): ToolDelivery[] {
   const acknowledged: ToolDelivery[] = [];
+  /**
+   * The handovers this scan already consumed, by what they carry.
+   *
+   * The identity of a handover is the worker, the revision and the notes
+   * cursor - not the worker alone. A parent polls a running worker and reads
+   * it again once it has finished: two handovers of the same worker, and the
+   * second one is the one that writes the completion receipt. Keyed by the
+   * worker alone, the second handover would look like the first one and the
+   * completion receipt would never be written.
+   */
   const handled = new Set<string>();
-  for (const message of [...session.conversation, ...(session.conversationArchive ?? [])]) {
+  /** The workers the current contract already acknowledged, for the migration path below. */
+  const handledWorkers = new Set<string>();
+  const legacyBest = new Map<string, LegacyWorkerValue>();
+  const report = (delivery: ToolDelivery, error: unknown): void => {
+    options.onFailure?.({ delivery, error });
+  };
+
+  const conversation = session.conversation ?? [];
+
+  for (const message of [...conversation, ...(session.conversationArchive ?? [])]) {
     if (message.role !== 'tool') continue;
     for (const part of message.content) {
       if (part.type !== 'tool-result' || part.output.type !== 'json') continue;
@@ -84,9 +153,14 @@ export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: Sa
       // The declaration is the proof, so nothing else has to be consulted.
       for (const delivery of deliveriesOf(output)) {
         if (delivery.kind !== WORKER_DELIVERY) continue;
-        writeReceipt(ledger, session.id, delivery);
+        // A handover that this very scan already wrote is not written twice.
+        // Reading the same report twice - once through the inbox and once
+        // through the poll - is a normal thing to do.
+        if (handled.has(handoverKey(delivery))) continue;
+        if (!writeReceipt(ledger, session.id, delivery, report)) continue;
         acknowledged.push(delivery);
-        handled.add(delivery.id);
+        handled.add(handoverKey(delivery));
+        handledWorkers.add(delivery.id);
       }
 
       // Conversations that were saved before deliveries existed still carry
@@ -94,26 +168,35 @@ export function acknowledgeSessionDeliveries(ledger: ActivityLedger, session: Sa
       // They are read for their own sake, so a conversation that is already on
       // disk still closes its notification. This is a migration path for old
       // data, not a pattern to keep matching: no new result is built this way.
+      //
+      // The best value per worker wins, not the first one found: a
+      // conversation can hold a poll from before the worker finished and
+      // another from after, and only the later one carries the completion.
       for (const legacy of legacyWorkerValues(part.toolName, output)) {
-        if (handled.has(legacy.session)) continue;
-        const held = options.heldWorkerIds?.includes(legacy.session) === true;
-        if (!held && legacy.session !== options.recoveryWorkerId) continue;
-        writeReceipt(ledger, session.id, {
-          kind: WORKER_DELIVERY,
-          id: legacy.session,
-          revision: legacy.revision,
-          cursor: legacy.notesCursor,
-        });
-        acknowledged.push({
-          kind: WORKER_DELIVERY,
-          id: legacy.session,
-          revision: legacy.revision,
-          cursor: legacy.notesCursor,
-        });
-        handled.add(legacy.session);
+        const current = legacyBest.get(legacy.session);
+        if (!current || legacy.revision > current.revision) legacyBest.set(legacy.session, legacy);
       }
     }
   }
+
+  // The migration path runs after the current contract, so a worker that was
+  // handed over the new way is never acknowledged the old way as well.
+  for (const legacy of legacyBest.values()) {
+    if (handledWorkers.has(legacy.session)) continue;
+    const held = options.heldWorkerIds?.includes(legacy.session) === true;
+    if (!held && legacy.session !== options.recoveryWorkerId) continue;
+    const delivery: ToolDelivery = {
+      kind: WORKER_DELIVERY,
+      id: legacy.session,
+      revision: legacy.revision,
+      cursor: legacy.notesCursor,
+    };
+    if (!writeReceipt(ledger, session.id, delivery, report)) continue;
+    acknowledged.push(delivery);
+    handled.add(handoverKey(delivery));
+    handledWorkers.add(legacy.session);
+  }
+
   return acknowledged;
 }
 
@@ -145,25 +228,46 @@ export function durableStateCovers(ledger: ActivityLedger, workerId: string, rev
 /**
  * Writes the durable receipt for one handover.
  *
- * Two things are deliberate here.
+ * Three things are deliberate here.
  *
  * The first is the skip: a receipt that is already on disk is not rewritten.
  * The durable record is the truth about what was read, so consulting it first
  * keeps a long conversation from rewriting the same receipt on every save.
  *
- * The second is the error handling. A receipt that cannot be written must not
- * fail the save of the session that holds the content: the session is already
- * on disk by then, and the worst case of a lost receipt is one extra wake-up,
- * which the host repairs from the saved conversation. Failing the save
- * instead would turn a receipt problem into a session that is never persisted.
+ * The second is that the check and the write share one error policy. Both
+ * touch the ledger, so both can fail, and a function that treats a failed
+ * read as fatal and a failed write as nothing is a function with two rules.
+ *
+ * The third is that a failure is reported rather than swallowed. A receipt
+ * that cannot be written must not fail the save of the session that holds the
+ * content: the session is already on disk by then, and the caller repairs
+ * the receipt on the next save. But it must not disappear either, because a
+ * receipt that never lands is a notification that stays open for a reason
+ * nobody can see. The reporting is what turns it into a visible fault.
+ *
+ * Returns false when the receipt could not be written, so the caller leaves
+ * the handover alone and offers it again.
  */
-function writeReceipt(ledger: ActivityLedger, parentId: string, delivery: ToolDelivery): void {
-  if (durableStateCovers(ledger, delivery.id, delivery.revision, delivery.cursor ?? 0)) return;
+function writeReceipt(
+  ledger: ActivityLedger,
+  parentId: string,
+  delivery: ToolDelivery,
+  report: (delivery: ToolDelivery, error: unknown) => void,
+): boolean {
   try {
+    if (durableStateCovers(ledger, delivery.id, delivery.revision, delivery.cursor ?? 0)) {
+      // The receipt is already on disk, so there is nothing to write. The
+      // event it answers can still be open, though: an event closes when its
+      // receipt lands, and a later session is only the one that notices the
+      // receipt is already there.
+      closeWorkerReceiptEvents(ledger, delivery.id, delivery.revision, delivery.cursor ?? 0);
+      return true;
+    }
     acknowledgeWorkerRead(ledger, parentId, delivery.id, delivery.revision, delivery.cursor ?? 0);
-  } catch {
-    // The unread rule is derived from the durable record, so a receipt that
-    // did not land leaves the notification unread and the host asks again.
+    return true;
+  } catch (error) {
+    report(delivery, error);
+    return false;
   }
 }
 
@@ -171,6 +275,17 @@ interface LegacyWorkerValue {
   session: string;
   revision: number;
   notesCursor: number;
+}
+
+/**
+ * What makes one handover different from another.
+ *
+ * The worker says which report it is; the revision says which version of it;
+ * the cursor says how far the notes are read. Two handovers that agree on
+ * all three are the same handover, and only one of them is worth writing.
+ */
+function handoverKey(delivery: ToolDelivery): string {
+  return `${delivery.id}:${delivery.revision}:${delivery.cursor ?? 0}`;
 }
 
 /** The worker records an old-style tool result carries, if any. */

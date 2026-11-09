@@ -5,15 +5,23 @@ import { createWorkerService } from '../src/host/worker-service.js';
 const PARENT_ID = '11111111-1111-4111-8111-111111111111';
 
 /**
- * A notification the parent never opens used to re-arm its own wake forever:
- * every retry delivered the identical notice text, so one unread notification
- * turned into permanent noise - the same empty reminder every few minutes.
+ * A notification wakes the parent until the parent has really read it.
  *
- * The event must reach a terminal state instead: the reminder loop ends, the
- * event stops being pending, and the notification itself stays in the inbox.
+ * The wake loop is not bounded by a counter: what ends it is the durable
+ * receipt. While the receipt is outstanding the event stays pending and the
+ * host keeps waking the parent, because an unread notification that stops
+ * reminding is a notification that is lost. When the receipt lands the event
+ * is delivered for good and the parent is never woken about it again.
  */
-describe('worker inbox reminder ceiling', () => {
-  function buildService(ledger: ActivityLedger, signalStillNeeded: () => boolean) {
+describe('worker notification wake lifecycle', () => {
+  function buildService(
+    ledger: ActivityLedger,
+    options: {
+      receiptOutstanding: () => boolean;
+      signalStillNeeded?: () => boolean;
+      acknowledgeSavedWorkerReads?: () => void;
+    },
+  ) {
     const sent: string[] = [];
     const controller = {
       automaticWakeHeld: false,
@@ -40,17 +48,18 @@ describe('worker inbox reminder ceiling', () => {
       readWorkerRecord: () => null,
       writeWorkerRecord: () => {},
       createPrivateSession: async () => ({}) as never,
-      signalStillNeeded,
+      signalStillNeeded: options.signalStillNeeded ?? (() => true),
+      receiptOutstanding: options.receiptOutstanding,
       workspaces: new Map(),
       isClosing: () => false,
-      acknowledgeSavedWorkerReads: () => {},
+      acknowledgeSavedWorkerReads: options.acknowledgeSavedWorkerReads ?? (() => {}),
       redactSensitiveText: (text: string) => text,
       inboxReminderMs: 5 * 60_000,
     });
     return { service, sent };
   }
 
-  it('closes the event after the reminder ceiling instead of waking the parent forever', async () => {
+  it('keeps waking the parent while the receipt is outstanding', async () => {
     const ledger = new ActivityLedger(':memory:');
     const inserted = ledger.insertEvent({
       source: 'worker',
@@ -58,29 +67,24 @@ describe('worker inbox reminder ceiling', () => {
       dedupeKey: 'worker.finished:child-1',
       payload: { parentSessionId: PARENT_ID, workerId: 'child-1' },
     });
-    // The parent never opens the notification: the signal is always still needed.
-    const { service, sent } = buildService(ledger, () => true);
+    // The parent has not read the report, so no receipt exists.
+    const { service, sent } = buildService(ledger, { receiptOutstanding: () => true });
 
-    // Each pass is what the host does when the retry timer fires: only a
-    // pending event is re-processed, so the loop ends on its own once the
-    // event reaches a terminal state.
-    for (let pass = 0; pass < 20; pass += 1) {
+    // Every pass is what the host does when the retry timer fires. The event
+    // stays pending for as long as the notification is unread, so the loop is
+    // bounded by the read and not by a counter.
+    for (let pass = 0; pass < 5; pass += 1) {
       const event = ledger.getEvent(inserted.id)!;
       if (event.status !== 'pending') break;
       await service.processWorkerEvent(event);
     }
 
     const event = ledger.getEvent(inserted.id)!;
-    // The event reached a terminal state, so the host stops re-processing it.
-    expect(event.status).toBe('ignored');
-    expect(event.error).toContain('did not open the notification');
-    // The wake was not delivered forever: the ceiling bounds the reminders.
-    expect(sent.length).toBeLessThanOrEqual(12);
-    // The reminder count is released, so a later event starts from zero.
-    expect(ledger.getState(`worker:remind:${inserted.id}`)).toBe('0');
+    expect(event.status).toBe('pending');
+    expect(sent.length).toBe(5);
   });
 
-  it('stops reminding an event the parent already opened', async () => {
+  it('stops waking the parent once the receipt lands', async () => {
     const ledger = new ActivityLedger(':memory:');
     const inserted = ledger.insertEvent({
       source: 'worker',
@@ -88,14 +92,18 @@ describe('worker inbox reminder ceiling', () => {
       dedupeKey: 'worker.finished:child-2',
       payload: { parentSessionId: PARENT_ID, workerId: 'child-2' },
     });
-    let needed = true;
-    const { service } = buildService(ledger, () => needed);
+    let outstanding = true;
+    const { service, sent } = buildService(ledger, { receiptOutstanding: () => outstanding });
 
-    // The parent opens the notification: the signal is no longer needed.
     await service.processWorkerEvent(ledger.getEvent(inserted.id)!);
-    needed = false;
+    expect(ledger.getEvent(inserted.id)!.status).toBe('pending');
+
+    // The parent read the report and the receipt was written.
+    outstanding = false;
     await service.processWorkerEvent(ledger.getEvent(inserted.id)!);
 
     expect(ledger.getEvent(inserted.id)!.status).toBe('delivered');
+    // The delivery that closed the event is the last wake about it.
+    expect(sent.length).toBe(1);
   });
 });

@@ -517,6 +517,20 @@ export class ActivityLedger {
     return row ? eventFromRow(row) : null;
   }
 
+  /**
+   * The event recorded under a dedupe key.
+   *
+   * The dedupe key is the identity of an event, so it is what a caller that
+   * knows what it is looking for - the completion of one worker, one note of
+   * one worker - needs. Looking it up by key keeps the writer and the closer
+   * from drifting apart: both name the same event the same way.
+   */
+  findEventByDedupeKey(dedupeKey: string): ObservedEventRow | null {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM openbutler_events WHERE dedupe_key = ?').get(dedupeKey) as EventDbRow | undefined;
+    return row ? eventFromRow(row) : null;
+  }
+
   listEvents(limit = 30): ObservedEventRow[] {
     this.assertOpen();
     if (!this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'openbutler_events'").get()) return [];

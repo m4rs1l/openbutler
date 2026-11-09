@@ -19,7 +19,52 @@ export function acknowledgeWorkerRead(
     writeWorkerOutbox(ledger, workerId, outbox);
     if (record.finished && revision === record.completionRevision)
       writeWorkerRecord(ledger, workerId, { ...record, reportedRevision: revision });
+    // The receipt and the event it answers are one fact, so they are written
+    // in the same commit. An event left open after its receipt landed would
+    // wake the parent again on the next tick, about a report the parent
+    // already holds.
+    closeWorkerReceiptEvents(ledger, workerId, revision, notesCursor);
   });
+}
+
+/**
+ * The identity of a worker's completion event.
+ *
+ * The event is created here and closed here, so both sides name it the same
+ * way. A key that is written in one place and spelled in another is a key
+ * that eventually stops matching.
+ */
+function completionEventKey(workerId: string, revision: number): string {
+  return `worker:${workerId}:completion:${revision}`;
+}
+
+/** The identity of the event of one note a worker left for its parent. */
+function noteEventKey(workerId: string, note: number): string {
+  return `worker:${workerId}:note:${note}`;
+}
+
+/**
+ * Closes the worker events that the receipt has just covered.
+ *
+ * "Covered" is asked with the same predicate that decides whether an event is
+ * outstanding at all - `workerSignalPending` - so there is one answer to the
+ * question "does the parent still have to hear about this", and the event
+ * closes at the moment that answer turns to no, not on some later tick.
+ *
+ * Both open states are closed. A worker event that is still `pending` was
+ * waiting for its turn; one that is `processing` is being woken right now,
+ * and the wake is what produced the receipt that is landing now. Either way
+ * the parent holds the report, and either way the event is finished.
+ */
+export function closeWorkerReceiptEvents(ledger: ActivityLedger, workerId: string, revision: number, notesCursor: number): void {
+  const candidates = [ledger.findEventByDedupeKey(completionEventKey(workerId, revision))];
+  for (let note = 1; note <= notesCursor; note += 1) candidates.push(ledger.findEventByDedupeKey(noteEventKey(workerId, note)));
+  for (const event of candidates) {
+    if (!event) continue;
+    if (event.status !== 'pending' && event.status !== 'processing') continue;
+    if (workerSignalPending(ledger, event)) continue;
+    ledger.setEventState(event.id, 'delivered');
+  }
 }
 
 /**
@@ -136,7 +181,7 @@ export function completeWorker(ledger: ActivityLedger, workerId: string, result:
     return ledger.insertEvent({
       source: 'worker',
       kind: result.error === 'Run cancelled.' ? 'worker.cancelled' : result.error ? 'worker.failed' : 'worker.completed',
-      dedupeKey: `worker:${workerId}:completion:${revision}`,
+      dedupeKey: completionEventKey(workerId, revision),
       ...(record.workspaceRoot ? { workspaceRoot: record.workspaceRoot } : {}),
       payload: { workerId, parentSessionId: record.parentSessionId, revision },
     }).id;
@@ -154,7 +199,7 @@ export function appendWorkerNote(ledger: ActivityLedger, workerId: string, text:
     ledger.insertEvent({
       source: 'worker',
       kind: `worker.${kind}`,
-      dedupeKey: `worker:${workerId}:note:${outbox.notes.length}`,
+      dedupeKey: noteEventKey(workerId, outbox.notes.length),
       ...(record.workspaceRoot ? { workspaceRoot: record.workspaceRoot } : {}),
       payload: { workerId, parentSessionId: record.parentSessionId, note: outbox.notes.length },
     });

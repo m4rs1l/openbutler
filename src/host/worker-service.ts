@@ -90,6 +90,16 @@ export interface WorkerServiceDeps {
     extra?: { label?: string; options?: AgentSessionOptions; restoreSessionId?: string; modelRole?: ModelRole },
   ) => Promise<PrivateSessionHost>;
   signalStillNeeded: (event: ObservedEventRow) => boolean;
+  /**
+   * Whether the durable receipt for this event is still outstanding.
+   *
+   * The durable receipt is the only thing that may close an event. The
+   * in-flight book says what the parent is holding right now; that may
+   * suppress a duplicate wake, but it may never decide that an event is
+   * finished, because a closed event is never woken again - a notification
+   * that stays open and mute is worse than one that stays open and loud.
+   */
+  receiptOutstanding: (event: ObservedEventRow) => boolean;
   workspaces: Map<string, WorkspaceHost>;
   isClosing: () => boolean;
   acknowledgeSavedWorkerReads: (session: SavedSession, recoveryWorkerId?: string) => void;
@@ -113,6 +123,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     writeWorkerRecord,
     createPrivateSession,
     signalStillNeeded,
+    receiptOutstanding,
     acknowledgeSavedWorkerReads,
     redactSensitiveText,
     workspaces,
@@ -126,7 +137,6 @@ export function createWorkerService(deps: WorkerServiceDeps) {
    * unbounded retry turns one unread notification into permanent noise: the
    * parent sees the identical reminder every few minutes, forever.
    */
-  const MAX_UNREAD_REMINDERS = 12;
 
   /** Worker write leases (parallel-write policy): normalized path -> the worker that claimed it for its current run. */
   const workerFileLeases = new Map<string, string>();
@@ -140,51 +150,28 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     }
   }
 
-  /**
-   * Defer a wake that re-arms a notification the parent has not opened.
-   *
-   * Every deferral delivers the same notice text again, so a parent that
-   * never opens the notification would be woken by it forever: one unread
-   * notification turns into permanent noise, repeating the identical
-   * reminder every few minutes. Count the reminders and close the event at
-   * the ceiling. The notification itself stays in the inbox and stays
-   * readable - only the wake loop ends.
-   */
-  function deferReminderOrClose(event: ObservedEventRow, reason: string): void {
-    const remindKey = `worker:remind:${event.id}`;
-    const reminders = Number(ledger.getState(remindKey) ?? '0') || 0;
-    ledger.setState(remindKey, String(reminders + 1));
-    deferWorkerEvent(event, INBOX_REMINDER_MS, reason);
-  }
-
-  /**
-   * Close a notification event that has already used up its reminders.
-   *
-   * The ceiling is checked before the wake is delivered, so the last
-   * reminder is the last thing the parent sees: an event past the ceiling
-   * is closed silently instead of waking the parent one more time with the
-   * same notice. The notification itself stays in the inbox and stays
-   * readable - only the wake loop ends.
-   */
-  function closeUnreadEvent(event: ObservedEventRow): boolean {
-    const remindKey = `worker:remind:${event.id}`;
-    const reminders = Number(ledger.getState(remindKey) ?? '0') || 0;
-    if (reminders < MAX_UNREAD_REMINDERS) return false;
-    ledger.setEventState(event.id, 'ignored', 'The parent did not open the notification; it stays in the inbox and no longer wakes it.');
-    ledger.setState(remindKey, '0');
-    return true;
-  }
-
   async function processWorkerEvent(event: ObservedEventRow): Promise<void> {
-    if (!signalStillNeeded(event)) {
+    // The durable receipt decides whether the event is still open. The
+    // in-flight book is consulted later, and only for the wake.
+    if (!receiptOutstanding(event)) {
       ledger.setEventState(event.id, 'delivered');
       return;
     }
     const parentId = String(event.payload.parentSessionId);
     const persistedParent = loadSavedSession(parentId);
     if (persistedParent) acknowledgeSavedWorkerReads(persistedParent, String(event.payload.workerId));
-    if (!signalStillNeeded(event)) {
+    if (!receiptOutstanding(event)) {
       ledger.setEventState(event.id, 'delivered');
+      return;
+    }
+    // The receipt is outstanding but the parent is holding the handover in
+    // this very moment: it has read the report and the turn that holds it is
+    // not saved yet. Waking it again would repeat a notice about something
+    // it is already holding, so the event waits quietly for the receipt.
+    // This wait is not a reminder: the notification was not ignored, it is
+    // in flight.
+    if (!signalStillNeeded(event)) {
+      deferWorkerEvent(event, INBOX_REMINDER_MS, 'The parent is holding the handover; waiting for the receipt to land.');
       return;
     }
     let parent = findSessionController(parentId);
@@ -241,9 +228,6 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       deferWorkerEvent(event, 0, 'Automatic wake is held by the owner.');
       return;
     }
-    // Past the reminder ceiling the event is closed without another wake:
-    // the parent has already seen the same notice MAX_UNREAD_REMINDERS times.
-    if (closeUnreadEvent(event)) return;
     const controller = parent;
     const attemptId = `${event.id}:attempt:${event.attempts}`;
     try {
@@ -261,12 +245,12 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       await controller.flushSave();
       const result = controller.takeEventRunResult(attemptId);
       const error = result ? result.error : controller.getLastRunError();
-      if (!signalStillNeeded(event)) ledger.setEventState(event.id, 'delivered');
+      if (!receiptOutstanding(event)) ledger.setEventState(event.id, 'delivered');
       else if (controller.getSnapshot().session.id !== parentId)
         deferWorkerEvent(event, 30_000, 'The original parent is no longer selected.');
       else if (result?.skipped) deferWorkerEvent(event, 1000, 'Waiting for the parent tool result to be saved.');
-      else if (error) deferReminderOrClose(event, error);
-      else deferReminderOrClose(event, 'The subagent notification is still unread.');
+      else if (error) deferWorkerEvent(event, controller.automaticWakeHeld ? 0 : INBOX_REMINDER_MS, error);
+      else deferWorkerEvent(event, INBOX_REMINDER_MS, 'The subagent notification is still unread.');
     } catch (error) {
       if (isClosing()) ledger.setEventState(event.id, 'pending', 'Host stopped before parent delivery completed.');
       else

@@ -10,8 +10,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActivityLedger } from '../src/activity-ledger.js';
 import { DELIVERIES_KEY, deliveriesOf } from '../src/delivery.js';
-import { acknowledgeSessionDeliveries, workerHasUnread } from '../src/worker-receipts.js';
-import { readWorkerOutbox, readWorkerRecord, writeWorkerRecord } from '../src/worker-records.js';
+import { acknowledgeSessionDeliveries, workerNeedsAttention, workerReportPending } from '../src/worker-receipts.js';
+import { completeWorker, readWorkerOutbox, readWorkerRecord, writeWorkerRecord } from '../src/worker-records.js';
 import type { SavedSession } from '../src/session-store.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 
@@ -58,6 +58,24 @@ function sessionWith(toolName: string, value: unknown): SavedSession {
         ],
       },
     ],
+  } as unknown as SavedSession;
+}
+
+/** A saved session holding several tool results with the given values. */
+function sessionWithResults(toolName: string, values: unknown[]): SavedSession {
+  return {
+    id: PARENT,
+    conversation: values.map((value, index) => ({
+      role: 'tool',
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId: `call-${index}`,
+          toolName,
+          output: { type: 'json', value },
+        },
+      ],
+    })),
   } as unknown as SavedSession;
 }
 
@@ -174,16 +192,16 @@ describe('the unread rule follows the durable receipt', () => {
 
     // The report was handed over but the session has not been saved yet, so
     // there is no receipt and the parent still has to hear about it.
-    expect(workerHasUnread(record, notes)).toBe(true);
+    expect(workerNeedsAttention(record, notes)).toBe(true);
 
     acknowledgeSessionDeliveries(ledger, sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] }));
 
-    expect(workerHasUnread(readWorkerRecord(ledger, WORKER)!, notes)).toBe(false);
+    expect(workerNeedsAttention(readWorkerRecord(ledger, WORKER)!, notes)).toBe(false);
   });
 
   it('stays unread for a worker that was never handed over', () => {
     finishedWorker();
-    expect(workerHasUnread(readWorkerRecord(ledger, WORKER)!, readWorkerOutbox(ledger, WORKER))).toBe(true);
+    expect(workerNeedsAttention(readWorkerRecord(ledger, WORKER)!, readWorkerOutbox(ledger, WORKER))).toBe(true);
   });
 
   it('does not depend on what the conversation looks like', () => {
@@ -192,7 +210,7 @@ describe('the unread rule follows the durable receipt', () => {
     acknowledgeSessionDeliveries(ledger, sessionWith('inbox', { status: 'ok', items: [] }));
 
     expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBeUndefined();
-    expect(workerHasUnread(readWorkerRecord(ledger, WORKER)!, readWorkerOutbox(ledger, WORKER))).toBe(true);
+    expect(workerNeedsAttention(readWorkerRecord(ledger, WORKER)!, readWorkerOutbox(ledger, WORKER))).toBe(true);
   });
 });
 
@@ -228,5 +246,128 @@ describe('old conversations still reconcile', () => {
     acknowledgeSessionDeliveries(ledger, saved, { recoveryWorkerId: WORKER });
 
     expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+  });
+
+  it('takes the later poll when the conversation holds an earlier one too', () => {
+    // A conversation can hold a poll from before the worker finished and one
+    // from after. Only the later one carries the completion, so taking the
+    // first value found would leave the notification open for good.
+    finishedWorker();
+    const session = sessionWithResults('subagent_poll', [
+      { session: WORKER, completionRevision: 0, notesCursor: 0 },
+      { session: WORKER, completionRevision: 1, notesCursor: 0 },
+    ]);
+    acknowledgeSessionDeliveries(ledger, session, { heldWorkerIds: [WORKER] });
+
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+  });
+});
+
+describe('a handover the parent is holding right now', () => {
+  it('is not listed as unread while the report is in hand', () => {
+    // The parent read the report, but the turn that holds it is not saved
+    // yet, so the receipt is still to come. Listing it as unread would tell
+    // the parent that a report it is already holding was never read.
+    finishedWorker();
+    const record = readWorkerRecord(ledger, WORKER)!;
+    const notes = readWorkerOutbox(ledger, WORKER);
+
+    expect(workerNeedsAttention(record, notes)).toBe(true);
+    expect(workerNeedsAttention(record, notes, { revision: 1, notesCursor: 0 })).toBe(false);
+    expect(workerReportPending(record, { revision: 1, notesCursor: 0 })).toBe(false);
+  });
+
+  it('does not silence a report that was never handed over', () => {
+    // The in-flight book may only subtract a report that is really in hand.
+    // A handover for another revision says nothing about this one, so it
+    // must not be used to hide a report the parent never received.
+    finishedWorker();
+    const record = readWorkerRecord(ledger, WORKER)!;
+    const notes = readWorkerOutbox(ledger, WORKER);
+
+    expect(workerNeedsAttention(record, notes, { revision: 0, notesCursor: 0 })).toBe(true);
+  });
+
+  it('still counts notes that the parent has not read', () => {
+    // The report and the notes are two cursors. A handover that covers the
+    // report does not cover the notes.
+    finishedWorker();
+    const record = readWorkerRecord(ledger, WORKER)!;
+    const notes = { notes: ['a note'], read: 0 };
+
+    expect(workerNeedsAttention(record, notes, { revision: 1, notesCursor: 1 })).toBe(false);
+    expect(workerNeedsAttention(record, notes, { revision: 1, notesCursor: 0 })).toBe(true);
+  });
+});
+
+describe('a receipt that cannot be written is reported', () => {
+  it('reports the failure and leaves the notification open', () => {
+    // The notification stays open, so the failure has to be visible: a
+    // silent failure is discovered days later, as a stuck notification with
+    // no cause. The save of the session itself must not fail because of it -
+    // the content is on disk, only the bookkeeping failed.
+    finishedWorker();
+    const failures: Array<{ id: string; error: unknown }> = [];
+    vi.spyOn(ledger, 'transaction').mockImplementation(() => {
+      throw new Error('ledger is locked');
+    });
+
+    const acknowledged = acknowledgeSessionDeliveries(ledger, sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] }), {
+      onFailure: ({ delivery, error }) => failures.push({ id: delivery.id, error }),
+    });
+
+    expect(acknowledged).toEqual([]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.id).toBe(WORKER);
+    expect(String(failures[0]?.error)).toContain('ledger is locked');
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBeUndefined();
+  });
+
+  it('writes the receipt on the next save after a failed write', () => {
+    // A failed write leaves the handover where it was: the next save sees it
+    // again and writes the receipt. The failure costs a wake-up, not the
+    // notification.
+    finishedWorker();
+    const session = sessionWith('inbox', { [DELIVERIES_KEY]: [workerDelivery] });
+    vi.spyOn(ledger, 'transaction').mockImplementationOnce(() => {
+      throw new Error('ledger is locked');
+    });
+
+    acknowledgeSessionDeliveries(ledger, session, { onFailure: () => {} });
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBeUndefined();
+
+    acknowledgeSessionDeliveries(ledger, session);
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+  });
+});
+
+describe('a worker handed over twice', () => {
+  it('writes the completion receipt of the later handover and closes its event', () => {
+    // The parent polls a running worker and reads it again once it has
+    // finished. Those are two handovers of the same worker, and only the
+    // second one carries the completion. Treating them as one handover threw
+    // the completion receipt away, and a notification without a receipt is a
+    // notification that stays open and repeats itself.
+    writeWorkerRecord(ledger, WORKER, {
+      parentSessionId: PARENT,
+      depth: 1,
+      mode: 'explorer',
+      background: true,
+      startedAt: 1_000,
+      finished: false,
+    });
+    const eventId = completeWorker(ledger, WORKER, { report: 'WORKER-REPORT', error: null });
+
+    const session = sessionWithResults('inbox', [
+      { [DELIVERIES_KEY]: [{ kind: 'worker', id: WORKER, revision: 0, cursor: 0 }] },
+      { [DELIVERIES_KEY]: [{ kind: 'worker', id: WORKER, revision: 1, cursor: 0 }] },
+    ]);
+
+    acknowledgeSessionDeliveries(ledger, session);
+
+    expect(readWorkerRecord(ledger, WORKER)?.reportedRevision).toBe(1);
+    // The event that asked for the report closes with the receipt that
+    // answers it - not on the next tick.
+    expect(ledger.getEvent(eventId!)?.status).toBe('delivered');
   });
 });

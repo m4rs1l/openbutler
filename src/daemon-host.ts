@@ -102,7 +102,7 @@ import { getDataPath } from './paths.js';
 import { imageTypeFromBytes, decodeBase64Image } from './image.js';
 import { AgentInbox, inboxNotice, type InboxItem } from './inbox.js';
 import { deliveryOf } from './delivery.js';
-import { acknowledgeSessionDeliveries, workerHasUnread } from './worker-receipts.js';
+import { acknowledgeSessionDeliveries, workerNeedsAttention, workerReportPending } from './worker-receipts.js';
 import { pendingReportLine, reportsNeedWake } from './report-summary.js';
 
 const MAX_MESSAGE_TEXT_BYTES = 8 * 1024 * 1024;
@@ -232,13 +232,35 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   const inFlightWorkerDeliveries = new Map<string, Map<string, { revision: number; notesCursor: number }>>();
 
   /**
+   * Whether the durable receipt for this event is still outstanding.
+   *
+   * This is the only question that may close an event. The receipt is
+   * written from the saved conversation, so it lands at the same moment the
+   * content becomes durable; until then the event is genuinely outstanding.
+   *
+   * Closing an event any earlier - for instance because the in-flight book
+   * says the parent is holding the report - would leave a notification open
+   * that nobody would ever wake again: the parent would see it in the inbox
+   * and never be told about it again.
+   */
+  function receiptOutstanding(event: ObservedEventRow): boolean {
+    return workerSignalPending(ledger, event);
+  }
+
+  /**
    * Whether the parent still has to be woken about this event.
    *
-   * The durable receipt decides it; the in-flight map only removes the
-   * duplicate wake for a handover the parent is already holding.
+   * Two questions, kept apart on purpose:
+   *
+   * - `receiptOutstanding` is the durable one. It decides whether the event
+   *   is still open, and only the receipt may close it.
+   * - this function is the transient one. The in-flight book says the parent
+   *   is holding the handover right now, so a second wake would repeat
+   *   itself. Suppressing a duplicate wake is all it may do; it may never
+   *   decide that an event is finished.
    */
   function signalStillNeeded(event: ObservedEventRow): boolean {
-    if (!workerSignalPending(ledger, event)) return false;
+    if (!receiptOutstanding(event)) return false;
     const inFlight = inFlightWorkerDeliveries.get(String(event.payload.parentSessionId))?.get(String(event.payload.workerId));
     return typeof event.payload.note === 'number'
       ? (inFlight?.notesCursor ?? 0) < event.payload.note
@@ -266,6 +288,17 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     const acknowledged = acknowledgeSessionDeliveries(ledger, session, {
       ...(inFlight ? { heldWorkerIds: [...inFlight.keys()] } : {}),
       ...(recoveryWorkerId ? { recoveryWorkerId } : {}),
+      // A receipt that cannot be written is a real fault and is reported, not
+      // swallowed: the notification stays open and the book of pending events
+      // waits for it, so a silent failure would be discovered days later as a
+      // stuck notification with no cause. The session save is not failed by
+      // it - the content is already on disk, only the bookkeeping failed.
+      onFailure: ({ delivery, error }) =>
+        options.log(
+          `Worker receipt could not be written for ${delivery.id} (revision ${delivery.revision}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
     });
     if (!inFlight) return;
     for (const delivery of acknowledged) {
@@ -336,6 +369,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     writeWorkerRecord,
     createPrivateSession,
     signalStillNeeded,
+    receiptOutstanding,
     acknowledgeSavedWorkerReads,
     redactSensitiveText,
     inboxReminderMs: INBOX_REMINDER_MS,
@@ -606,14 +640,20 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           // read the notes. Nothing else is allowed to answer "is it read",
           // because a second answer is a second truth, and the two truths
           // drift apart the moment the host restarts.
-          const hasReport = record.finished && (record.completionRevision ?? 0) > (record.reportedRevision ?? 0);
-          if (workerHasUnread(record, notes))
+          //
+          // The one exception is the handover the parent is holding right
+          // now: it has been read, and its receipt is written when the turn
+          // that holds it is saved. Listing it as unread would tell the
+          // parent that a report it is already holding was never read.
+          const held = inFlightWorkerDeliveries.get(sessionId)?.get(id);
+          const heldHandover = held ? { revision: held.revision, notesCursor: held.notesCursor } : undefined;
+          if (workerNeedsAttention(record, notes, heldHandover))
             items.push({
               reference: id,
               receivedAt: new Date(record.startedAt).toISOString(),
               state: 'unread',
               from: id.slice(0, 8),
-              subject: hasReport ? 'report' : 'update',
+              subject: workerReportPending(record, heldHandover) ? 'report' : 'update',
             });
         }
         return { items };
@@ -1997,7 +2037,11 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     for (const event of ledger.pendingEvents(1000)) {
       if (activeEvents.has(event.id)) continue;
       if (event.source === 'worker') {
-        if (!signalStillNeeded(event)) {
+        // Only the durable receipt closes a worker event. The in-flight book
+        // may suppress a duplicate wake, but it may not decide that an event
+        // is finished: closing it without a receipt would leave the
+        // notification open and mute at the same time.
+        if (!receiptOutstanding(event)) {
           ledger.setEventState(event.id, 'delivered');
           continue;
         }
