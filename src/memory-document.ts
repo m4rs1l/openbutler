@@ -4,6 +4,16 @@ import { basename } from 'node:path';
 export const MEMORY_DOCUMENT_REVISION = 'markdown-v3';
 export const MEMORY_INDEX_MAX_LINES = 200;
 export const MEMORY_INDEX_MAX_BYTES = 25 * 1024;
+/**
+ * Budget for the always-loaded user notes (preferences and profile).
+ *
+ * These two notes carry the standing rules of the session, so a cut in them
+ * removes rules rather than detail, and the rules written last are the ones a
+ * cut at the end of the file takes. The notes are supposed to stay short and
+ * put dated evidence in topic notes, so a well-kept note fits; this budget is
+ * the room for one that grew, not an invitation to grow into it.
+ */
+export const MEMORY_USER_CONTEXT_MAX_BYTES = 16 * 1024;
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference';
 export type MemoryScope = 'user' | 'self' | `workspace:${string}`;
 const TYPES: readonly MemoryType[] = ['user', 'feedback', 'project', 'reference'];

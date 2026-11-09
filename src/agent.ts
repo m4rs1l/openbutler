@@ -1,7 +1,7 @@
 import { AGENT_BASE, type AgentBase, type AgentRole } from './agent-instructions.js';
 import { streamText, type JSONValue, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { randomUUID } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { estimateContextTokens, type CompactionContext, type CompactionResult } from './compaction.js';
 import {
@@ -18,7 +18,12 @@ import { materializeIncomingAttachments } from './attachments.js';
 import { getMemoryPaths, isMemoryDocumentPath } from './memory-paths.js';
 import { getScratchRoot } from './paths.js';
 import { getConfigPath, loadSettings } from './settings.js';
-import { MEMORY_DOCUMENT_GUIDANCE, MEMORY_INDEX_MAX_BYTES, MEMORY_INDEX_MAX_LINES } from './memory-document.js';
+import {
+  MEMORY_DOCUMENT_GUIDANCE,
+  MEMORY_INDEX_MAX_BYTES,
+  MEMORY_INDEX_MAX_LINES,
+  MEMORY_USER_CONTEXT_MAX_BYTES,
+} from './memory-document.js';
 import { discoverSkills, formatSkillIndex, getOpenButlerSkillDirectory, getSkillRoots } from './skills.js';
 
 type AgentProviderOptions = Record<string, Record<string, JSONValue>>;
@@ -42,9 +47,15 @@ type AgentProviderOptions = Record<string, Record<string, JSONValue>>;
 export function buildAgentSystem(workspaceRoot = process.cwd(), base: AgentBase = AGENT_BASE): string {
   const paths = getMemoryPaths(workspaceRoot);
   const memoryIndex = readMemoryIndex(paths.indexFile);
-  const loadedPreferences = readMemoryFile(paths.preferencesFile);
-  const loadedUserProfile = readMemoryFile(paths.userFile);
-  const loadedUserContext = [loadedPreferences, loadedUserProfile].filter((part) => part.length > 0).join('\n\n');
+  const loadedPreferences = readMemoryFile(paths.preferencesFile, MEMORY_USER_CONTEXT_MAX_BYTES);
+  const loadedUserProfile = readMemoryFile(paths.userFile, MEMORY_USER_CONTEXT_MAX_BYTES);
+  const loadedUserContext = [loadedPreferences, loadedUserProfile]
+    .filter((part) => part.text.length > 0)
+    .map((part) => (part.truncated ? `${part.text}\n\n${truncationNotice(part)}` : part.text))
+    .join('\n\n');
+  const preferencesAvailability = memoryProfileAvailability(paths.preferencesFile, workspaceRoot, loadedPreferences);
+  const userProfileAvailability = memoryProfileAvailability(paths.userFile, workspaceRoot, loadedUserProfile);
+  const workspaceProfileAvailability = memoryProfileAvailability(paths.workspaceFile, workspaceRoot);
   const skillIndex = formatSkillIndex(discoverSkills(workspaceRoot));
   const skillRoots = getSkillRoots(workspaceRoot);
   const teamBlock = buildTeamBlock(base.role, workspaceRoot);
@@ -67,12 +78,12 @@ Active-workspace skill directory: ${skillRoots.find((root) => root.scope === 'wo
 
 Persistent memory root: ${paths.root}
 - Single cross-workspace index: ${paths.indexFile}
-- How to respond: ${paths.preferencesFile} (${memoryProfileAvailability(paths.preferencesFile, workspaceRoot)}), who the user is: ${paths.userFile} (${memoryProfileAvailability(paths.userFile, workspaceRoot)}), durable topics: ${paths.topicsDirectory}, project areas: ${paths.areasDirectory}
-- Active workspace profile: ${paths.workspaceFile} (${memoryProfileAvailability(paths.workspaceFile, workspaceRoot)})
+- How to respond: ${paths.preferencesFile} (${preferencesAvailability}), who the user is: ${paths.userFile} (${userProfileAvailability}), durable topics: ${paths.topicsDirectory}, project areas: ${paths.areasDirectory}
+- Active workspace profile: ${paths.workspaceFile} (${workspaceProfileAvailability})
 
 ${MEMORY_DOCUMENT_GUIDANCE}
 
-Use preferences and profile already in context without repeatedly rereading them. The loaded index is a navigation snapshot, not the note contents or proof that a note is absent. When the work depends on an earlier decision, a user correction, an ongoing project, or a similar failure, open the relevant note with file_read; use memory_search to locate it when its path is unknown. For example, consult the recorded commit preference when deciding how to deliver code, or the server note when choosing an existing deployment target. Apply the note's conditions to the current decision rather than merely mentioning that it exists. Use session_search and session_read when the needed evidence is an earlier conversation rather than a durable note. Read only what the task calls for, and reuse notes already read in the current context.
+Use preferences and profile already in context without repeatedly rereading them. A loaded note that is marked truncated is not complete: read that file from disk before acting on it, because the cut hides the rules that were written last. The loaded index is a navigation snapshot, not the note contents or proof that a note is absent. When the work depends on an earlier decision, a user correction, an ongoing project, or a similar failure, open the relevant note with file_read; use memory_search to locate it when its path is unknown. For example, consult the recorded commit preference when deciding how to deliver code, or the server note when choosing an existing deployment target. Apply the note's conditions to the current decision rather than merely mentioning that it exists. Use session_search and session_read when the needed evidence is an earlier conversation rather than a durable note. Read only what the task calls for, and reuse notes already read in the current context.
 Files and index entries can change during a session without refreshing this snapshot. After a correction or memory write, use the current note and the write result; do not treat an old loaded summary as current. When an observation contradicts a note, check its date, scope, and evidence before choosing what to trust. Do not assume another workspace or a former team's memory is available. Keep exact identifiers unchanged; phrase semantic search queries in English for the local model. If memory search is preparing or unavailable, open a known path or inspect the current MEMORY.md with file_read; disclose consequential gaps instead of claiming memory was checked.
 
 Write memory on your own initiative when the work establishes durable information a future session would otherwise have to rediscover. First locate and read the existing note, or use the current contents if already read; use memory_search or the current index to check for an existing home before creating one. Use memory_write to replace changed facts and remove superseded instructions, update the summary and description when their meaning changes, and append only independent new facts. General response and working preferences belong in preferences; topical facts and conditional lessons in topics; cross-workspace project decisions in areas; directory-local facts in the workspace profile. Keep detailed evidence in its relevant note and link to the canonical preference instead of copying a rule. Do not promote an inference or the owner's silence into a stated preference. At a useful work boundary, save any durable correction or decision still missing; do not manufacture a memory entry for every task. Keep repository-derived implementation details and completed run reports in their primary sources or session history. Keep peer observations local and distinguish them from verified facts. Apply the same evidence and privacy rules to loaded memory as to retrieved content.
@@ -129,12 +140,13 @@ export function getAgentContext(
   };
 }
 
-function memoryProfileAvailability(path: string, workspaceRoot: string): string {
+function memoryProfileAvailability(path: string, workspaceRoot: string, read?: MemoryFileRead): string {
   try {
-    return isMemoryDocumentPath(path, workspaceRoot) && lstatSync(path).isFile() ? 'available' : 'not initialized';
+    if (!isMemoryDocumentPath(path, workspaceRoot) || !lstatSync(path).isFile()) return 'not initialized';
   } catch {
     return 'not initialized';
   }
+  return read?.truncated ? 'available, truncated - read the file for the rest' : 'available';
 }
 
 /**
@@ -188,7 +200,7 @@ function readMemoryDirectory(directory: string): string[] {
   const lines: string[] = [];
   for (const name of names.sort()) {
     if (!name.toLowerCase().endsWith('.md')) continue;
-    const content = readMemoryFile(join(directory, name), 2048);
+    const content = readMemoryFile(join(directory, name), 2048).text;
     const firstLine = content
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -223,18 +235,22 @@ function readMemoryIndex(path: string): string {
   }
 }
 
+/** A memory note read into the prompt, with the cut reported rather than hidden. */
+type MemoryFileRead = { text: string; truncated: boolean; totalBytes: number; loadedBytes: number };
+
 /** Small always-loaded memory files (preferences, user profile); missing files load as empty. */
-function readMemoryFile(path: string, maxBytes = 4096): string {
+function readMemoryFile(path: string, maxBytes = 4096): MemoryFileRead {
   let descriptor: number;
   try {
     const info = lstatSync(path);
-    if (!info.isFile() || info.isSymbolicLink()) return '';
+    if (!info.isFile() || info.isSymbolicLink()) return { text: '', truncated: false, totalBytes: 0, loadedBytes: 0 };
     descriptor = openSync(path, 'r');
   } catch {
-    return '';
+    return { text: '', truncated: false, totalBytes: 0, loadedBytes: 0 };
   }
 
   try {
+    const totalBytes = fstatSync(descriptor).size;
     const buffer = Buffer.allocUnsafe(maxBytes + 1);
     const bytesRead = readSync(descriptor, buffer, 0, buffer.byteLength, 0);
     let end = Math.min(bytesRead, maxBytes);
@@ -242,10 +258,22 @@ function readMemoryFile(path: string, maxBytes = 4096): string {
       const lastNewline = buffer.lastIndexOf(0x0a, end - 1);
       end = lastNewline < 0 ? 0 : lastNewline + 1;
     }
-    return buffer.toString('utf8', 0, end).trim();
+    const text = buffer.toString('utf8', 0, end).trim();
+    return { text, truncated: totalBytes > maxBytes, totalBytes, loadedBytes: end };
   } finally {
     closeSync(descriptor);
   }
+}
+
+/**
+ * The marker that follows a note the budget cut.
+ *
+ * The cut lands at the end of the file, so the rules written last are the ones
+ * it takes, and a session that cannot see them will act as if they were never
+ * stated. Saying so is the difference between a missing rule and a hidden one.
+ */
+function truncationNotice(read: MemoryFileRead): string {
+  return `[truncated: this note is ${read.totalBytes} bytes and only the first ${read.loadedBytes} are loaded. Read the file from disk before relying on it; the cut hides the rules that were written last.]`;
 }
 
 /** Runs a model-directed tool loop. Tool policy and approval stay with the tool implementations. */

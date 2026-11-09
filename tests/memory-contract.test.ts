@@ -246,6 +246,30 @@ it('inlines the user preferences and profile into the system prompt when they ex
   expect(system).toContain('Solo developer.');
 });
 
+it('loads a preferences note that outgrew the old 4 KB cut, including the rule written last', () => {
+  const paths = getMemoryPaths(workspace);
+  const rules = Array.from({ length: 120 }, (_, index) => `- Rule number ${index} about how to reply to the owner.`).join('\n');
+  const content = `---\ntitle: Prefs\ndescription: D\nupdated: 2026-11-09\ntype: user\n---\n# Prefs\n\nReply briefly.\n\n${rules}\n- Address the owner as "efendim" and speak in the formal plural.\n`;
+  expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(4096);
+  expect(Buffer.byteLength(content, 'utf8')).toBeLessThan(16 * 1024);
+  put(paths.preferencesFile, content);
+  const system = getAgentContext([], false, workspace).system;
+  expect(system).toContain('Address the owner as "efendim"');
+  expect(system).not.toContain('truncated: this note is');
+});
+
+it('marks a user note that outgrew the budget as truncated instead of loading it silently', () => {
+  const paths = getMemoryPaths(workspace);
+  const rules = Array.from({ length: 400 }, (_, index) => `- Rule number ${index} about how to reply to the owner.`).join('\n');
+  const content = `---\ntitle: Prefs\ndescription: D\nupdated: 2026-11-09\ntype: user\n---\n# Prefs\n\nReply briefly.\n\n${rules}\n`;
+  expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(16 * 1024);
+  put(paths.preferencesFile, content);
+  const system = getAgentContext([], false, workspace).system;
+  expect(system).toContain('truncated: this note is');
+  expect(system).toContain('available, truncated - read the file for the rest');
+  expect(system).toContain('A loaded note that is marked truncated is not complete');
+});
+
 it('refuses a linked component inside the memory tree so one scope cannot masquerade as another', () => {
   const paths = getMemoryPaths(workspace);
   const external = join(root, 'external-topics');
