@@ -21,12 +21,22 @@ const reasoning = (text: string, at: number, durationMs?: number): Entry => ({
 });
 
 describe('reasoning row mount state', () => {
-  it('keeps the newest reasoning open in a live turn even when it arrives pre-stamped', () => {
+  it('folds a finished thought the moment it is stamped, even mid-turn', () => {
     const [turn] = buildTurns([
       user('Task'),
       reasoning('earlier thought, already stamped', 1_000, 1_000),
-      reasoning('latest thought, arrives stamped', 2_000, 500),
+      reasoning('latest thought, also finished', 2_000, 500),
     ]);
+    if (!turn) throw new Error('expected turn');
+    const html = renderToStaticMarkup(createElement(TurnView, { turn, live: true, sessionId: 's' }));
+    // Both thoughts carry their duration: the run finished them, so neither stays
+    // open just because the turn is still live. The duration is the sole signal.
+    expect(html).not.toContain('<div class="step open">');
+    expect(html.match(/<div class="step">/g) ?? []).toHaveLength(2);
+  });
+
+  it('keeps the thought being written open in a live turn', () => {
+    const [turn] = buildTurns([user('Task'), reasoning('finished thought', 1_000, 1_000), reasoning('still writing', 2_000)]);
     if (!turn) throw new Error('expected turn');
     const html = renderToStaticMarkup(createElement(TurnView, { turn, live: true, sessionId: 's' }));
     const opens = html.match(/<div class="step open">/g) ?? [];

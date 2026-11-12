@@ -82,14 +82,13 @@ function EntryNotice({ entry }: { entry: Entry }) {
   ) : null;
 }
 
-function StepRow({ entry, live, tail = false }: { entry: Entry; live: boolean; tail?: boolean }) {
+function StepRow({ entry, live }: { entry: Entry; live: boolean }) {
   // A thinking block streams its text and only gets its duration once the block
   // ends. It stays open while it is being written and folds into "Thought for
-  // Xs" the moment the duration lands; a block the reader opened stays open.
-  // A block that arrives already stamped (a batched flush after a hidden tab)
-  // would mount closed forever; in a live turn the newest reasoning row stays
-  // open for as long as the turn is writing.
-  const thinking = live && entry.kind === 'reasoning' && (entry.durationMs === undefined || tail);
+  // Xs" the moment the duration lands, even mid-turn; a block the reader opened
+  // stays open. The duration is the sole signal — a finished thought is closed
+  // whether or not the turn is still running.
+  const thinking = live && entry.kind === 'reasoning' && entry.durationMs === undefined;
   const [open, setOpen] = useState(thinking);
   const [automatic, setAutomatic] = useState(thinking);
   const [wasThinking, setWasThinking] = useState(thinking);
@@ -200,17 +199,6 @@ function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: 
     const timer = setTimeout(() => setTick((value) => value + 1), Math.max(0, hold - (Date.now() - shown.at)));
     return () => clearTimeout(timer);
   }, [holding, hold, shown.at]);
-  // The newest reasoning row of a live turn is the one the model is writing;
-  // it stays open even when it arrived already stamped.
-  let streamingIndex = -1;
-  if (live) {
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      if (entries[index]?.kind === 'reasoning') {
-        streamingIndex = index;
-        break;
-      }
-    }
-  }
   const label = active ? shown.text || summary : summary;
   return (
     <div className={`tool-group${open ? ' open' : ''}${live && running ? ' running' : ''}`}>
@@ -232,15 +220,13 @@ function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: 
       </button>
       <Collapsible open={open}>
         <ScrollArea className="steps" role="region" aria-label="Step details" tabIndex={0} follow={live}>
-          {entries.map((entry, index) => {
-            // The newest reasoning row of a live turn is the one the model is
-            // writing; it stays open even when it arrived already stamped.
-            return entry.kind === 'tool' || entry.kind === 'reasoning' ? (
-              <StepRow key={entry.eventId || index} entry={entry} live={live} tail={index === streamingIndex} />
+          {entries.map((entry, index) =>
+            entry.kind === 'tool' || entry.kind === 'reasoning' ? (
+              <StepRow key={entry.eventId || index} entry={entry} live={live} />
             ) : (
               <EntryNotice key={entry.eventId || index} entry={entry} />
-            );
-          })}
+            ),
+          )}
         </ScrollArea>
       </Collapsible>
     </div>
