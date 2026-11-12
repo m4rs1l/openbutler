@@ -228,7 +228,11 @@ export async function compactConversation(
     );
   }
   const maxOutputTokens = outputLimits.length > 0 ? Math.floor(Math.min(...outputLimits)) : undefined;
-  if (maxOutputTokens !== undefined && maxOutputTokens < 1) {
+  // Below this, a full-context checkpoint cannot hold a useful summary: the
+  // request truncates every time and the step after it retries the same thing.
+  const windowSlack = contextLimit !== null && options.previousContextTokens !== undefined ? contextLimit - estimatedContextTokens : null;
+  const summaryBudgetTooSmall = maxOutputTokens !== undefined && (maxOutputTokens < 1 || (windowSlack !== null && windowSlack < 1024));
+  if (maxOutputTokens !== undefined && summaryBudgetTooSmall) {
     // The full summarization request does not fit. Try the sliced fallback
     // first - summarize inside the budget, then condense - because a window
     // smaller than the conversation must degrade, not kill the turn.
@@ -258,7 +262,7 @@ export async function compactConversation(
       reason: 'exceeds-window',
       window: contextLimit,
       estimatedTokens: Math.round(estimatedContextTokens),
-      shortfallTokens: 1 - maxOutputTokens,
+      shortfallTokens: windowSlack === null ? 1 - maxOutputTokens : Math.max(1, 1024 - windowSlack),
       ...(cause === undefined ? {} : { cause }),
     };
   }

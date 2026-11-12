@@ -1125,6 +1125,28 @@ describe('budget refusal as data', () => {
     expect(model.doStreamCalls).toHaveLength(0);
   });
 
+  it('goes to slicing when the full-context summary budget is too small to hold a summary', async () => {
+    // At the trigger on an 8k window the reserve leaves under 500 output
+    // tokens for a full-context checkpoint: a doomed request that truncates
+    // every step. Slicing must take over instead of one giant request.
+    const messages: ModelMessage[] = [];
+    for (let index = 0; index < 10; index++) messages.push({ role: index % 2 === 0 ? 'user' : 'assistant', content: 'x'.repeat(12_000) });
+    const model = new MockLanguageModelV3({ doStream: async () => textStream('Bounded slice notes with concrete facts.') });
+    const outcome = await compactConversation({
+      system: 'Small system',
+      messages,
+      model,
+      contextWindowTokens: 8192,
+      previousContextTokens: 6144,
+    });
+    expect(outcome).toMatchObject({ kind: 'compacted' });
+    if (outcome.kind !== 'compacted') return;
+    // The full path issues exactly one request; the sliced path issues per
+    // slice plus the final checkpoint.
+    expect(model.doStreamCalls.length).toBeGreaterThan(1);
+    expect(outcome.result.summary).toContain('Bounded slice notes with concrete facts.');
+  });
+
   it('summarizes an oversized conversation slice by slice instead of refusing it', async () => {
     const messages: ModelMessage[] = [];
     for (let index = 0; index < 10; index++) messages.push({ role: index % 2 === 0 ? 'user' : 'assistant', content: 'x'.repeat(12_000) });
