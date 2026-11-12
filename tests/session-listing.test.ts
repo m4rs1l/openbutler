@@ -115,7 +115,7 @@ describe('session listing reads a header instead of the whole file', () => {
     expect(listed?.preview).toBe('last Huge');
   });
 
-  it('falls back to a full parse for a compact session written before the header fields existed', () => {
+  it('lists a compact session written before the header fields existed without a full parse', () => {
     const saved = store.saveSession(bigSession('Compact legacy', 2_000));
     const path = join(sessionsDir, saved.id, `${saved.id}.json`);
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
@@ -123,9 +123,12 @@ describe('session listing reads a header instead of the whole file', () => {
     delete parsed.preview;
     writeFileSync(path, JSON.stringify(parsed), 'utf8');
 
+    readFileSyncSpy.mockClear();
     const listed = store.listSavedSessions().find((entry) => entry.id === saved.id);
     expect(listed).toBeDefined();
     expect(listed?.preview).toBe('last Compact legacy');
+    // The legacy format must take the bounded scan, never a whole-file read.
+    expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
   });
 
   it('does not let one unreadable file hide the others', () => {
@@ -154,7 +157,7 @@ describe('session listing reads a header instead of the whole file', () => {
     expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
   });
 
-  it('reads the whole file only for a session that needs the legacy fallback', () => {
+  it('never reads the whole file for a session that needs the legacy scan', () => {
     const saved = store.saveSession(bigSession('Needs fallback', 4_000_000));
     const path = join(sessionsDir, saved.id, `${saved.id}.json`);
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
@@ -165,7 +168,60 @@ describe('session listing reads a header instead of the whole file', () => {
     const listed = store.listSavedSessions();
 
     expect(listed.map((entry) => entry.id)).toContain(saved.id);
-    expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path).length).toBeGreaterThan(0);
+    expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
+  });
+
+  it('normalizes and truncates legacy previews exactly like a full parse', () => {
+    const base = store.createSession('p', 'm', 262_144, root);
+    const saved = store.saveSession({
+      ...base,
+      title: 'Legacy normalisation',
+      entries: [
+        { kind: 'user', text: '  first\n\nline  ' },
+        { kind: 'assistant', text: 'x'.repeat(4_000_000) },
+        { kind: 'user', text: '  last\n\nline  ' + 'y'.repeat(500) },
+      ],
+      conversation: [{ role: 'user', content: 'c'.repeat(4_000_000) }],
+    });
+    const path = join(sessionsDir, saved.id, `${saved.id}.json`);
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    delete parsed.hasUserMessage;
+    delete parsed.preview;
+    delete parsed.firstUserMessage;
+    delete parsed.lastAssistantMessage;
+    writeFileSync(path, JSON.stringify(parsed), 'utf8');
+
+    readFileSyncSpy.mockClear();
+    const listed = store.listSavedSessions().find((entry) => entry.id === saved.id);
+    const expected = 'last line ' + 'y'.repeat(500);
+    expect(listed?.preview).toBe(expected.slice(0, 120));
+    expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
+  });
+
+  it('lists a pretty-printed legacy file without a full parse', () => {
+    const saved = store.saveSession(bigSession('Pretty legacy', 4_000_000));
+    const path = join(sessionsDir, saved.id, `${saved.id}.json`);
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    delete parsed.hasUserMessage;
+    delete parsed.preview;
+    writeFileSync(path, JSON.stringify(parsed, null, 2), 'utf8');
+
+    readFileSyncSpy.mockClear();
+    const listed = store.listSavedSessions().find((entry) => entry.id === saved.id);
+    expect(listed?.preview).toBe('last Pretty legacy');
+    expect(readFileSyncSpy.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
+  });
+
+  it('keeps sessions without user messages out of the legacy listing', () => {
+    const saved = store.saveSession(bigSession('Empty entries', 500));
+    const path = join(sessionsDir, saved.id, `${saved.id}.json`);
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    delete parsed.hasUserMessage;
+    delete parsed.preview;
+    parsed.entries = [];
+    writeFileSync(path, JSON.stringify(parsed), 'utf8');
+
+    expect(store.listSavedSessions().map((entry) => entry.id)).not.toContain(saved.id);
   });
 
   it('still loads the full transcript that listing never reads', () => {

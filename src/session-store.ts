@@ -188,6 +188,18 @@ export interface SavedSession {
   conversationArchive?: ModelMessage[];
 }
 
+/**
+ * A page of transcript entries addressed by absolute host index. A windowed
+ * client holds only the tail, so it asks the host for the older range it does
+ * not have; `from`/`to` are absolute and `total` is the full transcript length.
+ */
+export interface SessionEntriesRange {
+  from: number;
+  to: number;
+  total: number;
+  entries: SessionEntry[];
+}
+
 export interface SessionSummary {
   running?: boolean;
   project?: SessionProject;
@@ -363,7 +375,7 @@ export function listSavedSessions(workspaceRoot?: string | null): SessionSummary
  *
  * The cutoff is guessed and then verified: the truncated prefix is only accepted if it parses as a
  * session whose id matches the file name. A string inside an entry that happens to contain
- * `\n  "conversation":` cannot pass that check, so the fallback to a full parse is what keeps this
+ * `\n  "conversation":` cannot pass that check, so the stream scan below is what keeps this
  * correct rather than merely fast.
  */
 /**
@@ -414,13 +426,11 @@ function lastAssistantMessageText(entries: readonly SessionEntry[]): string {
  * A JSON string can never contain a real newline, so `\n  "entries":` occurs only at a structural
  * position: cutting there and closing the object cannot produce a valid parse by accident. That
  * makes the cutoff checkable rather than merely plausible — anything unexpected falls through to a
- * full parse, which is what keeps this correct and not just fast.
+ * bounded stream scan, which is what keeps this correct and not just fast.
  *
  * Sessions saved before `hasUserMessage` and `preview` existed carry no header-only summary, so
- * they take the full read and are rewritten with both fields the next time they are saved.
- * `firstUserMessage` and `lastAssistantMessage` are read when present but never trigger a full
- * parse on their own: a multi-megabyte session would make that fallback far more expensive than
- * the previews it would add, so the registry degrades to title and preview until the next save.
+ * the stream scan reads their previews from `entries` without materialising them; they are
+ * rewritten with both fields the next time they are saved.
  */
 const HEADER_WINDOW_BYTES = 8 * 1024;
 
@@ -437,7 +447,7 @@ export function readSessionHeader(path: string, id: string): StoredSessionHeader
     // The whole file fits in the window and carries no `entries` marker, so it is already complete.
     return fullSessionHeader(head.text);
   }
-  return fullSessionHeader(readFileSync(path, 'utf8'));
+  return scanSessionHeader(path, id);
 }
 
 /**
@@ -481,6 +491,455 @@ function fullSessionHeader(text: string): StoredSessionHeader | null {
   };
 }
 
+/**
+ * Streams a session file for the same summary `fullSessionHeader` returns, without ever
+ * materialising `entries` or `conversation`. The old fallback read the whole file and parsed
+ * it end to end, so one multi-megabyte legacy session cost a full allocation on every listing
+ * and could exhaust the process under commit pressure. This scan instead walks the top level
+ * in 32 KB chunks: header scalars are kept (bounded), `entries` items are examined one at a
+ * time for the message previews, and every other value is skipped without being decoded.
+ * Previews are normalised with the same whitespace-collapse-then-slice rule as
+ * `sessionPreview`/`firstUserMessageText`/`lastAssistantMessageText`, applied on the fly so
+ * retained text stays bounded however long the original was.
+ */
+function scanSessionHeader(path: string, id: string): StoredSessionHeader | null {
+  type EntryDigest = {
+    kind: string | null;
+    textNorm: string | null;
+    imageCount: number | null;
+  };
+
+  const headerCap = 16_384;
+  const textCap = 240;
+  const scrubCap = 8_192;
+
+  let buffer = '';
+  let pos = 0;
+  let eof = false;
+  let overflow = false;
+  let descriptor: number | undefined;
+
+  const chunk = Buffer.allocUnsafe(32 * 1024);
+
+  function fill(): boolean {
+    if (pos < buffer.length) return true;
+    if (eof) return false;
+    if (descriptor === undefined) return false;
+    buffer = '';
+    pos = 0;
+    const read = readSync(descriptor, chunk, 0, chunk.length, null);
+    if (read <= 0) {
+      eof = true;
+      return false;
+    }
+    buffer = chunk.toString('utf8', 0, read);
+    if (read < chunk.length) eof = true;
+    return true;
+  }
+
+  function peek(): string | null {
+    if (pos >= buffer.length && !fill()) return null;
+    return buffer[pos] ?? null;
+  }
+
+  function next(): string | null {
+    if (pos >= buffer.length && !fill()) return null;
+    return buffer[pos++] ?? null;
+  }
+
+  function skipWs(): void {
+    for (;;) {
+      const ch = peek();
+      if (ch !== null && (ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t')) pos++;
+      else return;
+    }
+  }
+
+  function expect(ch: string): void {
+    if (next() !== ch) throw new Error(`expected ${ch}`);
+  }
+
+  function readUnicodeEscape(): string {
+    let code = 0;
+    for (let i = 0; i < 4; i++) {
+      const ch = next();
+      if (ch === null) throw new Error('truncated escape');
+      const digit = parseInt(ch, 16);
+      if (Number.isNaN(digit)) throw new Error('bad escape');
+      code = code * 16 + digit;
+    }
+    return String.fromCharCode(code);
+  }
+
+  /** Consumes one string character (decoded) without storing it. Caller positions at the opening quote for the first char. */
+  function nextStringChar(): string {
+    const ch = next();
+    if (ch === null) throw new Error('unterminated string');
+    if (ch !== '\\') return ch;
+    const esc = next();
+    if (esc === null) throw new Error('unterminated escape');
+    switch (esc) {
+      case '"':
+        return '"';
+      case '\\':
+        return '\\';
+      case '/':
+        return '/';
+      case 'b':
+        return '\b';
+      case 'f':
+        return '\f';
+      case 'n':
+        return '\n';
+      case 'r':
+        return '\r';
+      case 't':
+        return '\t';
+      case 'u':
+        return readUnicodeEscape();
+      default:
+        throw new Error('bad escape');
+    }
+  }
+
+  /** Reads a string, retaining at most `cap` decoded chars; beyond that the scan is abandoned. */
+  function readRetained(cap: number): string {
+    expect('"');
+    let out = '';
+    for (;;) {
+      const ch = peek();
+      if (ch === null) throw new Error('unterminated string');
+      if (ch === '"') {
+        pos++;
+        return out;
+      }
+      const decoded = nextStringChar();
+      if (out.length < cap) out += decoded;
+      else overflow = true;
+    }
+  }
+
+  /** Reads a string with `sessionPreview` normalisation: collapse whitespace, trim, slice. */
+  function readNormalized(): string {
+    expect('"');
+    let out = '';
+    let pendingSpace = false;
+    for (;;) {
+      const ch = peek();
+      if (ch === null) throw new Error('unterminated string');
+      if (ch === '"') {
+        pos++;
+        return out;
+      }
+      const decoded = nextStringChar();
+      if (/\s/.test(decoded)) {
+        if (out.length > 0) pendingSpace = true;
+      } else {
+        if (pendingSpace) {
+          if (out.length < textCap) out += ' ';
+          pendingSpace = false;
+        }
+        if (out.length < textCap) out += decoded;
+      }
+    }
+  }
+
+  function readNumber(): number {
+    let text = '';
+    for (;;) {
+      const ch = peek();
+      if (ch !== null && /[-+0-9.eE]/.test(ch)) {
+        text += ch;
+        pos++;
+      } else break;
+    }
+    const value = Number(text);
+    if (text === '' || Number.isNaN(value)) throw new Error('bad number');
+    return value;
+  }
+
+  function readLiteral(literal: string): void {
+    for (let i = 0; i < literal.length; i++) {
+      if (next() !== literal[i]) throw new Error('bad literal');
+    }
+  }
+
+  function skipValue(depth: number): void {
+    if (depth > 64) throw new Error('too deep');
+    skipWs();
+    const ch = peek();
+    if (ch === '"') {
+      expect('"');
+      for (;;) {
+        const c = peek();
+        if (c === null) throw new Error('unterminated string');
+        if (c === '"') {
+          pos++;
+          return;
+        }
+        nextStringChar();
+      }
+    }
+    if (ch === '{') {
+      pos++;
+      skipWs();
+      if (peek() === '}') {
+        pos++;
+        return;
+      }
+      for (;;) {
+        skipWs();
+        skipValue(depth + 1); // key
+        skipWs();
+        expect(':');
+        skipValue(depth + 1);
+        skipWs();
+        const sep = next();
+        if (sep === '}') return;
+        if (sep !== ',') throw new Error('bad object');
+      }
+    }
+    if (ch === '[') {
+      pos++;
+      skipWs();
+      if (peek() === ']') {
+        pos++;
+        return;
+      }
+      for (;;) {
+        skipValue(depth + 1);
+        skipWs();
+        const sep = next();
+        if (sep === ']') return;
+        if (sep !== ',') throw new Error('bad array');
+      }
+    }
+    if (ch === 't') return readLiteral('true');
+    if (ch === 'f') return readLiteral('false');
+    if (ch === 'n') return readLiteral('null');
+    readNumber();
+  }
+
+  /** Parses a small value (the `project` block) with bounded strings, for validation only. */
+  function parseSmallValue(depth: number): unknown {
+    if (depth > 8) throw new Error('too deep');
+    skipWs();
+    const ch = peek();
+    if (ch === '"') return readRetained(scrubCap);
+    if (ch === '{') {
+      pos++;
+      const obj: Record<string, unknown> = {};
+      skipWs();
+      if (peek() === '}') {
+        pos++;
+        return obj;
+      }
+      for (;;) {
+        skipWs();
+        const key = readRetained(scrubCap);
+        skipWs();
+        expect(':');
+        obj[key] = parseSmallValue(depth + 1);
+        skipWs();
+        const sep = next();
+        if (sep === '}') return obj;
+        if (sep !== ',') throw new Error('bad object');
+      }
+    }
+    if (ch === '[') {
+      pos++;
+      const arr: unknown[] = [];
+      skipWs();
+      if (peek() === ']') {
+        pos++;
+        return arr;
+      }
+      for (;;) {
+        arr.push(parseSmallValue(depth + 1));
+        skipWs();
+        const sep = next();
+        if (sep === ']') return arr;
+        if (sep !== ',') throw new Error('bad array');
+      }
+    }
+    if (ch === 't') {
+      readLiteral('true');
+      return true;
+    }
+    if (ch === 'f') {
+      readLiteral('false');
+      return false;
+    }
+    if (ch === 'n') {
+      readLiteral('null');
+      return null;
+    }
+    return readNumber();
+  }
+
+  function readEntryDigest(): EntryDigest {
+    const digest: EntryDigest = { kind: null, textNorm: null, imageCount: null };
+    skipWs();
+    if (peek() !== '{') {
+      skipValue(0);
+      return digest;
+    }
+    pos++;
+    skipWs();
+    if (peek() === '}') {
+      pos++;
+      return digest;
+    }
+    for (;;) {
+      skipWs();
+      const key = readRetained(scrubCap);
+      skipWs();
+      expect(':');
+      skipWs();
+      if (key === 'kind' && peek() === '"') digest.kind = readRetained(scrubCap);
+      else if (key === 'text' && digest.kind !== null && (digest.kind === 'user' || digest.kind === 'assistant') && peek() === '"')
+        digest.textNorm = readNormalized();
+      else if (key === 'imageCount') digest.imageCount = readNumber();
+      else skipValue(0);
+      skipWs();
+      const sep = next();
+      if (sep === '}') return digest;
+      if (sep !== ',') throw new Error('bad entry');
+    }
+  }
+
+  const header: Record<string, unknown> = {};
+  let entriesSeen = false;
+  let anyUser = false;
+  let firstUserNorm: string | null = null;
+  let firstUserImage: number | null = null;
+  let lastUserNorm: string | null = null;
+  let lastUserImage: number | null = null;
+  let lastAssistantNorm: string | null = null;
+
+  try {
+    descriptor = openSync(path, 'r');
+    skipWs();
+    expect('{');
+    skipWs();
+    if (peek() === '}') return null;
+    for (;;) {
+      skipWs();
+      const key = readRetained(scrubCap);
+      skipWs();
+      expect(':');
+      skipWs();
+      switch (key) {
+        case 'entries': {
+          entriesSeen = true;
+          expect('[');
+          skipWs();
+          if (peek() === ']') pos++;
+          else {
+            for (;;) {
+              const digest = readEntryDigest();
+              if (digest.kind === 'user') {
+                anyUser = true;
+                if (firstUserNorm === null) {
+                  firstUserNorm = digest.textNorm ?? '';
+                  firstUserImage = digest.imageCount;
+                }
+                lastUserNorm = digest.textNorm ?? '';
+                lastUserImage = digest.imageCount;
+              } else if (digest.kind === 'assistant') {
+                lastAssistantNorm = digest.textNorm ?? '';
+              }
+              skipWs();
+              const sep = next();
+              if (sep === ']') break;
+              if (sep !== ',') throw new Error('bad entries');
+            }
+          }
+          break;
+        }
+        case 'project':
+          header.project = parseSmallValue(0);
+          break;
+        case 'version':
+          header.version = readNumber();
+          break;
+        case 'hasUserMessage': {
+          skipWs();
+          if (peek() === 't') {
+            readLiteral('true');
+            header.hasUserMessage = true;
+          } else if (peek() === 'f') {
+            readLiteral('false');
+            header.hasUserMessage = false;
+          } else return null;
+          break;
+        }
+        case 'preview':
+        case 'firstUserMessage':
+        case 'lastAssistantMessage':
+        case 'id':
+        case 'title':
+        case 'createdAt':
+        case 'updatedAt':
+        case 'lastActivityAt':
+        case 'providerId':
+        case 'modelId':
+        case 'workspaceRoot':
+          if (peek() !== '"') return null;
+          header[key] = readRetained(headerCap);
+          break;
+        default:
+          skipValue(0);
+          break;
+      }
+      if (overflow) return null;
+      skipWs();
+      const sep = next();
+      if (sep === '}') break;
+      if (sep !== ',') throw new Error('bad session object');
+    }
+    while (peek() !== null) {
+      // Trailing whitespace only; anything else is not a session file.
+      const ch = next();
+      if (ch !== ' ' && ch !== '\n' && ch !== '\r' && ch !== '\t') return null;
+    }
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+
+  if (!entriesSeen || header.version !== 1 || header.id !== id) return null;
+  if (
+    typeof header.title !== 'string' ||
+    typeof header.createdAt !== 'string' ||
+    typeof header.updatedAt !== 'string' ||
+    typeof header.providerId !== 'string' ||
+    typeof header.modelId !== 'string'
+  )
+    return null;
+  if (header.project !== undefined && !isSessionProject(header.project)) return null;
+
+  const firstUser = firstUserNorm ?? '';
+  const lastUser = lastUserNorm ?? '';
+  return {
+    id,
+    title: header.title,
+    createdAt: header.createdAt,
+    updatedAt: header.updatedAt,
+    ...(typeof header.lastActivityAt === 'string' ? { lastActivityAt: header.lastActivityAt } : {}),
+    providerId: header.providerId,
+    modelId: header.modelId,
+    ...(typeof header.workspaceRoot === 'string' ? { workspaceRoot: header.workspaceRoot } : {}),
+    ...(isSessionProject(header.project) ? { project: header.project } : {}),
+    hasUserMessage: typeof header.hasUserMessage === 'boolean' ? header.hasUserMessage : anyUser,
+    preview: typeof header.preview === 'string' ? header.preview : lastUser.slice(0, 120) || (lastUserImage ? '[Image attached #1]' : ''),
+    firstUserMessage:
+      typeof header.firstUserMessage === 'string' ? header.firstUserMessage : firstUser || (firstUserImage ? '[Image attached]' : ''),
+    lastAssistantMessage: typeof header.lastAssistantMessage === 'string' ? header.lastAssistantMessage : (lastAssistantNorm ?? ''),
+  };
+}
+
 function tryParseHeader(text: string, id: string): StoredSessionHeader | null {
   let value: unknown;
   try {
@@ -491,7 +950,8 @@ function tryParseHeader(text: string, id: string): StoredSessionHeader | null {
   if (!isRecord(value) || value.version !== 1 || value.id !== id) return null;
   if (typeof value.title !== 'string' || typeof value.updatedAt !== 'string' || typeof value.createdAt !== 'string') return null;
   if (typeof value.providerId !== 'string' || typeof value.modelId !== 'string') return null;
-  // A session without both denormalised fields predates them, so it is read in full instead.
+  // A session without both denormalised fields predates them, so the bounded
+  // stream scan answers for it instead of a whole-file parse.
   if (value.hasUserMessage !== true || typeof value.preview !== 'string') return null;
   if (value.project !== undefined && !isSessionProject(value.project)) return null;
   return {
