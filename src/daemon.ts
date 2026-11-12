@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync,
@@ -16,6 +16,7 @@ import {
 } from 'node:fs';
 import { createConnection, createServer, type Server } from 'node:net';
 import { join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { cliNodeArgs } from './cli-entry.js';
 import { createDaemonHost } from './daemon-host.js';
@@ -34,6 +35,102 @@ const DAEMON_REQUEST_TIMEOUT_MS = 5_000;
 const IPC_CLOSE_TIMEOUT_MS = 2_000;
 const PREVIOUS_DAEMON_PROTOCOL_VERSION = 1;
 const execFileAsync = promisify(execFile);
+
+/**
+ * A child that dies during boot is retried with backoff: under memory pressure
+ * the first spawn can lose a native allocation while a retry seconds later
+ * succeeds. A deterministic failure (a busy port, a broken module) is not
+ * retried — waiting cannot fix it, and the owner gets the cause at once.
+ */
+const STARTUP_RETRY_BACKOFF_MS = [750, 2_000] as const;
+
+class StartupError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'StartupError';
+  }
+}
+
+type ChildExit = { code: number | null; signal: NodeJS.Signals | null };
+
+/**
+ * Turns a child's early death into a diagnosis the owner can act on. A native
+ * out-of-memory abort (V8 "Zone Allocation failed", exit 134) means the machine
+ * ran out of committable memory, not that OpenButler leaked: the message says so
+ * and points at the pagefile instead of dumping raw GC noise alone.
+ */
+export function diagnoseStartupFailure(kind: 'host' | 'web server', exit: ChildExit, logTail: string): StartupError {
+  const { code, signal } = exit;
+  const exitLabel = code === null ? (signal ?? 'unknown signal') : `exit code ${code}`;
+  const tail = logTail ? `\n${logTail}` : '';
+  const outOfMemory =
+    /zone allocation failed|out of memory|cannot allocate memory|enomem|javascript heap/i.test(logTail) ||
+    code === 134 ||
+    signal === 'SIGABRT';
+  if (outOfMemory) {
+    return new StartupError(
+      `The ${kind} exited before becoming ready (${exitLabel}): the machine ran out of memory. ` +
+        `Close other applications or enlarge the Windows pagefile, then start it again.${tail}`,
+      true,
+    );
+  }
+  // A configuration or code fault reproduces on every spawn; retrying only delays the answer.
+  const deterministic =
+    /EADDRINUSE|address already in use|already running|SyntaxError|Cannot find module|ERR_MODULE_NOT_FOUND|ERR_UNSUPPORTED_RESOLVE|Unknown command|Usage:/i.test(
+      logTail,
+    );
+  return new StartupError(`The ${kind} exited before becoming ready (${exitLabel}).${tail}`, !deterministic);
+}
+
+export async function withStartupRetry<T>(attempt: () => Promise<T>): Promise<T> {
+  for (let attemptIndex = 0; ; attemptIndex += 1) {
+    try {
+      return await attempt();
+    } catch (error) {
+      const backoff = STARTUP_RETRY_BACKOFF_MS[attemptIndex];
+      if (!(error instanceof StartupError) || !error.retryable || backoff === undefined) throw error;
+      await delay(backoff);
+    }
+  }
+}
+
+/**
+ * Waits for a spawned service child to answer its readiness probe. An early
+ * death is diagnosed (and marked retryable when transient); a child that is
+ * alive but silent past the deadline is killed so a retry never races a
+ * half-started process for the same endpoint.
+ */
+async function awaitChildReady(
+  kind: 'host' | 'web server',
+  child: ChildProcess,
+  exit: { value: ChildExit | null },
+  logPath: string,
+  logOffset: number,
+  isReady: () => Promise<boolean>,
+): Promise<void> {
+  const deadline = Date.now() + DAEMON_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (exit.value) {
+      const logTail = readDaemonLogSince(logPath, logOffset);
+      throw diagnoseStartupFailure(kind, exit.value, logTail);
+    }
+    if (await isReady()) return;
+    await delay(250);
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* already gone */
+  }
+  const logTail = readDaemonLogSince(logPath, logOffset);
+  throw new StartupError(
+    `The ${kind} did not become ready within ${DAEMON_START_TIMEOUT_MS / 1_000} seconds.${logTail ? `\n${logTail}` : ''}`,
+    false,
+  );
+}
 
 type DaemonStartLock = {
   path: string;
@@ -87,6 +184,22 @@ export async function getDaemonStatus(): Promise<DaemonStatus | null> {
   }
   const record = readDaemonPidRecord();
   if (record && processIsAlive(record.pid)) {
+    // After an unclean shutdown the pid can be recycled by an unrelated process. The
+    // recorded identity (creation time + executable + command line) proves whether the
+    // live pid is still our host; a definitive mismatch means the record is stale, so
+    // prune it rather than lock every start/restart behind a stranger's pid. An
+    // unreadable identity is not proof, so it still reports unresponsive.
+    if (record.identity) {
+      const liveIdentity = await readProcessIdentity(record.pid);
+      if (liveIdentity !== null && liveIdentity !== record.identity) {
+        try {
+          unlinkSync(getDaemonPidPath());
+        } catch {
+          /* another reader already removed it */
+        }
+        return null;
+      }
+    }
     return { pid: record.pid, startedAt: record.startedAt, workspaceCount: 0, connectedClients: 0, unresponsive: true };
   }
   return null;
@@ -165,54 +278,46 @@ export async function startDaemon(_legacyWorkspaceScope?: string): Promise<Daemo
   const custodianDirectory = getDataPath('custodian');
   mkdirSync(dataDirectory, { recursive: true });
   mkdirSync(custodianDirectory, { recursive: true });
-  const logPath = getDataPath('daemon.log');
-  const logFd = openSync(logPath, 'a', 0o600);
-  const logOffset = fstatSync(logFd).size;
-  const args = cliNodeArgs(entry, ['daemon', 'run']);
-  let child;
-  try {
-    child = spawn(process.execPath, args, {
-      cwd: custodianDirectory,
-      env: {
-        ...process.env,
-        OPENBUTLER_DAEMON_CHILD: '1',
-      },
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-      windowsHide: true,
-    });
-  } finally {
-    closeSync(logFd);
-  }
-
-  let childExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
-  child.once('exit', (code, signal) => {
-    childExit = { code, signal };
-  });
-
-  await new Promise<void>((resolveSpawn, rejectSpawn) => {
-    child.once('error', rejectSpawn);
-    child.once('spawn', () => resolveSpawn());
-  });
-  child.unref();
-
-  const deadline = Date.now() + DAEMON_START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const status = await getDaemonStatus();
-    if (status && !status.unresponsive) return status;
-    if (childExit) {
-      const logTail = readDaemonLogSince(logPath, logOffset);
-      const { code, signal } = childExit;
-      throw new Error(
-        `OpenButler host process exited before becoming ready${code === null ? ` (${signal ?? 'unknown signal'})` : ` (exit code ${code})`}.${logTail ? `\n${logTail}` : ''}`,
-      );
+  return await withStartupRetry(async () => {
+    const logPath = getDataPath('daemon.log');
+    const logFd = openSync(logPath, 'a', 0o600);
+    const logOffset = fstatSync(logFd).size;
+    const args = cliNodeArgs(entry, ['daemon', 'run']);
+    let child;
+    try {
+      child = spawn(process.execPath, args, {
+        cwd: custodianDirectory,
+        env: {
+          ...process.env,
+          OPENBUTLER_DAEMON_CHILD: '1',
+        },
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+        windowsHide: true,
+      });
+    } finally {
+      closeSync(logFd);
     }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-  }
-  const logTail = readDaemonLogSince(logPath, logOffset);
-  throw new Error(
-    `OpenButler host did not become ready within ${DAEMON_START_TIMEOUT_MS / 1_000} seconds.${logTail ? `\n${logTail}` : ''}`,
-  );
+
+    const exit: { value: ChildExit | null } = { value: null };
+    child.once('exit', (code, signal) => {
+      exit.value = { code, signal };
+    });
+
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      child.once('error', rejectSpawn);
+      child.once('spawn', () => resolveSpawn());
+    });
+    child.unref();
+
+    await awaitChildReady('host', child, exit, logPath, logOffset, async () => {
+      const status = await getDaemonStatus();
+      return Boolean(status && !status.unresponsive);
+    });
+    const status = await getDaemonStatus();
+    if (!status) throw new StartupError('The host became ready but its status could not be read.', true);
+    return status;
+  });
 }
 
 export async function stopDaemon(restarting = false): Promise<boolean> {
@@ -341,53 +446,53 @@ export async function startWebProcess(entry: string | undefined, port: number, h
   if (!entry) throw new Error('Could not locate the OpenButler CLI entry point.');
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error(`Invalid --port value "${port}". Use a number between 1 and 65535.`);
-  const logPath = getDataPath('daemon.log');
-  const logFd = openSync(logPath, 'a', 0o600);
-  const logOffset = fstatSync(logFd).size;
-  let child;
-  try {
-    child = spawn(process.execPath, webSpawnArgs(resolve(entry), port, host), {
-      // The child resolves `--dir` from its own cwd, so the recorded workspace root is
-      // what it serves even when this CLI was launched from somewhere else.
-      cwd: dir,
-      env: { ...process.env },
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-      windowsHide: true,
-    });
-  } finally {
-    closeSync(logFd);
-  }
-  const childExit: { value: { code: number | null; signal: NodeJS.Signals | null } | null } = { value: null };
-  child.once('exit', (code, signal) => {
-    childExit.value = { code, signal };
-  });
-  await new Promise<void>((resolveSpawn, rejectSpawn) => {
-    child.once('error', rejectSpawn);
-    child.once('spawn', () => resolveSpawn());
-  });
-  child.unref();
-  const record: WebPidRecord = { pid: child.pid!, startedAt: new Date().toISOString(), port, host, dir };
-  writeFileSync(webPidPath(), JSON.stringify(record), { mode: 0o600 });
-  const pollHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-  const deadline = Date.now() + DAEMON_START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (childExit.value) {
-      const logTail = readDaemonLogSince(logPath, logOffset);
-      const { code, signal } = childExit.value;
-      throw new Error(
-        `The web server exited before becoming ready${code === null ? ` (${signal ?? 'unknown signal'})` : ` (exit code ${code})`}.${logTail ? `\n${logTail}` : ''}`,
-      );
-    }
+  return await withStartupRetry(async () => {
+    const logPath = getDataPath('daemon.log');
+    const logFd = openSync(logPath, 'a', 0o600);
+    const logOffset = fstatSync(logFd).size;
+    let child;
     try {
-      const response = await fetch(`http://${pollHost}:${port}/`, { signal: AbortSignal.timeout(1_000), redirect: 'manual' });
-      if (response.status < 500) return record;
-    } catch {
-      /* not listening yet */
+      child = spawn(process.execPath, webSpawnArgs(resolve(entry), port, host), {
+        // The child resolves `--dir` from its own cwd, so the recorded workspace root is
+        // what it serves even when this CLI was launched from somewhere else.
+        cwd: dir,
+        env: { ...process.env },
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+        windowsHide: true,
+      });
+    } finally {
+      closeSync(logFd);
     }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-  }
-  throw new Error(`The web server did not become ready within ${DAEMON_START_TIMEOUT_MS / 1_000} seconds.`);
+    const exit: { value: ChildExit | null } = { value: null };
+    child.once('exit', (code, signal) => {
+      exit.value = { code, signal };
+    });
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      child.once('error', rejectSpawn);
+      child.once('spawn', () => resolveSpawn());
+    });
+    child.unref();
+    const record: WebPidRecord = { pid: child.pid!, startedAt: new Date().toISOString(), port, host, dir };
+    writeFileSync(webPidPath(), JSON.stringify(record), { mode: 0o600 });
+    const pollHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+    try {
+      await awaitChildReady('web server', child, exit, logPath, logOffset, async () => {
+        try {
+          const response = await fetch(`http://${pollHost}:${port}/`, { signal: AbortSignal.timeout(1_000), redirect: 'manual' });
+          return response.status < 500;
+        } catch {
+          return false;
+        }
+      });
+    } catch (error) {
+      // The record must not outlive a failed spawn: a stale pid would make the
+      // next `openbutler web` believe a dead server is still running.
+      untrackWebProcess(record.pid);
+      throw error;
+    }
+    return record;
+  });
 }
 
 /** Stops the tracked web process; only a verified OpenButler web child is signalled. */

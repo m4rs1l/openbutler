@@ -1582,7 +1582,29 @@ async function readWebOptions(parsed: Parsed, fallback: { host: string; port: nu
   return { port, host, dir };
 }
 
+/**
+ * The one restart flow, shared by `openbutler restart` and `openbutler daemon
+ * restart`: both recycle the host and the tracked browser server together so the
+ * two processes never run different code vintages.
+ */
+async function runRestartFlow(): Promise<void> {
+  ui.info('Stopping active runs and saving sessions…');
+  const { status, web, webFailure } = await restartDaemon();
+  ui.success(`Background host restarted (pid ${status.pid}).`);
+  if (web) ui.success(`Web server running (pid ${web.pid}).`);
+  if (webFailure) {
+    ui.warn(`The browser server did not come back up: ${webFailure}`);
+    ui.info('Start it again with `openbutler web`.');
+  }
+  ui.info('Open sessions reconnect automatically.');
+}
+
 async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): Promise<void> {
+  if (action === 'restart') {
+    if (sub !== undefined) throw new Error('Usage: openbutler daemon restart');
+    await runRestartFlow();
+    return;
+  }
   if (action === 'run') {
     // The host entry is a backend-only process. Web is an independent client
     // and is composed by the CLI (`daemon start --web`) or by its own login
@@ -1695,7 +1717,7 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     return;
   }
   throw new Error(
-    'Usage: openbutler daemon [start [--web [--port N] [--hostname H] [--dir PATH]]|status|stop|install [--web [--no-web]]|uninstall|autostart [on|off|status]|autostart-status]',
+    'Usage: openbutler daemon [start [--web [--port N] [--hostname H] [--dir PATH]]|restart|status|stop|install [--web [--no-web]]|uninstall|autostart [on|off|status]|autostart-status]',
   );
 }
 
@@ -1784,13 +1806,7 @@ async function main(): Promise<void> {
     }
     case 'restart': {
       if (parsed.words.length > 0) throw new Error('Usage: openbutler restart');
-
-      ui.info('Stopping active runs and saving sessions…');
-      const { status, web, webFailure } = await restartDaemon();
-      ui.success(`Background host restarted (pid ${status.pid}).`);
-      if (web) ui.success(`Web server running (pid ${web.pid}).`);
-      if (webFailure) ui.warn(`The browser server did not come back up: ${webFailure}`);
-      ui.info('Open sessions reconnect automatically.');
+      await runRestartFlow();
       return;
     }
     case 'logs': {

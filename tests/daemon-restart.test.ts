@@ -141,3 +141,36 @@ describe('restart CLI and detached host lifecycle', () => {
     expect(probe.status).toBeLessThan(500);
   }, 60_000);
 });
+
+describe('daemon restart alias and usage surface', () => {
+  it('recycles the host through `daemon restart` exactly as `restart` does', async () => {
+    const { getDaemonStatus } = await import('../src/daemon.js');
+    const booted = await cli(['restart']);
+    expect(booted.code, booted.stderr).toBe(0);
+    const original = await getDaemonStatus();
+    expect(original?.pid).toBeGreaterThan(0);
+
+    const restarted = await cli(['daemon', 'restart']);
+    expect(restarted.code, restarted.stderr).toBe(0);
+    expect(restarted.stdout).toContain('Background host restarted');
+    const current = await getDaemonStatus();
+    expect(current?.pid).toBeGreaterThan(0);
+    expect(current?.pid).not.toBe(original?.pid);
+    expect(() => process.kill(original!.pid, 0)).toThrow();
+    expect(readFileSync(join(root, 'daemon.log'), 'utf8')).toContain('IPC restart request');
+  }, 30_000);
+
+  it('refuses an extra argument to `daemon restart` with its own usage line', async () => {
+    const result = await cli(['daemon', 'restart', 'extra']);
+    expect(result.code).toBe(1);
+    // ui.failure writes to stdout, so the usage line lands there rather than on stderr.
+    expect(result.stdout).toContain('Usage: openbutler daemon restart');
+  }, 15_000);
+
+  it('refuses an unknown daemon subcommand with the daemon usage line that lists restart', async () => {
+    const result = await cli(['daemon', 'bogus']);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('Usage: openbutler daemon');
+    expect(result.stdout).toContain('restart');
+  }, 15_000);
+});
