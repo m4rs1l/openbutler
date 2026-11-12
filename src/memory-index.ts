@@ -293,16 +293,26 @@ export class MemoryIndex {
     if (!normalizedQuery) throw new Error('query must be a non-empty string.');
 
     const files = await this.collectSourceFiles();
-    const issues = await this.collectIndexIssues(files);
-    const issueField = issues.length > 0 ? { indexIssues: issues } : {};
+    const issues: string[] = [...(await this.collectIndexIssues(files))];
     const database = files.length > 0 || this.database !== undefined ? this.getDatabase() : undefined;
-    if (!database) return { matches: [], indexedSources: 0, indexedChunks: 0, emptyMemory: true, ...issueField };
+    if (!database) {
+      const issueField = issues.length > 0 ? { indexIssues: issues } : {};
+      return { matches: [], indexedSources: 0, indexedChunks: 0, emptyMemory: true, ...issueField };
+    }
 
     await this.removeMissingSources(files);
     for (const file of files) {
-      const content = await readFile(file.path, 'utf8');
+      let content: string;
+      try {
+        content = await readFile(file.path, 'utf8');
+      } catch {
+        // One unreadable note must not disable search for the whole memory.
+        issues.push(`Unreadable memory file skipped: ${file.path}`);
+        continue;
+      }
       await this.indexSource(file, content);
     }
+    const issueField = issues.length > 0 ? { indexIssues: issues } : {};
 
     const scopeFilter = this.searchScopeFilter('s');
     const sourceCount = Number(

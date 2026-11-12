@@ -10,6 +10,20 @@ import { createWriteTool } from '../src/tools/file-write.js';
 
 const dimensions = 384;
 
+const fsGate = vi.hoisted(() => ({ unreadableSuffix: '' }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const readFile = (path: unknown, ...rest: unknown[]) => {
+    if (fsGate.unreadableSuffix && String(path).endsWith(fsGate.unreadableSuffix)) {
+      const error = new Error('EACCES: permission denied, open') as NodeJS.ErrnoException;
+      error.code = 'EACCES';
+      return Promise.reject(error);
+    }
+    return (actual.readFile as (p: unknown, ...r: unknown[]) => Promise<unknown>)(path, ...rest);
+  };
+  return { ...actual, readFile };
+});
+
 const fake = vi.hoisted(() => {
   const wordIds = new Map<string, number>();
   const encode = (text: string): number[] => {
@@ -169,6 +183,23 @@ describe('search over the derived index', () => {
       expect(unrelated.matches).toEqual([]);
       expect(unrelated.indexedChunks).toBeGreaterThan(0);
     } finally {
+      await index.close();
+    }
+  });
+
+  it('skips an unreadable note instead of failing the whole search', async () => {
+    const paths = getMemoryPaths(workspace);
+    put(join(paths.topicsDirectory, 'subtitle-pipeline.md'), subtitleNote);
+    put(join(paths.topicsDirectory, 'unreadable-note.md'), subtitleNote.replace('Subtitle Pipeline', 'Unreadable Copy'));
+    fsGate.unreadableSuffix = 'unreadable-note.md';
+    const index = new MemoryIndex(workspace);
+    try {
+      const result = await index.search('subtitle extraction timing', 5);
+      expect(result.matches.length).toBeGreaterThan(0);
+      expect(result.matches[0]!.path).toBe(join(paths.topicsDirectory, 'subtitle-pipeline.md'));
+      expect(result.indexIssues?.some((issue) => issue.includes('unreadable-note.md'))).toBe(true);
+    } finally {
+      fsGate.unreadableSuffix = '';
       await index.close();
     }
   });
