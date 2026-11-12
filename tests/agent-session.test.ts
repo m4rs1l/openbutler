@@ -1946,7 +1946,7 @@ describe('session compaction persistence and continuation', () => {
       entries: [{ kind: 'user', text: 'Continue the implementation.' }],
       conversation: raw,
       contextTokens: 90_000,
-      contextEstimateTokens: estimateContextTokens(getAgentContext(raw)),
+      contextEstimateTokens: estimateContextTokens(getAgentContext(raw, undefined, dataDir)),
     });
     // The chat owns its effort: the pick is recorded on the session, and both
     // the compaction request and the admitted turn then run with it.
@@ -2084,7 +2084,7 @@ describe('session compaction persistence and continuation', () => {
       runtime.modelId = modelId;
     };
     session = new AgentSessionController(runtime);
-    const estimate = estimateContextTokens(getAgentContext(raw));
+    const estimate = estimateContextTokens(getAgentContext(raw, undefined, dataDir));
     session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Continue this task.' }],
@@ -2137,7 +2137,7 @@ describe('session compaction persistence and continuation', () => {
       entries: [{ kind: 'user', text: 'Preserve the complete user message.' }],
       conversation: raw,
       contextTokens: 258_950,
-      contextEstimateTokens: estimateContextTokens(getAgentContext(raw)),
+      contextEstimateTokens: estimateContextTokens(getAgentContext(raw, undefined, dataDir)),
     });
     await session.compact(true);
     session.flushSave();

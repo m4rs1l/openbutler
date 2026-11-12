@@ -260,7 +260,7 @@ export class MemoryIndex {
   private database: DatabaseSync | undefined;
   private readonly embedding = new EmbeddingIdleLease(createEmbeddingLease());
 
-  constructor(workspaceRoot = process.cwd()) {
+  constructor(workspaceRoot: string) {
     migrateMemoryLayout(workspaceRoot);
     this.paths = getMemoryPaths(workspaceRoot);
     this.workspaceScope = `workspace:${this.paths.workspaceKey}`;

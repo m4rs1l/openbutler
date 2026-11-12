@@ -85,7 +85,7 @@ function renderNote(options: {
  * only happened when the owner asked. This tool owns that shape: one call
  * creates or updates a note, stamps the date, and keeps MEMORY.md in step.
  */
-export function createMemoryWriteTool(workspaceRoot = process.cwd(), memoryIndex?: MemoryIndex): ToolDefinition {
+export function createMemoryWriteTool(workspaceRoot: string, memoryIndex?: MemoryIndex): ToolDefinition {
   const paths = getMemoryPaths(workspaceRoot);
 
   const resolveTarget = (

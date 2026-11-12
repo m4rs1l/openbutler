@@ -17,7 +17,7 @@ const migratedRoots = new Set<string>();
  * construction would otherwise re-walk the whole tree on each session start
  * and each custodian scope switch.
  */
-export function migrateMemoryLayout(workspaceRoot = process.cwd()): MemoryLayoutMigration {
+export function migrateMemoryLayout(workspaceRoot: string): MemoryLayoutMigration {
   const paths = getMemoryPaths(workspaceRoot);
   if (migratedRoots.has(paths.root)) return { moved: [], conflicts: [] };
   migratedRoots.add(paths.root);

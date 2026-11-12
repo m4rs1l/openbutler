@@ -1575,10 +1575,7 @@ async function readWebOptions(parsed: Parsed, fallback: { host: string; port: nu
   const port = parsed.flags.has('port') ? readPort(parsed) : (fallback?.port ?? readPort(parsed));
   const host = parsed.flags.get('hostname') ?? fallback?.host ?? DEFAULT_WEB_HOST;
   const explicitDir = parsed.flags.get('dir');
-  const dir =
-    explicitDir !== undefined
-      ? resolveServerScope({ explicitDir, cwd: process.cwd() }).root
-      : (fallback?.dir ?? resolveServerScope({ cwd: process.cwd() }).root);
+  const dir = explicitDir !== undefined ? resolveServerScope({ explicitDir }).root : (fallback?.dir ?? resolveServerScope({}).root);
   return { port, host, dir };
 }
 

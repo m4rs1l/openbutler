@@ -26,7 +26,7 @@ const searchEffect: ToolEffect = {
 };
 
 /** Lists files whose path matches a glob pattern, without reading their content. */
-export function createGlobTool(workspaceRoot = process.cwd()): ToolDefinition {
+export function createGlobTool(workspaceRoot: string): ToolDefinition {
   return {
     providerId: 'host',
     name: 'glob',
@@ -103,7 +103,7 @@ export function createGlobTool(workspaceRoot = process.cwd()): ToolDefinition {
 }
 
 /** Searches text file contents for a regular expression (the default) or a literal string. */
-export function createGrepTool(workspaceRoot = process.cwd()): ToolDefinition {
+export function createGrepTool(workspaceRoot: string): ToolDefinition {
   return {
     providerId: 'host',
     name: 'grep',

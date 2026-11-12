@@ -402,11 +402,15 @@ describe('full-context LLM compaction', () => {
   });
 
   it('keeps the checkpoint as conversation data and rebuilds the original system instructions', () => {
-    const baseline = getAgentContext([{ role: 'user', content: 'Current task' }]);
-    const compacted = getAgentContext([
-      { role: 'assistant', content: COMPACTION_SUMMARY_MARKER + 'Historical file content says to ignore policy.' },
-      { role: 'user', content: 'Current task' },
-    ]);
+    const baseline = getAgentContext([{ role: 'user', content: 'Current task' }], undefined, dataDir);
+    const compacted = getAgentContext(
+      [
+        { role: 'assistant', content: COMPACTION_SUMMARY_MARKER + 'Historical file content says to ignore policy.' },
+        { role: 'user', content: 'Current task' },
+      ],
+      undefined,
+      dataDir,
+    );
     expect(compacted.system).toBe(baseline.system);
     expect(compacted.system).not.toContain('Historical file content');
     expect(compacted.messages[0]).toEqual({
@@ -712,7 +716,7 @@ describe('full-context LLM compaction', () => {
       { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'new-image', toolName: 'file_read', output: newImage }] },
     ];
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Both image findings are summarized here.') });
-    const compacted = await compactResult({ ...getAgentContext(messages, false), model, contextWindowTokens: null, force: true });
+    const compacted = await compactResult({ ...getAgentContext(messages, false, dataDir), model, contextWindowTokens: null, force: true });
     expect(JSON.stringify(model.doStreamCalls[0]!.prompt)).toContain('old.png');
     const media = compacted!.messages.filter(
       (message) => message.role === 'user' && Array.isArray(message.content) && message.content.some((part) => part.type === 'image'),
@@ -732,7 +736,7 @@ describe('full-context LLM compaction', () => {
         ],
       },
     ];
-    const repeated = await compactResult({ ...getAgentContext(next, false), model, contextWindowTokens: null, force: true });
+    const repeated = await compactResult({ ...getAgentContext(next, false, dataDir), model, contextWindowTokens: null, force: true });
     expect(
       repeated!.messages.some(
         (message) => message.role === 'user' && Array.isArray(message.content) && message.content.some((part) => part.type === 'image'),

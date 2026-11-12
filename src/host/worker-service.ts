@@ -9,7 +9,7 @@ import { WORKER_INSTRUCTIONS } from '../agent-instructions.js';
 import type { WorkerNoteKind, WorkerRecord } from '../worker-records.js';
 import { appendWorkerNote, completeWorker, readWorkerOutbox } from '../worker-records.js';
 import type { ToolDelivery } from '../delivery.js';
-import { resolveRestoreScope } from '../workspace-origin.js';
+import { machineWorkspaceRoot, resolveRestoreScope } from '../workspace-origin.js';
 import { inboxId, inboxNotice } from '../inbox.js';
 import { isToolRequestWhitelisted } from '../tool-permissions.js';
 import { resolveSessionReference } from '../session-registry.js';
@@ -184,7 +184,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
       const root = resolveRestoreScope({
         storedRoot: saved.workspaceRoot,
         eventRoot: event.workspaceRoot,
-        cwd: process.cwd(),
+        cwd: machineWorkspaceRoot(),
       }).root;
       // Restore the current custodian or workspace; never switch another owner's active session.
       if (!saved.workspaceRoot) await getCustodianWorkspace(root);

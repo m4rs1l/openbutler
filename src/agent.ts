@@ -18,6 +18,7 @@ import { materializeIncomingAttachments } from './attachments.js';
 import { getMemoryPaths, isMemoryDocumentPath } from './memory-paths.js';
 import { getScratchRoot } from './paths.js';
 import { getConfigPath, loadSettings } from './settings.js';
+import { machineWorkspaceRoot } from './workspace-origin.js';
 import {
   MEMORY_DOCUMENT_GUIDANCE,
   MEMORY_INDEX_MAX_BYTES,
@@ -44,7 +45,7 @@ type AgentProviderOptions = Record<string, Record<string, JSONValue>>;
  * contradicts what it reads next, and the role decides which reference blocks
  * belong to it.
  */
-export function buildAgentSystem(workspaceRoot = process.cwd(), base: AgentBase = AGENT_BASE): string {
+export function buildAgentSystem(workspaceRoot: string, base: AgentBase = AGENT_BASE): string {
   const paths = getMemoryPaths(workspaceRoot);
   const memoryIndex = readMemoryIndex(paths.indexFile);
   const loadedPreferences = readMemoryFile(paths.preferencesFile, MEMORY_USER_CONTEXT_MAX_BYTES);
@@ -126,8 +127,8 @@ ${reference}`;
 /** Shared by normal turns and compaction so both read the same active context. */
 export function getAgentContext(
   messages: ModelMessage[],
-  supportsImageToolResult?: boolean,
-  workspaceRoot = process.cwd(),
+  supportsImageToolResult: boolean | undefined,
+  workspaceRoot: string,
   base?: AgentBase,
   supportsVision = true,
   system?: string,
@@ -320,7 +321,7 @@ export async function runAgent(options: {
   const initialContext = getAgentContext(
     options.messages,
     options.supportsImageToolResult,
-    options.workspaceRoot,
+    options.workspaceRoot ?? machineWorkspaceRoot(),
     options.basePolicy,
     options.supportsVision,
     options.system,
@@ -403,7 +404,7 @@ export async function runAgent(options: {
         ? getAgentContext(
             checkpoint.result.messages,
             options.supportsImageToolResult,
-            options.workspaceRoot,
+            options.workspaceRoot ?? machineWorkspaceRoot(),
             options.basePolicy,
             options.supportsVision,
             options.system,
@@ -436,7 +437,7 @@ export async function runAgent(options: {
         const context = getAgentContext(
           compacted.messages,
           options.supportsImageToolResult,
-          options.workspaceRoot,
+          options.workspaceRoot ?? machineWorkspaceRoot(),
           options.basePolicy,
           options.supportsVision,
           options.system,

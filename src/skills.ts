@@ -34,7 +34,7 @@ export function getOpenButlerSkillDirectory(): string {
 }
 
 /** Bundled skills, user-level skills, then workspace skills; later roots override duplicate names. */
-export function getSkillRoots(workspaceRoot = process.cwd()): SkillRoot[] {
+export function getSkillRoots(workspaceRoot: string): SkillRoot[] {
   const home = homedir();
   const codexHome = process.env.CODEX_HOME || join(home, '.codex');
   return [
@@ -49,7 +49,7 @@ export function getSkillRoots(workspaceRoot = process.cwd()): SkillRoot[] {
 }
 
 /** Metadata only: skill instructions and references stay unloaded until needed. */
-export function discoverSkills(workspaceRoot = process.cwd()): AgentSkill[] {
+export function discoverSkills(workspaceRoot: string): AgentSkill[] {
   const cacheKey = resolve(workspaceRoot);
   const cached = discoveryCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.skills;
@@ -102,7 +102,7 @@ export function formatSkillIndex(skills: readonly AgentSkill[]): string {
 }
 
 /** Only files within valid bundled or user-level skill packages are pre-authorized for read. */
-export function isTrustedSkillResourcePath(source: string, workspaceRoot = process.cwd()): boolean {
+export function isTrustedSkillResourcePath(source: string, workspaceRoot: string): boolean {
   let target: string;
   try {
     target = realpathSync(resolve(source));

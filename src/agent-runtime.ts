@@ -1,6 +1,6 @@
 import type { InboxRequest } from './inbox.js';
 import type { ParentMessageInput } from './worker-records.js';
-import { canonicalScopeRoot as canonicalWorkspaceRoot } from './workspace-origin.js';
+import { canonicalScopeRoot as canonicalWorkspaceRoot, machineWorkspaceRoot } from './workspace-origin.js';
 import { resolveContextBudget } from './context-budget.js';
 import type { LanguageModel } from 'ai';
 import { getCatalogIndex, getCatalogRevision, isCatalogLoaded } from './provider/catalog.js';
@@ -250,7 +250,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
   }
   let titleClerk = await loadTitleClerk(settings);
   let appliedTitleConfig = titleConfig(settings);
-  let workspaceRoot = canonicalWorkspaceRoot(options.workspaceRoot ?? process.cwd());
+  let workspaceRoot = canonicalWorkspaceRoot(options.workspaceRoot ?? machineWorkspaceRoot());
   const { ToolRegistry } = await import('./tools/registry.js');
   let memoryIndex = new MemoryIndex(workspaceRoot);
   let workspaceSwitch = Promise.resolve();

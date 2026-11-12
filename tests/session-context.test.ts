@@ -26,7 +26,7 @@ afterEach(() => {
 describe('the assembled agent context', () => {
   it('states the session-history contract in the core prompt', async () => {
     const { getAgentContext } = await import('../src/agent.js');
-    const system = getAgentContext([], false).system;
+    const system = getAgentContext([], false, root).system;
     expect(system).toContain('## Session history');
     expect(system).toContain('find it with session_search and open the cited entries with session_read');
     expect(system).toContain('name the session you relied on');

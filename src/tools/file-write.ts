@@ -27,7 +27,7 @@ const writeEffect: ToolEffect = {
 };
 
 /** Writes UTF-8 text. The shared registry applies the normal approval policy. */
-export function createWriteTool(workspaceRoot = process.cwd(), memoryIndex?: MemoryIndex): ToolDefinition {
+export function createWriteTool(workspaceRoot: string, memoryIndex?: MemoryIndex): ToolDefinition {
   return {
     providerId: 'host',
     name: 'file_write',

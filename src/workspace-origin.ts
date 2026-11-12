@@ -1,6 +1,7 @@
-import { realpathSync, statSync } from 'node:fs';
+import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
+import { getDataPath } from './paths.js';
 import { loadSettings } from './settings.js';
 
 /**
@@ -8,7 +9,7 @@ import { loadSettings } from './settings.js';
  * status line, an attach result or a log can say why this folder is the one
  * that matters, instead of leaving callers to guess which fallback fired.
  */
-export type ScopeSource = 'explicit' | 'stored' | 'settings' | 'launch' | 'custodian-dir';
+export type ScopeSource = 'explicit' | 'stored' | 'settings' | 'launch' | 'custodian-dir' | 'machine-default';
 
 export type WorkspaceResolution = { root: string; source: ScopeSource };
 
@@ -48,11 +49,31 @@ export function resolveInteractiveScope(options: { explicitPath?: string | undef
   return { root: canonicalScopeRoot(options.cwd), source: 'launch' };
 }
 
-/** The browser server: `--dir` wins, the directory web was launched in is the floor. */
-export function resolveServerScope(options: { explicitDir?: string | undefined; cwd: string }): WorkspaceResolution {
+/**
+ * The machine's own workspace folder: the configured default, else the data-dir
+ * workspace. The single authoritative fallback for any machine-level scope —
+ * never "whatever directory the process happened to start in". A background
+ * service has no meaningful launch directory, so a cwd fallback silently turns
+ * an arbitrary folder into the place the machine's work lives.
+ */
+export function machineWorkspaceRoot(): string {
+  const configured = loadSettings().defaultWorkspaceRoot;
+  if (configured) return canonicalScopeRoot(configured);
+  const folder = getDataPath('workspace');
+  mkdirSync(folder, { recursive: true });
+  return canonicalScopeRoot(folder);
+}
+
+/**
+ * The browser server: `--dir` wins, then the machine workspace. Like
+ * `machineWorkspaceRoot`, it never falls back to the launch cwd — that cwd used
+ * to leak into every projectless browser chat as its workspace.
+ */
+export function resolveServerScope(options: { explicitDir?: string | undefined }): WorkspaceResolution {
   if (options.explicitDir !== undefined && options.explicitDir !== '')
     return { root: canonicalScopeRoot(options.explicitDir), source: 'explicit' };
-  return { root: canonicalScopeRoot(options.cwd), source: 'launch' };
+  const configured = loadSettings().defaultWorkspaceRoot;
+  return { root: machineWorkspaceRoot(), source: configured ? 'settings' : 'machine-default' };
 }
 
 /**

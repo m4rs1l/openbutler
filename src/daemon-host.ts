@@ -20,6 +20,7 @@ import type { ModelRole } from './model-roles.js';
 import { bindRoleModelView } from './session-model-binding.js';
 import {
   canonicalScopeRoot as canonicalWorkspaceRoot,
+  machineWorkspaceRoot,
   resolveBackgroundScope,
   scopeMapKey as normalizeWorkspaceKey,
 } from './workspace-origin.js';
@@ -766,7 +767,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   /** `team_send_file`: stream a local file to a member or the group. */
   async function sendTeamFile(input: { path: string; to: string }): Promise<unknown> {
     try {
-      const absolute = resolveFilePath(input.path, custodianWorkspace?.runtime.workspaceRoot ?? process.cwd());
+      const absolute = resolveFilePath(input.path, custodianWorkspace?.runtime.workspaceRoot ?? machineWorkspaceRoot());
       // The secret store may never leave the machine, by any path, including
       // this one: a prompt-injected agent must not be able to exfiltrate keys.
       if (isForbiddenHostPath(absolute)) return { status: 'refused', error: 'That file is the secret store and can never be sent.' };
@@ -871,7 +872,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         );
       });
       if (fresh.length === 0) return;
-      const root = resolveBackgroundScope({ previousRoot: custodianWorkspace?.runtime.workspaceRoot, cwd: process.cwd() }).root;
+      const root = resolveBackgroundScope({ previousRoot: custodianWorkspace?.runtime.workspaceRoot, cwd: custodianRoot }).root;
       const workspace = await getCustodianWorkspace(root);
       if (closing || membershipKey(loadSettings().team) !== teamKey) return;
       const controller = workspace.controller;
@@ -1052,7 +1053,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       await reloadServices();
       // The custodian is installed with the installation and is always running: the
       // host opens it at every start, and no client can replace or remove it after.
-      await getCustodianWorkspace(resolveBackgroundScope({ cwd: process.cwd() }).root);
+      await getCustodianWorkspace(resolveBackgroundScope({ cwd: custodianRoot }).root);
       ensureOwnerInboxWakes();
       pumpEvents();
       watchSettingsFiles();
@@ -2002,7 +2003,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     // Telegram has one target: the custodian's own conversation. Nothing is
     // decided or recorded per message, so nothing can re-point the channel and a
     // quoted message cannot address a different session.
-    const custodian = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings.workspaceRoot ?? process.cwd());
+    const custodian = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings.workspaceRoot ?? custodianRoot);
     const custodianSessionId = custodian.controller.getSnapshot().session.id;
     if (attachment?.image) {
       custodian.controller.flushSave({ allowEmpty: true });
@@ -2045,7 +2046,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     }
     // Nothing to deliver: no words and no attachment is not a message at all.
     if (!String(inbox.payload.text ?? '').trim() && !Array.isArray(inbox.payload.attachments)) return;
-    const workspaceRoot = inbox.workspaceRoot ?? configuredWorkspaceRoot();
+    const workspaceRoot = inbox.workspaceRoot ?? machineWorkspaceRoot();
     if (!workspaceRoot) return;
     const currentId = ledger.getState(`owner-inbox:wakeup:${inbox.id}`);
     const current = currentId ? ledger.getEvent(currentId) : null;
@@ -2395,23 +2396,6 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   }
 
   /**
-   * The machine's default workspace, with no channel involved: an owner chat, a
-   * stored message between layers and a wake record all live in the same scope.
-   * The Telegram setting used to be read here, which made a transport decide
-   * where the machine's work lives; it is gone, because a channel is a way to
-   * reach the owner, not a place. With nothing configured the floor is the
-   * daemon's own workspace folder - never a transport's path and never whatever
-   * directory the process happened to start in.
-   */
-  function configuredWorkspaceRoot(): string {
-    const configured = loadSettings().defaultWorkspaceRoot;
-    if (configured) return configured;
-    const fallback = getDataPath('workspace');
-    mkdirSync(fallback, { recursive: true });
-    return fallback;
-  }
-
-  /**
    * The reports that may reach a running turn, shaped for the line builder. Reading
    * them consumes nothing, so the head can still open each record in full.
    */
@@ -2456,7 +2440,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       source: 'agent-inbox',
       kind: 'agent.message',
       dedupeKey: `agent-message:${randomUUID()}`,
-      workspaceRoot: configuredWorkspaceRoot(),
+      workspaceRoot: machineWorkspaceRoot(),
       payload: {
         fromSessionId: input.fromSessionId,
         toSessionId: input.toSessionId,
@@ -2489,7 +2473,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       source: 'agent',
       kind: 'inbox.wakeup',
       dedupeKey: `agent-wakeup:${targetSessionId}:${randomUUID()}`,
-      workspaceRoot: configuredWorkspaceRoot(),
+      workspaceRoot: machineWorkspaceRoot(),
       payload: { toSessionId: targetSessionId },
     });
     ledger.setState(`agent-inbox:wakeup:${targetSessionId}`, inserted.id);
@@ -2514,14 +2498,14 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   /** The live controller for a session, opening a saved chat when it is not running. */
   async function controllerForSession(sessionId: string): Promise<AgentSessionController | null> {
     if (sessionId === CUSTODIAN_SESSION_ID) {
-      const scope = custodianWorkspace?.runtime.workspaceRoot ?? configuredWorkspaceRoot();
+      const scope = custodianWorkspace?.runtime.workspaceRoot ?? machineWorkspaceRoot();
       return (await getCustodianWorkspace(scope)).controller;
     }
     const live = findSessionController(sessionId);
     if (live) return live;
     const saved = loadSavedSession(sessionId, null) ?? loadSavedSession(sessionId);
     if (!saved) return null;
-    const scope = canonicalWorkspaceRoot(saved.workspaceRoot ?? configuredWorkspaceRoot());
+    const scope = canonicalWorkspaceRoot(saved.workspaceRoot ?? machineWorkspaceRoot());
     try {
       return (await openChat(scope, sessionId)).controller;
     } catch (error) {
@@ -2612,7 +2596,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     // The new chat opens in the machine's default workspace: the folder a bare
     // start would use. The custodian's own directory is internal space and never
     // becomes a workspace, and no channel decides where an owner's chat lives.
-    const chat = await openChat(canonicalWorkspaceRoot(configuredWorkspaceRoot()));
+    const chat = await openChat(canonicalWorkspaceRoot(machineWorkspaceRoot()));
     const sessionId = chat.controller.getSnapshot().session.id;
     // A chat is addressable only once its record exists, so the first turn is
     // started and the record written before the id is handed back: the caller's

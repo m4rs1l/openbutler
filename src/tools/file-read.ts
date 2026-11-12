@@ -104,7 +104,7 @@ async function describeDirectoryEntry(root: string, entry: Dirent): Promise<Dire
 }
 
 /** Reads UTF-8 text or passes a validated image to a vision-capable model. */
-export function createReadTool(inputModalities: readonly string[], workspaceRoot = process.cwd()): ToolDefinition {
+export function createReadTool(inputModalities: readonly string[], workspaceRoot: string): ToolDefinition {
   const supportsVision = inputModalities.includes('image');
   return {
     providerId: 'host',

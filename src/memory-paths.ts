@@ -33,7 +33,7 @@ export function teamSlug(teamName: string): string {
 }
 
 /** Shared path contract for the agent prompt and the session runtime. */
-export function getMemoryPaths(workspaceRoot = process.cwd()): MemoryPaths {
+export function getMemoryPaths(workspaceRoot: string): MemoryPaths {
   const absoluteWorkspace = resolve(workspaceRoot);
   let stableWorkspace = absoluteWorkspace;
   try {
@@ -63,7 +63,7 @@ export function getMemoryPaths(workspaceRoot = process.cwd()): MemoryPaths {
 }
 
 /** The only index is MEMORY.md. The remaining Markdown files are source notes. */
-export function isMemoryIndexPath(source: string, workspaceRoot = process.cwd()): boolean {
+export function isMemoryIndexPath(source: string, workspaceRoot: string): boolean {
   const paths = getMemoryPaths(workspaceRoot);
   const requested = resolveMemoryPath(source, workspaceRoot);
   return requested !== null && samePath(requested, paths.indexFile) && !hasLinkedComponent(paths.root, requested);
@@ -81,7 +81,7 @@ export interface MemoryDocumentPath {
  * The managed tree is structural: a symlinked component inside it would let one
  * scope masquerade as another, so such paths are refused rather than resolved.
  */
-export function getMemoryDocumentPath(source: string, workspaceRoot = process.cwd()): MemoryDocumentPath | null {
+export function getMemoryDocumentPath(source: string, workspaceRoot: string): MemoryDocumentPath | null {
   const paths = getMemoryPaths(workspaceRoot);
   const target = resolveMemoryPath(source, workspaceRoot);
   if (target === null || !target.toLowerCase().endsWith('.md')) return null;
@@ -103,7 +103,7 @@ export function getMemoryDocumentPath(source: string, workspaceRoot = process.cw
   return null;
 }
 
-export function isWithinMemoryRoot(source: string, workspaceRoot = process.cwd()): boolean {
+export function isWithinMemoryRoot(source: string, workspaceRoot: string): boolean {
   const target = resolveMemoryPath(source, workspaceRoot);
   return target !== null && isWithin(target, getMemoryPaths(workspaceRoot).root);
 }
@@ -113,7 +113,7 @@ export function isWithinMemoryRoot(source: string, workspaceRoot = process.cwd()
  * scopes. The shared team scope is deliberately excluded: it is a read-only
  * mirror of the hub's log, written only by the daemon, never by a file tool.
  */
-export function isMemoryDocumentPath(source: string, workspaceRoot = process.cwd()): boolean {
+export function isMemoryDocumentPath(source: string, workspaceRoot: string): boolean {
   const document = getMemoryDocumentPath(source, workspaceRoot);
   return (
     document !== null &&

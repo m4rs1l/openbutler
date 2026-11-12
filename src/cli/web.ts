@@ -45,7 +45,7 @@ const isLoopback = (host: string): boolean => host === '127.0.0.1' || host === '
 export async function runWebCommand(parsed: Parsed): Promise<void> {
   const port = readPort(parsed);
   const host = parsed.flags.get('hostname') ?? DEFAULT_WEB_HOST;
-  const scope = resolveServerScope({ explicitDir: parsed.flags.get('dir'), cwd: process.cwd() });
+  const scope = resolveServerScope({ explicitDir: parsed.flags.get('dir') });
   const workspaceRoot = scope.root;
   const wantsPair = parsed.booleans.has('pair') || parsed.flags.get('pair') === 'true';
   const serving = parsed.booleans.has('serve') || parsed.flags.get('serve') === 'true';

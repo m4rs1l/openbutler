@@ -63,7 +63,7 @@ function parseReplacements(value: unknown): { ok: true; edits: Replacement[] } |
 }
 
 /** Replaces one exact occurrence inside an existing UTF-8 text file. */
-export function createEditTool(workspaceRoot = process.cwd(), memoryIndex?: MemoryIndex): ToolDefinition {
+export function createEditTool(workspaceRoot: string, memoryIndex?: MemoryIndex): ToolDefinition {
   return {
     providerId: 'host',
     name: 'file_edit',

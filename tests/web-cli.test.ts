@@ -140,7 +140,9 @@ describe('openbutler web pairing gate', () => {
     const started = await runCli(['web', '--port', String(port)]);
     expect(started.code, started.stderr).toBe(0);
     expect(started.stdout).toContain('running in the background');
-    expect(started.stdout).toContain('(from launch)');
+    // A background browser service scopes to the machine workspace, never the
+    // directory it happened to be launched in.
+    expect(started.stdout).toContain('(from machine-default)');
     expect(started.stdout).toContain(`:${port}`);
     expect(started.stdout).toContain('openbutler web --pair');
     expect(started.stdout).not.toContain('one-time link');

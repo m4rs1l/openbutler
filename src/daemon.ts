@@ -24,6 +24,7 @@ import { createLogger, fileSink } from './logging.js';
 import { DAEMON_PROTOCOL_VERSION, MAX_DAEMON_FRAME_BYTES, type DaemonStatus } from './daemon-protocol.js';
 import { getDataDir, getDataPath } from './paths.js';
 import { withDeadline } from './shutdown.js';
+import { machineWorkspaceRoot } from './workspace-origin.js';
 
 const DAEMON_START_TIMEOUT_MS = 20_000;
 const DAEMON_START_LOCK_WAIT_MS = 30_000;
@@ -380,7 +381,7 @@ export async function restartDaemon(_legacyWorkspaceScope?: string): Promise<Res
   try {
     return {
       status,
-      web: await startWebProcess(process.argv[1], previousWeb.port, previousWeb.host, previousWeb.dir ?? process.cwd()),
+      web: await startWebProcess(process.argv[1], previousWeb.port, previousWeb.host, previousWeb.dir ?? machineWorkspaceRoot()),
       webFailure: null,
     };
   } catch (error) {

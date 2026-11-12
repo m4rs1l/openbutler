@@ -88,19 +88,65 @@ describe('resolveInteractiveScope', () => {
 });
 
 describe('resolveServerScope', () => {
-  it('prefers --dir over the launch directory and treats an empty flag as absent', async () => {
+  it('prefers --dir and treats an empty flag as absent', async () => {
     const explicit = join(root, 'served');
     mkdirSync(explicit);
-    const launch = join(root, 'elsewhere');
-    mkdirSync(launch);
-    expect(workspaceOrigin.resolveServerScope({ explicitDir: explicit, cwd: launch })).toEqual({
+    expect(workspaceOrigin.resolveServerScope({ explicitDir: explicit })).toEqual({
       root: workspaceOrigin.canonicalScopeRoot(explicit),
       source: 'explicit',
     });
-    expect(workspaceOrigin.resolveServerScope({ explicitDir: '', cwd: launch })).toEqual({
-      root: workspaceOrigin.canonicalScopeRoot(launch),
-      source: 'launch',
+  });
+
+  it('defaults to the machine workspace, never the launch directory', async () => {
+    // A background browser service has no meaningful launch directory: an
+    // arbitrary cwd must never become the scope a projectless chat runs in.
+    // This mirrors configuredWorkspaceRoot in the host, which already refuses
+    // "whatever directory the process happened to start in".
+    const launch = join(root, 'arbitrary-launch');
+    mkdirSync(launch);
+    const scope = workspaceOrigin.resolveServerScope({});
+    const machine = workspaceOrigin.canonicalScopeRoot(join(root, 'workspace'));
+    expect(scope).toEqual({ root: machine, source: 'machine-default' });
+    expect(workspaceOrigin.resolveServerScope({ explicitDir: '' })).toEqual({ root: machine, source: 'machine-default' });
+    expect(scope.root).not.toBe(workspaceOrigin.canonicalScopeRoot(launch));
+  });
+
+  it('respects the configured default workspace ahead of the machine workspace', async () => {
+    const configured = join(root, 'configured');
+    mkdirSync(configured);
+    await saveDefaultWorkspace(configured);
+    expect(workspaceOrigin.resolveServerScope({})).toEqual({
+      root: workspaceOrigin.canonicalScopeRoot(configured),
+      source: 'settings',
     });
+  });
+});
+
+describe('machineWorkspaceRoot', () => {
+  it('is the configured default, else the data-dir workspace', async () => {
+    expect(workspaceOrigin.machineWorkspaceRoot()).toBe(workspaceOrigin.canonicalScopeRoot(join(root, 'workspace')));
+    const configured = join(root, 'configured-machine');
+    mkdirSync(configured);
+    await saveDefaultWorkspace(configured);
+    expect(workspaceOrigin.machineWorkspaceRoot()).toBe(workspaceOrigin.canonicalScopeRoot(configured));
+  });
+
+  it('never depends on the process launch directory', async () => {
+    // The class invariant: a machine-level scope is the same no matter where the
+    // process happened to start. A cwd fallback would silently move the
+    // machine's work into an arbitrary folder.
+    const elsewhere = join(root, 'arbitrary-launch');
+    mkdirSync(elsewhere);
+    const original = process.cwd();
+    try {
+      process.chdir(elsewhere);
+      const actual = workspaceOrigin.machineWorkspaceRoot();
+      const machine = workspaceOrigin.canonicalScopeRoot(join(root, 'workspace'));
+      expect(actual).toBe(machine);
+      expect(workspaceOrigin.resolveServerScope({}).root).toBe(machine);
+    } finally {
+      process.chdir(original);
+    }
   });
 });
 

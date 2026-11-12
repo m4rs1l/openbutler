@@ -119,7 +119,7 @@ export class SessionIndex {
   private database: DatabaseSync | undefined;
   private readonly embedding = new EmbeddingIdleLease(createEmbeddingLease());
 
-  constructor(workspaceRoot = process.cwd()) {
+  constructor(workspaceRoot: string) {
     this.workspaceRoot = resolve(workspaceRoot);
   }
 
