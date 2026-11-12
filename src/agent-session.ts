@@ -2378,6 +2378,9 @@ export class AgentSessionController implements AgentSessionClient {
               onReasoningDelta: (delta) => this.queueStreamDelta('reasoning', delta),
               onReasoningEnd: () => this.endStreamedReasoning(),
               onConversationProgress: (conversation, responseMessages) => {
+                // A successful step ends the retry sequence even when it produced
+                // only tool calls: no text/reasoning delta fired to close it.
+                this.closeRetryNotice();
                 this.conversation = conversation;
                 if (this.conversationArchive.length > 0) {
                   this.conversationArchive.push(...responseMessages.slice(archivedResponseCount));

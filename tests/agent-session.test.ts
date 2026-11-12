@@ -1067,6 +1067,51 @@ describe('provider retry reporting', () => {
     expect(notices).toHaveLength(1);
     expect((notices[0] as { text: string }).text).toContain('switching to the next key');
   });
+
+  it('starts a new line for a retry after a tool-only step recovered', async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'Fixture',
+      inputSchema: { type: 'object', properties: {} },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'model' },
+      autoApprove: () => true,
+      execute: async () => ({ message: 'Evidence' }),
+    });
+    let report: ((event: Record<string, unknown>) => void) | null = null;
+    const fire = (attempt: number) => report?.({ kind: 'retry', keyIndex: 0, attempt, waitMs: 1_000, error: { statusCode: 429 } });
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => titleResponse(),
+      doStream: vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          // Step 1 hits a 429, then recovers with a tool call and no text at all.
+          fire(0);
+          return delayedStream([{ type: 'tool-call', toolCallId: 'one', toolName: 'inspect', input: '{}' }], 'tool-calls');
+        })
+        .mockImplementationOnce(async () => {
+          // Step 2 hits a fresh 429 once the tool result is back.
+          fire(1);
+          return fixtureText('Done.');
+        }),
+    });
+    const runtime = runtimeFor(model, registry);
+    runtime.reportRetry = (handler) => {
+      report = handler as typeof report;
+    };
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    session = new AgentSessionController(runtime, undefined, { sessionWorkspaceRoot: null });
+
+    await session.sendMessage({ text: 'hello', images: [] });
+
+    const notices = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'notice');
+    // The tool-only step streamed no text or reasoning, yet it recovered: the
+    // second 429 is its own line, not an in-place update of the first.
+    expect(notices).toHaveLength(2);
+    expect((notices[0] as { text: string }).text).toContain('Retry 1 of');
+    expect((notices[1] as { text: string }).text).toContain('Retry 2 of');
+  });
 });
 
 describe('session streaming message boundaries', () => {
