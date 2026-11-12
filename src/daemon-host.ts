@@ -1573,6 +1573,14 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     if (closing || !workspace.runtime.reloadSettings) return;
     const busy = workspace.controller.isBusy || [...workspace.privateSessions.values()].some((session) => session.controller.isBusy);
     await workspace.runtime.reloadSettings?.(!busy);
+    if (closing) return;
+    // A spec-only edit (a model's context limit) rebuilds the runtime's model
+    // state, but each chat holds its own resolved copy. Refresh every live chat
+    // so the new window reaches its transcript and compaction budget without a
+    // restart or a re-pick. A running turn keeps its frozen model; this updates
+    // the state the next turn runs with.
+    await workspace.controller.restoreSessionModel();
+    for (const session of workspace.privateSessions.values()) await session.controller.restoreSessionModel();
     if (!closing) publishRuntime(workspace);
   }
 

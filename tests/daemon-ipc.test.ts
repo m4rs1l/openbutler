@@ -54,6 +54,8 @@ let registry: FixtureRegistry;
 let fixtureVision = false;
 /** The head's own-turn gap; a test that needs one sets this before replacing the host. */
 let fixtureSettingsReload: AgentEnvironment['reloadSettings'];
+/** Opt-in model-state factory, so a test can simulate a settings-fingerprint invalidation. */
+let fixtureModelFor: AgentEnvironment['modelFor'];
 const subagentSeen = new WeakSet<ToolRegistry>();
 const subagentStopSeen = new WeakSet<ToolRegistry>();
 const inboxSeen = new WeakSet<ToolRegistry>();
@@ -235,6 +237,7 @@ async function createFixtureHost(): Promise<DaemonHost> {
           fixtureSelectModels.push({ providerId, modelId });
         },
         ...(fixtureSettingsReload ? { reloadSettings: fixtureSettingsReload } : {}),
+        ...(fixtureModelFor ? { modelFor: fixtureModelFor } : {}),
         close: async () => {},
       };
       // Fidelity with the production runtime (agent-runtime.ts): a session whose
@@ -251,6 +254,7 @@ async function createFixtureHost(): Promise<DaemonHost> {
 beforeEach(async () => {
   fixtureSelectModels = [];
   fixtureSettingsReload = undefined;
+  fixtureModelFor = undefined;
   fixtureVision = false;
   root = mkdtempSync(join(tmpdir(), 'openbutler-ipc-check-'));
   vi.stubEnv('OPENBUTLER_DATA_DIR', root);
@@ -636,6 +640,39 @@ describe('shared host and session IPC', () => {
     viewer.stop();
     await running;
     await vi.waitFor(() => expect(reload).toHaveBeenCalledWith(true));
+  });
+
+  it('refreshes a live chat context window on settings reload without a new turn', async () => {
+    let window = 100_000;
+    fixtureSettingsReload = vi.fn(async () => {});
+    // The runtime resolves a chat's model through a settings-fingerprinted
+    // factory. Raising the window simulates an owner editing the model's context
+    // spec: same identity, invalidated cache.
+    fixtureModelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: 'Local fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: window,
+      outputLimitTokens: null,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'model-unsupported',
+      getReasoningProviderOptions: () => ({}),
+      registry: new ToolRegistry(),
+    });
+    const viewer = await newChat();
+    // The first turn resolves the chat's model state at the window it opens with.
+    await viewer.sendMessage({ text: 'Hello.', images: [] });
+    await vi.waitFor(() => expect(viewer.getSnapshot().session.contextWindowTokens).toBe(100_000));
+    window = 200_000;
+    await requestHost('settings.reload');
+    // The live chat picks up the new window without another message or a restart.
+    await vi.waitFor(() => expect(viewer.getSnapshot().session.contextWindowTokens).toBe(200_000));
   });
 
   it('reloads live runtimes when another process replaces the model catalog', async () => {

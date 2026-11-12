@@ -906,6 +906,48 @@ describe('restored session model identity', () => {
   });
 });
 
+describe('model spec refresh without a restart', () => {
+  it('refreshes a chat context window when the owner edits the spec for the same model', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const model = new MockLanguageModelV3({ doStream: [fixtureText('Answer.')] });
+    const runtime = runtimeFor(model);
+    // The runtime resolves a chat's model through a factory cached by a settings
+    // fingerprint (provider config + modelSpecs + catalog revision). An owner
+    // editing the context limit invalidates that cache for the SAME identity.
+    let window = 100_000;
+    runtime.modelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: 'Local streaming fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: window,
+      outputLimitTokens: null,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'model-unsupported',
+      getReasoningProviderOptions: () => ({}),
+      registry: new ToolRegistry(),
+    });
+    session = new AgentSessionController(runtime);
+    session.openSession(createSession('fixture', 'fixture'));
+    await session.restoreSessionModel();
+    expect(session.getSnapshot().session.contextWindowTokens).toBe(100_000);
+
+    // The owner raises the limit while the host runs. The model identity is
+    // unchanged, so only a fingerprint-aware refresh can pick it up.
+    window = 200_000;
+    await session.restoreSessionModel();
+    // The reported window and the state compaction reads come from this same
+    // refreshed model state: a restart or a model re-pick must not be required.
+    expect(session.getSnapshot().session.contextWindowTokens).toBe(200_000);
+  });
+});
+
 describe('provider retry reporting', () => {
   it('keeps key selection per conversation across new sessions and reloads on a shared runtime', async () => {
     const { createRotatingModel } = await import('../src/provider/retry.js');

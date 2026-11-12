@@ -1014,9 +1014,13 @@ export class AgentSessionController implements AgentSessionClient {
     // each other's model - the failure a single runtime slot has.
     const providerId = this.session.providerId;
     const modelId = this.session.modelId;
-    if (!this.modelState || this.modelState.providerId !== providerId || this.modelState.modelId !== modelId) {
-      this.modelState = await this.resolveModelState(providerId, modelId);
-    }
+    // Re-resolve even when the identity is unchanged: the runtime caches model
+    // state by a settings fingerprint (provider config, modelSpecs, catalog
+    // revision), so an owner edit such as a new context limit invalidates it.
+    // Guarding on identity alone froze the window this chat compacts against
+    // until a restart. The running turn keeps its frozen activeModelState; this
+    // refreshes the state the next turn runs with.
+    this.modelState = await this.resolveModelState(providerId, modelId);
     const state = this.modelState;
     const variants = state.reasoningVariants.map(({ id, label }) => ({ id, label }));
     this.session = {
