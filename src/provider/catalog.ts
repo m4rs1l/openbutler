@@ -271,7 +271,7 @@ function catalogDataPath(catalog: CatalogIndex | null): string {
 function pruneOldCatalogGenerations(current: string): void {
   try {
     for (const filename of readdirSync(dirname(NDJSON_FILE))) {
-      if (filename === current || !/^catalog\\.[0-9a-f-]{36}\\.ndjson$/.test(filename)) continue;
+      if (filename === current || !/^catalog\.[0-9a-f-]{36}\.ndjson$/.test(filename)) continue;
       const path = join(dirname(NDJSON_FILE), filename);
       if (Date.now() - statSync(path).mtimeMs > 30 * 24 * 60 * 60_000) unlinkSync(path);
     }

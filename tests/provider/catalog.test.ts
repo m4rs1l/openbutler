@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, mkdtempSync, openSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -325,5 +325,19 @@ describe('gateway-style model ids', () => {
     });
     expect(catalog.getModel('openai', 'openai/gpt-5')?.limit?.context).toBe(1000);
     expect(catalog.getModel('openai', 'gpt-5')?.limit?.context).toBe(400000);
+  });
+
+  it('prunes catalog generations older than 30 days on the next write', async () => {
+    const catalog = await loadWithCatalog();
+    const first = (await catalog.getCatalogIndex()).dataFile!;
+    expect(first).toBeTruthy();
+    const modelsDir = dataDir;
+    const firstPath = join(modelsDir, first);
+    const old = new Date(Date.now() - 31 * 24 * 60 * 60_000);
+    utimesSync(firstPath, old, old);
+    catalog.writeCatalogSnapshot(FIXTURE, new Date().toISOString());
+    expect(existsSync(firstPath)).toBe(false);
+    const remaining = readdirSync(modelsDir).filter((name) => name.startsWith('catalog.') && name.endsWith('.ndjson'));
+    expect(remaining).toHaveLength(1);
   });
 });
