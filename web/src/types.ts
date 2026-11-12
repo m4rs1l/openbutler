@@ -165,6 +165,8 @@ export interface UsageSummary {
   streakDays: number;
   pricedRows: number;
   unpricedRows: number;
+  estimatedRows: number;
+  unknownRows: number;
 }
 
 export interface UsageReport {

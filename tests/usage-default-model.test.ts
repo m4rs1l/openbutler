@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { UsageRow } from '../src/activity-ledger.js';
 import type { SettingsStore } from '../src/settings.js';
 import { pickMostUsedModel, resolveDefaultModel } from '../src/usage/default-model.js';
@@ -17,6 +17,24 @@ function settings(defaultProvider = '', defaultModel = ''): SettingsStore {
     },
   };
 }
+
+const ledgerFake = vi.hoisted(() => {
+  const state = { opened: 0, closed: 0, rows: [] as UsageRow[] };
+  class FakeLedger {
+    constructor() {
+      state.opened++;
+    }
+    usageRows() {
+      return state.rows;
+    }
+    close() {
+      state.closed++;
+    }
+  }
+  return { state, FakeLedger };
+});
+
+vi.mock('../src/activity-ledger.js', () => ({ ActivityLedger: ledgerFake.FakeLedger }));
 
 const row = (providerId: string, modelId: string, atMs: number): UsageRow => ({ providerId, modelId, atMs }) as UsageRow;
 
@@ -56,6 +74,22 @@ describe('resolveDefaultModel', () => {
   it('returns an explicit default without touching usage', () => {
     const choice = resolveDefaultModel(settings('fixture', 'modelx'), untouchedLedger);
     expect(choice).toEqual({ providerId: 'fixture', modelId: 'modelx', source: 'settings' });
+  });
+
+  it('closes the ledger it opened for usage rows', () => {
+    ledgerFake.state.opened = 0;
+    ledgerFake.state.closed = 0;
+    ledgerFake.state.rows = [row('fixture', 'modelx', 1_000)];
+    expect(resolveDefaultModel(settings())).toEqual({ providerId: 'fixture', modelId: 'modelx', source: 'usage', requests: 1 });
+    expect(ledgerFake.state.opened).toBe(1);
+    expect(ledgerFake.state.closed).toBe(1);
+  });
+
+  it('leaves a caller-provided ledger open', () => {
+    const close = vi.fn();
+    const ledger = { usageRows: () => [row('fixture', 'modelx', 1_000)], close };
+    expect(resolveDefaultModel(settings(), ledger)).toEqual({ providerId: 'fixture', modelId: 'modelx', source: 'usage', requests: 1 });
+    expect(close).not.toHaveBeenCalled();
   });
 
   it('falls back to usage when no explicit default exists', () => {

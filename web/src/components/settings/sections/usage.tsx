@@ -157,7 +157,7 @@ export function UsageSettings() {
               </SettingsRow>
               <SettingsRow label="Cost source" description="Provider-stated is a bill; catalog is an estimate">
                 <span className="settings-value">
-                  {report.summary.pricedRows} stated · {report.summary.unpricedRows} estimated
+                  {report.summary.pricedRows} stated · {report.summary.estimatedRows} estimated · {report.summary.unknownRows} unknown
                 </span>
               </SettingsRow>
             </SettingsGroup>

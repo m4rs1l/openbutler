@@ -86,6 +86,18 @@ describe('usage report', () => {
     expect(summary.unpricedRows).toBe(1);
   });
 
+  it('never labels rows without a cost source as estimates', () => {
+    const at = Date.parse('2026-10-21T09:00:00Z');
+    const summary = summarizeUsage(bucketUsage([row(at), row(at + 1), row(at + 2)]), [
+      row(at, { costSource: 'provider-inline' }),
+      row(at + 1, { costSource: 'none' }),
+      row(at + 2, { costSource: 'catalog-estimate' }),
+    ]);
+    expect(summary.pricedRows).toBe(1);
+    expect(summary.estimatedRows).toBe(1);
+    expect(summary.unknownRows).toBe(1);
+  });
+
   it('reads token counts and money at a glance', () => {
     expect(formatTokens(812)).toBe('812');
     expect(formatTokens(49_454)).toBe('49.5k');

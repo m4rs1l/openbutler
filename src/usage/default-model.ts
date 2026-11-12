@@ -44,9 +44,17 @@ export function resolveDefaultModel(settings: SettingsStore, ledger?: Pick<Activ
   if (settings.defaultProvider && settings.defaultModel) {
     return { providerId: settings.defaultProvider, modelId: settings.defaultModel, source: 'settings' };
   }
-  const rows = (ledger ?? new ActivityLedger(undefined, { readOnly: true })).usageRows({
-    sinceMs: Date.now() - USAGE_WINDOW_MS,
-  });
+  let rows: UsageRow[];
+  if (ledger) {
+    rows = ledger.usageRows({ sinceMs: Date.now() - USAGE_WINDOW_MS });
+  } else {
+    const owned = new ActivityLedger(undefined, { readOnly: true });
+    try {
+      rows = owned.usageRows({ sinceMs: Date.now() - USAGE_WINDOW_MS });
+    } finally {
+      owned.close();
+    }
+  }
   const picked = pickMostUsedModel(settings, rows);
   return picked ? { ...picked, source: 'usage' } : null;
 }

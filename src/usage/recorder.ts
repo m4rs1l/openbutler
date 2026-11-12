@@ -121,7 +121,9 @@ export async function recordUsage(ledger: ActivityLedger, input: UsageRecordInpu
       ...(input.responseId ? { generationId: input.responseId } : {}),
     };
     ledger.recordUsage(row);
-  } catch {
-    /* Accounting is best effort: a failed row must never fail the request. */
+  } catch (error) {
+    // Accounting stays best effort and never fails the request, but a silent
+    // catch would degrade to zero rows without a trace.
+    console.error(`Usage accounting failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

@@ -173,6 +173,11 @@ export interface UsageSummary {
   streakDays: number;
   /** How many days the provider stated the cost for, out of all rows. */
   pricedRows: number;
+  /** Catalog-price estimates: the provider did not state a cost for these. */
+  estimatedRows: number;
+  /** Rows with no cost source at all: failed or absent usage, never an estimate. */
+  unknownRows: number;
+  /** estimatedRows + unknownRows, kept for existing API consumers. */
   unpricedRows: number;
 }
 
@@ -191,6 +196,8 @@ export function summarizeUsage(days: readonly UsageDay[], rows: readonly UsageRo
     longestTaskMs: 0,
     streakDays: 0,
     pricedRows: 0,
+    estimatedRows: 0,
+    unknownRows: 0,
     unpricedRows: 0,
   };
   for (const day of days) {
@@ -207,7 +214,13 @@ export function summarizeUsage(days: readonly UsageDay[], rows: readonly UsageRo
   for (const row of rows) {
     summary.longestTaskMs = Math.max(summary.longestTaskMs, row.durationMs ?? 0);
     if (row.costSource === 'provider-inline' || row.costSource === 'provider-lookup') summary.pricedRows += 1;
-    else summary.unpricedRows += 1;
+    else if (row.costSource === 'catalog-estimate') {
+      summary.estimatedRows += 1;
+      summary.unpricedRows += 1;
+    } else {
+      summary.unknownRows += 1;
+      summary.unpricedRows += 1;
+    }
   }
   // A streak counts back from the newest recorded day without a gap.
   const recorded = new Set(days.filter((day) => day.requests > 0).map((day) => day.day));
@@ -264,7 +277,7 @@ export function renderUsageReport(days: readonly UsageDay[], summary: UsageSumma
         `  streak ${summary.streakDays}d`
       : '',
     summary.unpricedRows > 0
-      ? `  cost source: provider ${summary.pricedRows}, catalog estimate ${summary.unpricedRows}`
+      ? `  cost source: provider ${summary.pricedRows}, catalog estimate ${summary.estimatedRows}, unknown ${summary.unknownRows}`
       : `  cost source: provider for every request`,
     '',
   ].filter(Boolean);
