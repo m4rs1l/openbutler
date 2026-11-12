@@ -78,10 +78,7 @@ export function isRetryableError(error: unknown): boolean {
     if (flag === false) return false;
     if (flag === true) return true;
   }
-  return (
-    error instanceof TypeError ||
-    (error instanceof Error && /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(error.message))
-  );
+  return error instanceof Error && /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(error.message);
 }
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -126,8 +123,7 @@ export function createRotatingModel(models: readonly V3LanguageModel[], options:
     if (!Number.isSafeInteger(start) || start < 0 || start >= models.length) {
       throw new Error('Saved key position is outside the configured key pool.');
     }
-    let lastError: unknown;
-    for (let keyIndex = start; keyIndex < models.length; keyIndex++) {
+    for (let keyIndex = start; ; keyIndex++) {
       if (signal?.aborted) throw new Error('Run cancelled.');
       keyIndex = Math.max(keyIndex, positions[poolId] ?? 0);
       positions[poolId] = keyIndex;
@@ -139,7 +135,6 @@ export function createRotatingModel(models: readonly V3LanguageModel[], options:
           return await call(model);
         } catch (error) {
           if (signal?.aborted) throw error;
-          lastError = error;
           if (isAuthError(error)) {
             if (hasNextKey) {
               positions[poolId] = Math.max(keyIndex + 1, positions[poolId] ?? 0);
@@ -164,7 +159,6 @@ export function createRotatingModel(models: readonly V3LanguageModel[], options:
         }
       }
     }
-    throw lastError;
   };
 
   const rotating: V3LanguageModel = {

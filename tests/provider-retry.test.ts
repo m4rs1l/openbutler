@@ -48,6 +48,7 @@ describe('retry classification', () => {
     expect(isRetryableError(apiError(500))).toBe(true);
     expect(isRetryableError(apiError(503))).toBe(true);
     expect(isRetryableError(new TypeError('fetch failed'))).toBe(true);
+    expect(isRetryableError(new TypeError('Cannot read properties of undefined'))).toBe(false);
     expect(isRetryableError(apiError(400))).toBe(false);
     expect(isRetryableError(apiError(404))).toBe(false);
     expect(isRetryableError(new Error('bad request'))).toBe(false);
