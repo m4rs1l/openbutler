@@ -76,8 +76,50 @@ describe('reasoning adapter table', () => {
     });
   });
 
-  it('leaves gateway visibility options untouched', () => {
-    expect(withReasoningVisibility(provider('@ai-sdk/gateway', 'vercel'), {}, true)).toEqual({});
+  it('requests a readable summary when showing gateway reasoning', () => {
+    expect(withReasoningVisibility(provider('@ai-sdk/gateway', 'vercel'), {}, true)).toEqual({
+      openai: { reasoningSummary: 'detailed' },
+    });
+  });
+
+  it('merges the gateway effort variant with the visibility flag', () => {
+    expect(withReasoningVisibility(provider('@ai-sdk/gateway', 'vercel'), { openai: { reasoningEffort: 'minimal' } }, true)).toEqual({
+      openai: { reasoningEffort: 'minimal', reasoningSummary: 'detailed' },
+    });
+  });
+
+  it('sends no gateway visibility flag when reasoning is hidden', () => {
+    expect(withReasoningVisibility(provider('@ai-sdk/gateway', 'vercel'), { openai: { reasoningEffort: 'high' } }, false)).toEqual({
+      openai: { reasoningEffort: 'high' },
+    });
+  });
+});
+
+describe('reasoning visibility invariant', () => {
+  /* Every adapter that needs a request flag to receive readable reasoning must
+     send one when reasoning is shown. A missing flag is how a provider silently
+     loses reasoning while still counting reasoning tokens. openai-compatible is
+     the documented exception: those endpoints stream reasoning_content natively,
+     so no flag is needed. */
+  const cases: Array<{ npm: string; id: string; expected: Record<string, unknown> }> = [
+    { npm: '@ai-sdk/openai', id: 'openai', expected: { openai: { reasoningSummary: 'auto' } } },
+    { npm: '@ai-sdk/gateway', id: 'vercel', expected: { openai: { reasoningSummary: 'detailed' } } },
+    { npm: '@ai-sdk/anthropic', id: 'anthropic', expected: { anthropic: { sendReasoning: true } } },
+    { npm: '@ai-sdk/google', id: 'google', expected: { google: { thinkingConfig: { includeThoughts: true } } } },
+    { npm: '@openrouter/ai-sdk-provider', id: 'openrouter', expected: { openrouter: { reasoning: { exclude: false } } } },
+  ];
+  for (const { npm, id, expected } of cases) {
+    it(`${npm} requests visible reasoning when shown`, () => {
+      expect(withReasoningVisibility(provider(npm, id), {}, true)).toEqual(expected);
+    });
+  }
+
+  it('openai-compatible streams reasoning natively without a request flag', () => {
+    expect(
+      withReasoningVisibility(provider('@ai-sdk/openai-compatible', 'custom.oai'), { custom: { reasoningEffort: 'high' } }, true),
+    ).toEqual({
+      custom: { reasoningEffort: 'high' },
+    });
   });
 });
 

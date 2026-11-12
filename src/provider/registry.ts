@@ -550,19 +550,17 @@ const REASONING_ADAPTERS: Record<string, ReasoningAdapter> = {
     },
   },
   '@ai-sdk/gateway': {
-    // UNVERIFIED live: @ai-sdk/gateway forwards providerOptions to the
-    // Gateway API, which applies the serving provider's native entry, and
-    // GatewayProviderOptions itself is routing-only (no reasoning field).
-    // The vercel catalog entries use the OpenAI effort vocabulary, so effort
-    // is sent OpenAI-parity and left to the gateway's cross-provider
-    // translation. If the server ignores it, the server default applies and
-    // nothing breaks; verify against a live gateway call before relying on
-    // exact effort levels.
+    // The gateway forwards providerOptions verbatim to the serving backend, so
+    // the OpenAI-parity namespace carries both effort and the summary request.
+    // 'detailed' asks for the fullest readable summary; backends emit them
+    // sparsely, only at difficult steps (verified live on meta/muse-ember:
+    // detailed returns more summary deltas than auto). A backend without
+    // summaries ignores the flag and still returns encrypted reasoning.
     optionsKey: () => 'openai',
     effort: (effort) => (OPENAI_EFFORT_VALUES.includes(effort) ? { reasoningEffort: effort } : null),
     toggle: (enabled) => ({ reasoningEffort: enabled ? 'high' : 'none' }),
     budget: () => null,
-    display: () => null,
+    display: () => ({ reasoningSummary: 'detailed' }),
   },
 };
 
