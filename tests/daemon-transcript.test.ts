@@ -166,6 +166,26 @@ it('expires local notices without changing the host index space used by later te
   await vi.waitFor(() => expect(client!.getServerEntries()[1]).toMatchObject({ kind: 'reasoning', text: 'Thinking continues' }));
 });
 
+it('ignores a replacement beyond the entry list instead of creating holes', async () => {
+  client = await connect(root, { isolatedSession: true });
+  const { entries: _entries, ...session } = snapshot.session;
+  const intruder: SessionEntry = { kind: 'user', text: 'Out of range', turnId: 't2' };
+  const marker: SessionEntry = { kind: 'notice', text: 'Patch applied' };
+  emit({
+    version: 2,
+    event: 'patch',
+    patch: {
+      ...snapshot,
+      session,
+      runtime,
+      entriesPatch: { kind: 'delta', append: [marker], appendText: [], replace: [{ index: 99, entry: intruder }] },
+    },
+  });
+  await vi.waitFor(() => expect(client!.getServerEntries()).toHaveLength(2));
+  expect(client!.getServerEntries()).toEqual([...snapshot.session.entries, marker]);
+  expect(client!.getServerEntries()).not.toContain(undefined);
+});
+
 it('keeps IPC, web SSE, browser state and turn groups aligned after notice eviction and expiry', async () => {
   const { startWebServer } = await import('../src/web/server.js');
   web = await startWebServer({ workspaceRoot: root, port: 0, assetsDir: join(root, 'no-assets') });

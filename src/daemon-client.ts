@@ -22,7 +22,7 @@ import {
   type SessionEntriesPatch,
   type SessionSnapshotData,
 } from './daemon-protocol.js';
-import { listSavedSessions, type SessionEntry, type SessionSummary, type NoticeTone } from './session-store.js';
+import { listSavedSessions, type SessionEntry, type SessionEntriesRange, type SessionSummary, type NoticeTone } from './session-store.js';
 import { LocalNoticeList, LOCAL_NOTICE_TTL_MS, MAX_LOCAL_NOTICES } from './local-notices.js';
 import type { ApprovalMode } from './settings.js';
 import { LOCAL_CLIENT_KINDS, type LocalClientKind } from './communication.js';
@@ -46,6 +46,14 @@ export type AttachOptions = {
   workerSessionId?: string;
   /** Attach view-only to the worker a parent session is currently blocked on. */
   runningWorkerOf?: string;
+  /**
+   * Keep only the newest this-many transcript entries in memory, paging older
+   * history from the host on demand. A web client sets it so a long chat cannot
+   * spend the whole transcript on every attach; the terminal leaves it unset
+   * because its scrollback needs the full history. An older host ignores it and
+   * returns everything, which the client then windows itself.
+   */
+  entriesWindow?: number;
 };
 
 /**
@@ -82,6 +90,16 @@ class DaemonSessionClient implements AgentSessionClient {
   // Host patches address this array. The rendered snapshot also contains local
   // notices, whose expiry/eviction must never change the host's index space.
   private serverEntries: SessionEntry[] = [];
+  /**
+   * Absolute host index of `serverEntries[0]`. Zero when this client holds the
+   * whole transcript; otherwise the start of the tail window it keeps. Host
+   * patches address absolute indices, so every update is translated by this.
+   */
+  private entriesFrom = 0;
+  /** Full transcript length on the host, which the window itself does not reach. */
+  private totalEntries = 0;
+  /** The window this client keeps, or null when it holds the full transcript. */
+  private entriesWindow: number | null = null;
   private closed = false;
   private connectionFailureReported = false;
   private reconnecting = false;
@@ -163,6 +181,21 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.serverEntries;
   };
 
+  getServerEntriesFrom = (): number => this.entriesFrom;
+
+  getServerEntryCount = (): number => this.totalEntries;
+
+  /** Pages older history from the host, which always holds the full transcript. */
+  fetchEntriesRange(before: number, limit: number): Promise<SessionEntriesRange> {
+    return this.request<SessionEntriesRange>('session.entries-range', { before, limit });
+  }
+
+  /** Resolves an attachment across the full transcript, including history below the window. */
+  findAttachment(id: string): Promise<{ path: string; mediaType: string } | null> {
+    // `attachmentId`, not `id`: the request envelope reserves `id` for correlation.
+    return this.request<{ path: string; mediaType: string } | null>('session.find-attachment', { attachmentId: id });
+  }
+
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -170,6 +203,7 @@ class DaemonSessionClient implements AgentSessionClient {
 
   async attach(options: AttachOptions): Promise<void> {
     this.attachOptions = options;
+    this.entriesWindow = options.entriesWindow ?? null;
     const result = await this.request<AttachResult>('attach', {
       workspaceRoot: this.workspaceRoot,
       clientKind: options.clientKind ?? 'terminal',
@@ -180,6 +214,7 @@ class DaemonSessionClient implements AgentSessionClient {
       ...(options.scheduleId ? { scheduleId: options.scheduleId } : {}),
       ...(options.workerSessionId ? { workerSessionId: options.workerSessionId } : {}),
       ...(options.runningWorkerOf ? { runningWorkerOf: options.runningWorkerOf } : {}),
+      ...(options.entriesWindow !== undefined ? { entriesWindow: options.entriesWindow } : {}),
     });
     if (!isAttachResult(result)) throw new Error('The OpenButler host returned an invalid session attachment.');
     this.hostEntry = typeof result.hostEntry === 'string' && result.hostEntry ? result.hostEntry : null;
@@ -192,6 +227,10 @@ class DaemonSessionClient implements AgentSessionClient {
     if (options.chatSessionId || options.newChatSession) {
       if (typeof result.workspaceKey !== 'string') throw new Error('The host did not provide a chat binding.');
       this.workspaceKey = result.workspaceKey;
+    } else if (typeof result.workspaceKey === 'string') {
+      // A worker view binds to the workspace that hosts the worker, which can differ
+      // from the root this client named; follow-up requests must use the host's key.
+      this.workspaceKey = result.workspaceKey;
     }
     if (options.chatSessionId && result.snapshot.session.id !== options.chatSessionId)
       throw new Error('The host attached to a different chat. This connection cannot be used.');
@@ -201,9 +240,7 @@ class DaemonSessionClient implements AgentSessionClient {
     }
     this.applyRuntime(result.runtime);
     this.savedSessions = result.savedSessions;
-    const fresh = snapshotFromData(result.snapshot);
-    this.serverEntries = fresh.session.entries;
-    this.snapshot = { ...fresh, session: { ...fresh.session, entries: this.withLocalNotices(fresh.session.entries) } };
+    this.installSnapshot(result.snapshot);
     this.publish();
   }
 
@@ -409,6 +446,83 @@ class DaemonSessionClient implements AgentSessionClient {
     }
   }
 
+  /**
+   * Installs a snapshot from the host. The attach response may already be a tail
+   * window (`entriesFrom` present); a broadcast snapshot event always carries the
+   * full transcript. Either way a windowed client keeps only the tail, and the
+   * streaming entry resolves against the entries it actually holds.
+   */
+  private installSnapshot(data: SessionSnapshotData): void {
+    const fresh = snapshotFromData(data);
+    if (data.entriesFrom !== undefined) {
+      this.serverEntries = data.session.entries;
+      this.entriesFrom = data.entriesFrom;
+      this.totalEntries = data.totalEntries ?? data.session.entries.length;
+    } else {
+      const windowed = this.windowFull(data.session.entries);
+      this.serverEntries = windowed.entries;
+      this.entriesFrom = windowed.from;
+      this.totalEntries = windowed.total;
+    }
+    this.snapshot = { ...fresh, session: { ...fresh.session, entries: this.withLocalNotices(this.serverEntries) } };
+  }
+
+  /** The tail window of a full transcript, or the whole thing when this client does not window. */
+  private windowFull(full: SessionEntry[]): { entries: SessionEntry[]; from: number; total: number } {
+    if (this.entriesWindow === null) return { entries: full, from: 0, total: full.length };
+    const from = Math.max(0, full.length - this.entriesWindow);
+    return { entries: full.slice(from), from, total: full.length };
+  }
+
+  /**
+   * Applies a host patch to the window. Host indices are absolute and this client
+   * holds `[entriesFrom, totalEntries)`, so each update is translated and anything
+   * below the window is dropped. Appends grow the tail, a replace-all re-windows,
+   * and the front is trimmed once the window doubles — bounding memory without
+   * ever changing the host's index space.
+   */
+  private applyPatchedEntries(patch: SessionEntriesPatch | undefined): void {
+    if (!patch) return;
+    if (patch.kind === 'replace-all') {
+      const windowed = this.windowFull(patch.entries);
+      this.serverEntries = windowed.entries;
+      this.entriesFrom = windowed.from;
+      this.totalEntries = windowed.total;
+      return;
+    }
+    const entries = [...this.serverEntries];
+    for (const update of patch.appendText) {
+      const local = update.index - this.entriesFrom;
+      const entry = entries[local];
+      if (
+        local >= 0 &&
+        local < entries.length &&
+        (entry?.kind === 'assistant' || entry?.kind === 'reasoning') &&
+        typeof update.delta === 'string'
+      ) {
+        // Keep the rest of the entry: the host can add a field (a stamped
+        // thinking duration) while the text keeps growing.
+        entries[local] = { ...entry, text: entry.text + update.delta };
+      }
+    }
+    for (const update of patch.replace) {
+      const local = update.index - this.entriesFrom;
+      // An index outside the window is history this client no longer holds; the
+      // host's absolute space stays dense, so skipping it leaves no hole here.
+      if (!Number.isInteger(local) || local < 0 || local >= entries.length) continue;
+      entries[local] = update.entry;
+    }
+    entries.push(...patch.append);
+    this.totalEntries += patch.append.length;
+    if (this.entriesWindow !== null && entries.length > this.entriesWindow * 2) {
+      const drop = entries.length - this.entriesWindow;
+      this.serverEntries = entries.slice(drop);
+      this.entriesFrom += drop;
+    } else {
+      this.serverEntries = entries;
+    }
+  }
+
   private applyEvent(event: DaemonEvent): void {
     if (event.event === 'notification') {
       if (event.title === 'OpenButler host stopping') this.intentionalShutdown = true;
@@ -425,18 +539,18 @@ class DaemonSessionClient implements AgentSessionClient {
       return;
     }
     if (event.event === 'snapshot') {
-      const fresh = snapshotFromData(event.snapshot);
-      this.serverEntries = fresh.session.entries;
-      this.snapshot = { ...fresh, session: { ...fresh.session, entries: this.withLocalNotices(fresh.session.entries) } };
+      this.installSnapshot(event.snapshot);
       this.applyRuntime(event.runtime);
       this.publish();
       return;
     }
     if (!this.snapshot) return;
-    const patchedEntries = applyEntriesPatch(this.serverEntries, event.patch.entriesPatch);
-    this.serverEntries = patchedEntries;
-    const session = { ...event.patch.session, entries: this.withLocalNotices(patchedEntries) };
+    this.applyPatchedEntries(event.patch.entriesPatch);
+    const session = { ...event.patch.session, entries: this.withLocalNotices(this.serverEntries) };
+    // The host stamps the streaming entry's absolute index; translate it into the
+    // window this client holds, and treat one below the window as not visible.
     const streamingIndex = event.patch.streamingAssistantIndex;
+    const streamingLocal = streamingIndex === null ? null : streamingIndex - this.entriesFrom;
     this.snapshot = {
       session,
       busy: event.patch.busy,
@@ -448,7 +562,10 @@ class DaemonSessionClient implements AgentSessionClient {
       firstQueuedMessage: event.patch.firstQueuedMessage,
       queuedMessages: event.patch.queuedMessages ?? (event.patch.firstQueuedMessage ? [event.patch.firstQueuedMessage] : []),
       sessionSaveError: event.patch.sessionSaveError,
-      streamingAssistantEntry: streamingIndex === null ? null : (patchedEntries[streamingIndex] ?? null),
+      streamingAssistantEntry:
+        streamingLocal === null || streamingLocal < 0 || streamingLocal >= this.serverEntries.length
+          ? null
+          : (this.serverEntries[streamingLocal] ?? null),
     };
     this.applyRuntime(event.patch.runtime);
     this.publish();
@@ -522,7 +639,11 @@ class DaemonSessionClient implements AgentSessionClient {
     if (this.reconnecting || this.closed || this.intentionalShutdown) return;
     this.reconnecting = true;
     const previousSessionId = this.snapshot?.session.id;
-    const previousSessionHadUserMessage = this.snapshot?.session.entries.some((entry) => entry.kind === 'user') === true;
+    // A windowed client may not hold the user message that proves a chat is real,
+    // so read the denormalised flag the host stamps; fall back to a scan only for
+    // an older host that never wrote it (and so sent the full transcript anyway).
+    const previousSessionHadUserMessage =
+      (this.snapshot?.session.hasUserMessage ?? this.snapshot?.session.entries.some((entry) => entry.kind === 'user')) === true;
     let attempt = 0;
     while (!this.closed && !this.intentionalShutdown) {
       let socket: Socket | null = null;
@@ -537,7 +658,8 @@ class DaemonSessionClient implements AgentSessionClient {
         this.bindSocket(socket);
         await this.attach(this.attachOptions);
 
-        const activeSessionHasMessages = this.snapshot?.session.entries.some((entry) => entry.kind === 'user') === true;
+        const activeSessionHasMessages =
+          (this.snapshot?.session.hasUserMessage ?? this.snapshot?.session.entries.some((entry) => entry.kind === 'user')) === true;
         if (
           previousSessionId &&
           previousSessionHadUserMessage &&
@@ -548,8 +670,12 @@ class DaemonSessionClient implements AgentSessionClient {
         ) {
           const restored = await this.loadSession(previousSessionId);
           if (restored && this.snapshot) {
-            this.serverEntries = restored.entries;
-            this.snapshot = { ...this.snapshot, session: { ...restored, entries: this.withLocalNotices(restored.entries) } };
+            // loadSession answers with the full transcript; keep only the window.
+            const windowed = this.windowFull(restored.entries);
+            this.serverEntries = windowed.entries;
+            this.entriesFrom = windowed.from;
+            this.totalEntries = windowed.total;
+            this.snapshot = { ...this.snapshot, session: { ...restored, entries: this.withLocalNotices(windowed.entries) } };
             this.publish();
           }
         }
@@ -584,23 +710,6 @@ function snapshotFromData(data: SessionSnapshotData): AgentSessionSnapshot {
     sessionSaveError: data.sessionSaveError,
     streamingAssistantEntry: index === null ? null : (data.session.entries[index] ?? null),
   };
-}
-
-function applyEntriesPatch(previous: SessionEntry[], patch: SessionEntriesPatch | undefined): SessionEntry[] {
-  if (!patch) return previous;
-  if (patch.kind === 'replace-all') return patch.entries;
-  const entries = [...previous];
-  for (const update of patch.appendText) {
-    const entry = entries[update.index];
-    if ((entry?.kind === 'assistant' || entry?.kind === 'reasoning') && typeof update.delta === 'string') {
-      // Keep the rest of the entry: the server can add a field (a stamped
-      // thinking duration) while the text keeps growing.
-      entries[update.index] = { ...entry, text: entry.text + update.delta };
-    }
-  }
-  for (const update of patch.replace) entries[update.index] = update.entry;
-  entries.push(...patch.append);
-  return entries;
 }
 
 function connectSocket(): Promise<Socket> {
@@ -642,7 +751,10 @@ function isSessionSnapshotData(value: unknown): value is SessionSnapshotData {
     isRecord(value.session) &&
     Array.isArray(value.session.entries) &&
     typeof value.busy === 'boolean' &&
-    (value.streamingAssistantIndex === null || Number.isSafeInteger(value.streamingAssistantIndex))
+    (value.streamingAssistantIndex === null || Number.isSafeInteger(value.streamingAssistantIndex)) &&
+    (value.entriesFrom === undefined ||
+      (typeof value.entriesFrom === 'number' && Number.isSafeInteger(value.entriesFrom) && value.entriesFrom >= 0)) &&
+    (value.totalEntries === undefined || Number.isSafeInteger(value.totalEntries))
   );
 }
 

@@ -33,6 +33,14 @@ export type RuntimeViewData = Omit<
 export type SessionSnapshotData = Omit<AgentSessionSnapshot, 'streamingAssistantEntry'> & {
   firstQueuedMessage: { text: string; imageCount: number } | null;
   streamingAssistantIndex: number | null;
+  /**
+   * Absolute host index of `session.entries[0]` when the host sent only a tail
+   * window. Absent means the full transcript, so an older client that never
+   * asked for a window reads exactly what it always did.
+   */
+  entriesFrom?: number;
+  /** Full transcript length when `entriesFrom` is present; the window is shorter. */
+  totalEntries?: number;
 };
 
 export type SessionEntriesPatch =

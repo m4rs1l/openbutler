@@ -42,7 +42,14 @@ import {
   type SessionEntriesPatch,
   type SessionSnapshotData,
 } from './daemon-protocol.js';
-import { listSavedSessions, loadSavedSession, loadSessionForChat, type SessionEntry, type SavedSession } from './session-store.js';
+import {
+  listSavedSessions,
+  loadSavedSession,
+  loadSessionForChat,
+  type SessionEntry,
+  type SessionEntriesRange,
+  type SavedSession,
+} from './session-store.js';
 import { CUSTODIAN_SESSION_ID } from './session-paths.js';
 import { ActivityLedger, type ObservedEventInput, type ObservedEventRow } from './activity-ledger.js';
 import { redactSensitive, redactSensitiveText } from './sensitive-data.js';
@@ -109,6 +116,32 @@ const MAX_MESSAGE_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE = 8;
 const MAX_QUESTION_ANSWER_CHARS = 10_000;
+/** Ceiling on a web client's requested attach window, so a caller cannot ask for the whole transcript by name. */
+const MAX_ENTRIES_WINDOW = 2_000;
+/** Most entries one older-history page may return; matches the web client's page cap. */
+const MAX_ENTRIES_PAGE = 200;
+/** Attachment media types the browser may render inline; the host filters with the same list the web server uses. */
+const INLINE_IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+/**
+ * The only actions a view-only worker attachment may issue. Default-deny: a viewer
+ * reads the transcript, controls the run (stop, approve, answer, steer), picks the
+ * model the worker runs with, and posts display notices — but may not submit model
+ * turns, inject conversation entries, switch chats, or write a setting. A new action
+ * is refused here until deliberately classified. `session.add-entry` passes this
+ * gate but is further restricted to notices in its handler.
+ */
+const VIEW_ONLY_ACTIONS = new Set([
+  'session.list',
+  'session.entries-range',
+  'session.find-attachment',
+  'session.flush',
+  'session.stop',
+  'session.approve',
+  'session.answer',
+  'session.queue',
+  'session.select-model',
+  'session.add-entry',
+]);
 const MAX_WORKSPACE_PATH_BYTES = 32 * 1024;
 const MAX_QUEUED_OUTPUT_BYTES = 32 * 1024 * 1024;
 const WORKSPACE_IDLE_TTL_MS = 30 * 60_000;
@@ -162,6 +195,8 @@ interface ClientAttachment {
   scopeRoot: string;
   /** View-only attachment to a subagent worker: model turns cannot be submitted from it. */
   readOnly?: boolean;
+  /** The tail window this client keeps, or null for the full transcript (the terminal needs it all). */
+  entriesWindow: number | null;
 }
 
 interface DaemonHostOptions {
@@ -1340,6 +1375,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     scopeRoot: string,
     clientKind: LocalClientKind,
     target: { sessionId?: string | undefined; projectId?: string | null | undefined },
+    entriesWindow: number | null,
   ): Promise<ClientAttachment> {
     const chat = await openChat(scopeRoot, target.sessionId, target.projectId);
     if (socket.destroyed) throw new Error('The client disconnected while its chat was opening.');
@@ -1360,13 +1396,17 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       privateSessionId: chat.privateSessionId,
       scopeRoot,
       interactive: true,
+      entriesWindow,
       ...(workers.has(chat.controller.getSnapshot().session.id) ? { readOnly: true } : {}),
     };
     attachments.set(socket, attachment);
+    // The same tail window the attach response carries: a full snapshot event here
+    // would spend the whole transcript on every chat open and destroy the socket
+    // once it outgrows the frame limit, making a large chat unopenable.
     writeEvent(socket, {
       version: DAEMON_PROTOCOL_VERSION,
       event: 'snapshot',
-      snapshot: toSnapshotData(chat.controller.getSnapshot()),
+      snapshot: attachSnapshotData(chat.controller.getSnapshot(), entriesWindow),
       runtime: toRuntimeView(chat.workspace.runtime, undefined, chat.controller.getSnapshot().session),
     });
     return attachment;
@@ -3176,6 +3216,13 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (request.clientKind !== undefined && !LOCAL_CLIENT_KINDS.some((kind) => kind === request.clientKind))
           throw new Error('clientKind must be terminal or web.');
         const clientKind = request.clientKind === 'web' ? 'web' : 'terminal';
+        // Only a web client may window its attach: the terminal needs the whole
+        // transcript for scrollback geometry. An older host simply never sees the
+        // field, and a newer one ignores it for any non-web caller.
+        const entriesWindow =
+          clientKind === 'web' && request.entriesWindow !== undefined
+            ? requireInteger(request.entriesWindow, 'entriesWindow', 1, MAX_ENTRIES_WINDOW)
+            : null;
         const path = requireString(request.workspaceRoot, 'workspaceRoot', MAX_WORKSPACE_PATH_BYTES);
         if (!isAbsolute(path)) throw new Error('workspaceRoot must be an absolute path.');
         if (request.isolatedSession !== undefined && typeof request.isolatedSession !== 'boolean')
@@ -3195,17 +3242,23 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (request.projectId !== undefined && request.projectId !== null && typeof request.projectId !== 'string')
             throw new Error('Invalid project ID.');
           const targetId = request.chatSessionId === undefined ? undefined : requireString(request.chatSessionId, 'chatSessionId', 64);
-          const chat = await attachChat(socket, scopeRoot, clientKind, {
-            sessionId: targetId,
-            projectId: request.projectId as string | null | undefined,
-          });
+          const chat = await attachChat(
+            socket,
+            scopeRoot,
+            clientKind,
+            {
+              sessionId: targetId,
+              projectId: request.projectId as string | null | undefined,
+            },
+            entriesWindow,
+          );
           if (socket.destroyed) return;
           writeResponse(socket, request.id, true, {
             hostEntry: process.argv[1] ?? '',
             sessionAttachments: true,
             workspaceKey: chat.workspace.root,
             clientKind,
-            snapshot: toSnapshotData(chat.controller.getSnapshot()),
+            snapshot: attachSnapshotData(chat.controller.getSnapshot(), entriesWindow),
             runtime: toRuntimeView(chat.controller.runtime, undefined, chat.controller.getSnapshot().session),
             savedSessions: chat.controller.listSessions(),
           } satisfies AttachResult);
@@ -3288,7 +3341,14 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           privateMapId = persistent.mapId;
         }
         const controller = privateSession?.controller ?? workspace.controller;
-        if (socket.destroyed) return;
+        if (socket.destroyed) {
+          // A private session created while the client was connecting must not outlive the
+          // disconnect: with no client attached it never schedules its own cleanup, and an
+          // idle private session pins its whole workspace in memory (eviction skips it).
+          if (privateSession && !privateSession.persistent && privateMapId !== null && privateSession.clients.size === 0)
+            schedulePrivateSessionCleanup(workspace, privateMapId, privateSession, 0);
+          return;
+        }
         workspace.lastActivityAt = Date.now();
         if (privateSession) privateSession.clients.add(socket);
         else workspace.clients.add(socket);
@@ -3299,13 +3359,18 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           controller,
           privateSessionId: privateMapId,
           scopeRoot,
+          entriesWindow,
           ...(readOnly ? { readOnly: true } : {}),
         });
         const result: AttachResult = {
           hostEntry: process.argv[1] ?? '',
           sessionAttachments: true,
           clientKind,
-          snapshot: toSnapshotData(controller.getSnapshot()),
+          // The attachment binds to the workspace that hosts the session, which for a
+          // worker view is the worker's workspace, not the root the viewer named. The
+          // client must route follow-up requests by this key or they are refused.
+          workspaceKey: workspace.root,
+          snapshot: attachSnapshotData(controller.getSnapshot(), entriesWindow),
           runtime: toRuntimeView(workspace.runtime, scopeRoot, controller.getSnapshot().session),
           savedSessions: controller.listSessions(),
         };
@@ -3331,15 +3396,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (!resolved) throw new Error('Unknown command.');
         action = resolved;
       }
-      if (
-        attachment.readOnly === true &&
-        (action === 'session.send' ||
-          action === 'session.compact' ||
-          action === 'session.new' ||
-          action === 'session.load' ||
-          action === 'runtime.save-reasoning' ||
-          action === 'runtime.save-show-reasoning')
-      ) {
+      if (attachment.readOnly === true && !VIEW_ONLY_ACTIONS.has(action)) {
         throw new Error('This subagent session is view-only.');
       }
       switch (action) {
@@ -3436,6 +3493,33 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
               .map((session) => ({ ...session, running: findLiveSessionById(session.id)?.controller.isBusy ?? false })),
           );
           return;
+        case 'session.entries-range': {
+          // A windowed client pages older history it does not hold. The host always
+          // has the full transcript, so it answers in absolute indices regardless of
+          // what any one client chose to keep.
+          const entries = controller.getSnapshot().session.entries;
+          const total = entries.length;
+          const beforeRaw = request.before === undefined ? total : requireInteger(request.before, 'before', 0, Number.MAX_SAFE_INTEGER);
+          const before = Math.min(total, beforeRaw);
+          const limit = request.limit === undefined ? 50 : requireInteger(request.limit, 'limit', 1, MAX_ENTRIES_PAGE);
+          const start = Math.max(0, before - limit);
+          writeResponse(socket, request.id, true, {
+            from: start,
+            to: before,
+            total,
+            entries: entries.slice(start, before),
+          } satisfies SessionEntriesRange);
+          return;
+        }
+        case 'session.find-attachment': {
+          const id = requireString(request.attachmentId, 'attachmentId', 128);
+          const found = controller
+            .getSnapshot()
+            .session.entries.flatMap((entry) => (entry.kind === 'user' ? (entry.attachments ?? []) : []))
+            .find((file) => file.id === id && INLINE_IMAGE_MEDIA_TYPES.includes(file.mediaType));
+          writeResponse(socket, request.id, true, found ? { path: found.path, mediaType: found.mediaType } : null);
+          return;
+        }
         case 'session.load': {
           const sessionId = requireString(request.sessionId, 'sessionId', 64);
           const currentSnapshot = controller.getSnapshot();
@@ -3446,7 +3530,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (sessionId === CUSTODIAN_SESSION_ID)
             throw new Error("The machine custodian is the host's own conversation; it is not a chat to open.");
           if (controller.isBusy) throw new Error('Wait for the current run before switching chats.');
-          const chat = await attachChat(socket, attachment.scopeRoot, attachment.clientKind, { sessionId });
+          const chat = await attachChat(socket, attachment.scopeRoot, attachment.clientKind, { sessionId }, attachment.entriesWindow);
           if (socket.destroyed) return;
           writeResponse(socket, request.id, true, chat.controller.getSnapshot().session);
           return;
@@ -3462,17 +3546,30 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (controller.isBusy) throw new Error('Wait for the current run before creating a new chat.');
           if (request.projectId !== undefined && request.projectId !== null && typeof request.projectId !== 'string')
             throw new Error('Invalid project ID.');
-          await attachChat(socket, attachment.scopeRoot, attachment.clientKind, {
-            projectId: request.projectId as string | null | undefined,
-          });
+          await attachChat(
+            socket,
+            attachment.scopeRoot,
+            attachment.clientKind,
+            {
+              projectId: request.projectId as string | null | undefined,
+            },
+            attachment.entriesWindow,
+          );
           if (socket.destroyed) return;
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         }
-        case 'session.add-entry':
-          controller.addEntry(parseSessionEntry(request.entry));
+        case 'session.add-entry': {
+          const entry = parseSessionEntry(request.entry);
+          // A viewer may post display notices (the terminal surfaces warnings and
+          // slash-command output this way) but never inject a conversation entry.
+          if (attachment.readOnly === true && entry.kind !== 'notice') {
+            throw new Error('This subagent session is view-only.');
+          }
+          controller.addEntry(entry);
           writeResponse(socket, request.id, true, { accepted: true });
           return;
+        }
         case 'session.flush':
           controller.flushSave();
           writeResponse(socket, request.id, true, { saved: true });
@@ -3615,6 +3712,30 @@ function toSnapshotData(snapshot: AgentSessionSnapshot): SessionSnapshotData {
     sessionSaveError: snapshot.sessionSaveError,
     streamingAssistantIndex: streamingAssistantIndex(snapshot),
   };
+}
+
+/**
+ * The attach response for a client that asked for a tail window: only the newest
+ * `window` entries cross the wire, with the absolute index they start at and the
+ * full length, so the client can page older history on demand. The streaming
+ * index becomes window-local because the client indexes the window it received.
+ */
+function windowedSnapshotData(snapshot: AgentSessionSnapshot, window: number): SessionSnapshotData {
+  const total = snapshot.session.entries.length;
+  const from = Math.max(0, total - window);
+  const streaming = streamingAssistantIndex(snapshot);
+  return {
+    ...toSnapshotData(snapshot),
+    session: { ...snapshot.session, entries: snapshot.session.entries.slice(from) },
+    entriesFrom: from,
+    totalEntries: total,
+    streamingAssistantIndex: streaming === null || streaming < from ? null : streaming - from,
+  };
+}
+
+/** The attach snapshot a client receives: a tail window when it asked for one, the full transcript otherwise. */
+function attachSnapshotData(snapshot: AgentSessionSnapshot, entriesWindow: number | null): SessionSnapshotData {
+  return entriesWindow === null ? toSnapshotData(snapshot) : windowedSnapshotData(snapshot, entriesWindow);
 }
 
 function streamingAssistantIndex(snapshot: AgentSessionSnapshot): number | null {
@@ -3871,6 +3992,12 @@ function canonicalFileWithin(path: string, root: string, label: string): string 
 function requireString(value: unknown, name: string, maxBytes: number): string {
   if (typeof value !== 'string' || value.length === 0 || Buffer.byteLength(value, 'utf8') > maxBytes)
     throw new Error(`${name} must be a non-empty string under ${maxBytes} bytes.`);
+  return value;
+}
+
+function requireInteger(value: unknown, name: string, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max)
+    throw new Error(`${name} must be an integer between ${min} and ${max}.`);
   return value;
 }
 

@@ -18,6 +18,25 @@ vi.mock('../src/daemon.js', async (importOriginal) => {
   return { ...actual, startDaemon: daemonStart.run };
 });
 
+// A saved-worker attach builds its role-model view before it re-checks whether the
+// client is still connected. Holding that build open lets a test drop the socket
+// inside the exact window where an orphaned private session would otherwise be left
+// pinning its workspace. Off by default, so every other test binds for real.
+const roleBindGate = vi.hoisted(() => ({ hold: false, release: null as null | (() => void) }));
+vi.mock('../src/session-model-binding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/session-model-binding.js')>();
+  return {
+    ...actual,
+    bindRoleModelView: async (
+      role: Parameters<typeof actual.bindRoleModelView>[0],
+      base: Parameters<typeof actual.bindRoleModelView>[1],
+    ) => {
+      if (roleBindGate.hold) await new Promise<void>((resolve) => (roleBindGate.release = resolve));
+      return actual.bindRoleModelView(role, base);
+    },
+  };
+});
+
 const usage = {
   inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 20, text: 20, reasoning: 0 },
@@ -2850,6 +2869,158 @@ describe('shared host and session IPC', () => {
     await expect(client({ workerSessionId: '00000000-0000-4000-8000-000000000000' })).rejects.toThrow('not a subagent worker');
   }, 20_000);
 
+  it('binds a worker view to the worker workspace so follow-up reads route across workspaces', async () => {
+    const { createProject } = await import('../src/projects/store.js');
+    const workerFolder = join(root, 'worker-home');
+    mkdirSync(workerFolder);
+    const project = createProject({ name: 'Worker home', folders: [workerFolder] });
+
+    // A parent chat in another workspace spawns and settles a worker there, so the
+    // worker's own workspace root differs from the root a viewer names below.
+    const parent = await client({ clientKind: 'web', newChatSession: true, projectId: project.id });
+    let parentStep = 0;
+    model.doStream = vi.fn(async (options: { prompt?: unknown }) => {
+      const serialized = JSON.stringify(options.prompt ?? []);
+      if (serialized.includes('You are a worker:')) return textStream('WORKER-REPORT: cross-workspace view.');
+      parentStep += 1;
+      if (parentStep === 1)
+        return stream(
+          [
+            {
+              type: 'tool-call',
+              toolCallId: 'subagent-xws',
+              toolName: 'subagent',
+              input: JSON.stringify({ task: 'XWS-TASK: settle quickly', mode: 'explorer', background: false }),
+            },
+          ],
+          'tool-calls',
+        );
+      return textStream('PARENT-DONE');
+    });
+    await parent.sendMessage({ text: 'Delegate the cross-workspace view test.', images: [] });
+    await vi.waitFor(() =>
+      expect(parent.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'))).toBe(
+        true,
+      ),
+    );
+    const toolEntry = parent.getSnapshot().session.entries.find((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'));
+    const workerId = toolEntry?.kind === 'tool' ? toolEntry.session : undefined;
+    expect(workerId).toMatch(/^[0-9a-f-]{36}$/);
+    await parent.flushSave();
+
+    // After a restart no live worker remains, so the view opens from the saved transcript
+    // and binds to the workspace root recorded on that transcript.
+    await replaceFixtureHost();
+    const { loadSavedSession } = await import('../src/session-store.js');
+    const savedWorker = loadSavedSession(workerId!);
+    expect(savedWorker?.workspaceRoot).toBe(workerFolder);
+
+    // The viewer names its own workspace (root), not the worker's. The attachment binds
+    // to the worker's workspace, so a follow-up read must be routed by that binding key
+    // rather than refused as "not attached to that workspace".
+    const view = await client({ workerSessionId: workerId! });
+    expect(view.getSnapshot().session.id).toBe(workerId);
+    const range = await view.fetchEntriesRange!(view.getServerEntryCount(), 50);
+    expect(Array.isArray(range.entries)).toBe(true);
+    expect(range.total).toBe(view.getServerEntryCount());
+  }, 20_000);
+
+  it('cleans up a private worker view whose client dropped while its model was still binding', async () => {
+    const { createProject } = await import('../src/projects/store.js');
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { DAEMON_PROTOCOL_VERSION } = await import('../src/daemon-protocol.js');
+    const { randomUUID } = await import('node:crypto');
+    const { connect: netConnect } = await import('node:net');
+    const daemon = await import('../src/daemon.js');
+
+    const workerFolder = join(root, 'worker-home');
+    mkdirSync(workerFolder);
+    const project = createProject({ name: 'Worker home', folders: [workerFolder] });
+    const parent = await client({ clientKind: 'web', newChatSession: true, projectId: project.id });
+    let parentStep = 0;
+    model.doStream = vi.fn(async (options: { prompt?: unknown }) => {
+      const serialized = JSON.stringify(options.prompt ?? []);
+      if (serialized.includes('You are a worker:')) return textStream('WORKER-REPORT: orphan cleanup.');
+      parentStep += 1;
+      if (parentStep === 1)
+        return stream(
+          [
+            {
+              type: 'tool-call',
+              toolCallId: 'subagent-orphan',
+              toolName: 'subagent',
+              input: JSON.stringify({ task: 'ORPHAN-TASK: settle quickly', mode: 'explorer', background: false }),
+            },
+          ],
+          'tool-calls',
+        );
+      return textStream('PARENT-DONE');
+    });
+    await parent.sendMessage({ text: 'Delegate the orphan cleanup test.', images: [] });
+    await vi.waitFor(() =>
+      expect(parent.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'))).toBe(
+        true,
+      ),
+    );
+    const toolEntry = parent.getSnapshot().session.entries.find((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'));
+    const workerId = toolEntry?.kind === 'tool' ? toolEntry.session : undefined;
+    expect(workerId).toMatch(/^[0-9a-f-]{36}$/);
+    await parent.flushSave();
+    // Close the parent so it cannot reconnect to the restarted host and race the raw
+    // socket this test is about to open for the host-side connection capture.
+    await parent.close();
+    // No live worker survives the restart, so the next view opens from the saved
+    // transcript and must build a role-model view before it can attach.
+    await replaceFixtureHost();
+
+    // The host's own socket, not the client's: only the host's destroyed flag decides
+    // whether the suspended attach still has a reader.
+    let hostSocket: import('node:net').Socket | null = null;
+    server.on('connection', (socket) => {
+      hostSocket = socket;
+    });
+    const closeSpy = vi.spyOn(AgentSessionController.prototype, 'close');
+    closeSpy.mockClear();
+
+    roleBindGate.hold = true;
+    roleBindGate.release = null;
+    const raw = netConnect(daemon.getDaemonEndpoint());
+    await new Promise<void>((resolveConnect) => raw.once('connect', () => resolveConnect()));
+    raw.write(
+      JSON.stringify({
+        workspaceRoot: root,
+        clientKind: 'web',
+        workerSessionId: workerId,
+        version: DAEMON_PROTOCOL_VERSION,
+        id: randomUUID(),
+        action: 'attach',
+      }) + '\n',
+    );
+    try {
+      // The attach is suspended inside the role-model build, before the private session
+      // is registered. Drop the reader the host is holding, exactly as a disconnect would,
+      // then let the build finish so the attach resumes against a destroyed socket.
+      await vi.waitFor(() => expect(roleBindGate.release).not.toBeNull());
+      expect(hostSocket).not.toBeNull();
+      hostSocket!.destroy();
+      roleBindGate.release!();
+      // The orphan must schedule its own cleanup and close its controller. Without the
+      // guard it is never closed, and an idle private session pins its whole workspace.
+      await vi.waitFor(() =>
+        expect(
+          closeSpy.mock.instances.some(
+            (instance) => (instance as InstanceType<typeof AgentSessionController>).getSnapshot().session.id === workerId,
+          ),
+        ).toBe(true),
+      );
+    } finally {
+      roleBindGate.hold = false;
+      roleBindGate.release = null;
+      raw.destroy();
+      closeSpy.mockRestore();
+    }
+  }, 20_000);
+
   it('runs a background subagent and automatically wakes its idle parent for the final report', async () => {
     registerFakeTool('file_read');
     registerFakeTool('file_write');
@@ -3794,3 +3965,230 @@ it.each(['terminal', 'telegram'])(
   },
   20_000,
 );
+
+describe('windowed web attach', () => {
+  it('sends only the tail window and reports the full length and origin', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    const total = 250;
+    for (let index = 0; index < total; index += 1) builder.addEntry({ kind: 'notice', text: `entry ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBe(total));
+
+    const windowed = await openChat(sessionId, { clientKind: 'web', entriesWindow: 100 });
+    expect(windowed.getServerEntryCount()).toBe(total);
+    expect(windowed.getServerEntriesFrom()).toBe(total - 100);
+    const entries = windowed.getServerEntries();
+    expect(entries).toHaveLength(100);
+    expect(entries[0]).toMatchObject({ kind: 'notice', text: 'entry 150' });
+    expect(entries[99]).toMatchObject({ kind: 'notice', text: 'entry 249' });
+  });
+
+  it('pages older history below the window from the host in absolute indices', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    for (let index = 0; index < 200; index += 1) builder.addEntry({ kind: 'notice', text: `entry ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBe(200));
+    const windowed = await openChat(sessionId, { clientKind: 'web', entriesWindow: 50 });
+    expect(windowed.getServerEntriesFrom()).toBe(150);
+
+    const older = await windowed.fetchEntriesRange!(150, 40);
+    expect(older).toMatchObject({ from: 110, to: 150, total: 200 });
+    expect(older.entries).toHaveLength(40);
+    expect(older.entries[0]).toMatchObject({ text: 'entry 110' });
+    expect(older.entries[39]).toMatchObject({ text: 'entry 149' });
+
+    // A page that runs past the start clamps to zero rather than failing.
+    const oldest = await windowed.fetchEntriesRange!(40, 100);
+    expect(oldest).toMatchObject({ from: 0, to: 40, total: 200 });
+    expect(oldest.entries[0]).toMatchObject({ text: 'entry 0' });
+  });
+
+  it('keeps the full transcript for a client that does not ask for a window', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    for (let index = 0; index < 120; index += 1) builder.addEntry({ kind: 'notice', text: `entry ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBe(120));
+    const full = await openChat(sessionId, { clientKind: 'web' });
+    expect(full.getServerEntriesFrom()).toBe(0);
+    expect(full.getServerEntryCount()).toBe(120);
+    expect(full.getServerEntries()).toHaveLength(120);
+    expect(full.getServerEntries()[0]).toMatchObject({ text: 'entry 0' });
+  });
+
+  it('trims the window front as the transcript grows, keeping indices absolute', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    const windowed = await openChat(sessionId, { clientKind: 'web', entriesWindow: 50 });
+    expect(windowed.getServerEntriesFrom()).toBe(0);
+    for (let index = 0; index < 120; index += 1) builder.addEntry({ kind: 'notice', text: `n ${index}` });
+    await vi.waitFor(() => expect(windowed.getServerEntryCount()).toBe(120));
+    const entries = windowed.getServerEntries();
+    // Bounded by twice the window, and the host's absolute space stays intact:
+    // the window origin plus its length still equals the full transcript.
+    expect(entries.length).toBeLessThanOrEqual(100);
+    expect(windowed.getServerEntriesFrom()).toBeGreaterThan(0);
+    expect(windowed.getServerEntriesFrom() + entries.length).toBe(120);
+    expect(entries.at(-1)).toMatchObject({ text: 'n 119' });
+  });
+
+  it('appends a live turn into the window with translated indices', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    for (let index = 0; index < 80; index += 1) builder.addEntry({ kind: 'notice', text: `history ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBe(80));
+    const windowed = await openChat(sessionId, { clientKind: 'web', entriesWindow: 30 });
+    expect(windowed.getServerEntriesFrom()).toBe(50);
+
+    await windowed.sendMessage({ text: 'A new question.', images: [] });
+    await vi.waitFor(() =>
+      expect(windowed.getServerEntries().some((entry) => entry.kind === 'assistant' && entry.text === 'Fixture response')).toBe(true),
+    );
+    expect(windowed.getServerEntryCount()).toBeGreaterThan(80);
+    expect(windowed.getServerEntriesFrom() + windowed.getServerEntries().length).toBe(windowed.getServerEntryCount());
+    const tail = windowed.getServerEntries();
+    expect(tail.some((entry) => entry.kind === 'user' && entry.text === 'A new question.')).toBe(true);
+    expect(tail.at(-1)).toMatchObject({ kind: 'assistant', text: 'Fixture response' });
+  });
+
+  it('resolves an attachment that sits below the window through the host', async () => {
+    fixtureVision = true;
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6C9sAAAAASUVORK5CYII=';
+    await builder.sendMessage({ text: 'Inspect this.', images: [{ base64: png, mediaType: 'image/png' }] });
+    await vi.waitFor(() =>
+      expect(builder.getServerEntries().some((entry) => entry.kind === 'user' && (entry.attachments?.length ?? 0) > 0)).toBe(true),
+    );
+    const attachment = builder.getServerEntries().flatMap((entry) => (entry.kind === 'user' ? (entry.attachments ?? []) : []))[0]!;
+    for (let index = 0; index < 60; index += 1) builder.addEntry({ kind: 'notice', text: `pad ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBeGreaterThan(60));
+
+    const windowed = await openChat(sessionId, { clientKind: 'web', entriesWindow: 20 });
+    expect(windowed.getServerEntriesFrom()).toBeGreaterThan(0);
+    // The turn holding the image is below the window, so a local search finds nothing.
+    expect(windowed.getServerEntries().flatMap((entry) => (entry.kind === 'user' ? (entry.attachments ?? []) : []))).toHaveLength(0);
+    expect(await windowed.findAttachment!(attachment.id)).toEqual({ path: attachment.path, mediaType: attachment.mediaType });
+    expect(await windowed.findAttachment!('missing-id')).toBeNull();
+  });
+
+  it('windows the snapshot event it pushes on chat attach, not only the attach response', async () => {
+    const builder = await newChat();
+    const sessionId = builder.getSnapshot().session.id;
+    for (let index = 0; index < 250; index += 1) builder.addEntry({ kind: 'notice', text: `entry ${index}` });
+    await vi.waitFor(() => expect(builder.getServerEntryCount()).toBe(250));
+
+    const { createConnection } = await import('node:net');
+    const { DaemonFrameDecoder } = await import('../src/daemon-frames.js');
+    const { DAEMON_PROTOCOL_VERSION } = await import('../src/daemon-protocol.js');
+    const daemon = await import('../src/daemon.js');
+
+    // Read the raw frames the host writes: a windowed client must never be sent the
+    // full transcript as a snapshot event, which would defeat the window and destroy
+    // the socket once the chat outgrows the frame limit.
+    const frames: any[] = await new Promise((resolvePromise, rejectPromise) => {
+      const socket = createConnection(daemon.getDaemonEndpoint());
+      const decoder = new DaemonFrameDecoder(32 * 1024 * 1024);
+      const collected: any[] = [];
+      const timer = setTimeout(() => {
+        socket.destroy();
+        rejectPromise(new Error('raw windowed attach timed out'));
+      }, 10_000);
+      socket.on('connect', () => {
+        socket.write(
+          JSON.stringify({
+            version: DAEMON_PROTOCOL_VERSION,
+            id: 'raw-attach-1',
+            action: 'attach',
+            workspaceRoot: root,
+            clientKind: 'web',
+            chatSessionId: sessionId,
+            entriesWindow: 100,
+          }) + '\n',
+        );
+      });
+      socket.on('data', (chunk: Buffer) => {
+        for (const frame of decoder.append(chunk)) {
+          collected.push(JSON.parse(frame.toString('utf8')));
+          if (collected.some((f) => f.event === 'snapshot') && collected.some((f) => f.id === 'raw-attach-1')) {
+            clearTimeout(timer);
+            socket.destroy();
+            resolvePromise(collected);
+          }
+        }
+      });
+      socket.on('error', (error) => {
+        clearTimeout(timer);
+        rejectPromise(error);
+      });
+    });
+
+    const snapshotEvent = frames.find((f) => f.event === 'snapshot');
+    expect(snapshotEvent).toBeTruthy();
+    expect(snapshotEvent.snapshot.entriesFrom).toBe(150);
+    expect(snapshotEvent.snapshot.totalEntries).toBe(250);
+    expect(snapshotEvent.snapshot.session.entries).toHaveLength(100);
+    const response = frames.find((f) => f.id === 'raw-attach-1');
+    expect(response.ok).toBe(true);
+    expect(response.result.snapshot.session.entries).toHaveLength(100);
+  }, 20_000);
+});
+
+describe('view-only worker attachment', () => {
+  it('refuses conversation injection and settings writes, but keeps notices, control and reads', async () => {
+    const viewer = await newChat();
+    let parentStep = 0;
+    model.doStream = vi.fn(async (options: { prompt?: unknown }) => {
+      const serialized = JSON.stringify(options.prompt ?? []);
+      if (serialized.includes('You are a worker:')) return textStream('WORKER-REPORT: guard test done.');
+      parentStep += 1;
+      if (parentStep === 1)
+        return stream(
+          [
+            {
+              type: 'tool-call',
+              toolCallId: 'subagent-guard',
+              toolName: 'subagent',
+              input: JSON.stringify({ task: 'GUARD-TASK: settle quickly', mode: 'explorer', background: false }),
+            },
+          ],
+          'tool-calls',
+        );
+      return textStream('PARENT-AFTER-GUARD');
+    });
+
+    await viewer.sendMessage({ text: 'Delegate the guard test.', images: [] });
+    await vi.waitFor(() =>
+      expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'))).toBe(
+        true,
+      ),
+    );
+    const toolEntry = viewer.getSnapshot().session.entries.find((entry) => entry.kind === 'tool' && entry.result.includes('WORKER-REPORT'));
+    const workerId = toolEntry?.kind === 'tool' ? toolEntry.session : undefined;
+    expect(workerId).toMatch(/^[0-9a-f-]{36}$/);
+
+    // A settled worker opens view-only from its saved transcript.
+    await replaceFixtureHost();
+    const view = await client({ workerSessionId: workerId! });
+    expect(view.getSnapshot().session.id).toBe(workerId);
+
+    // A viewer may not inject a conversation entry into the worker's transcript.
+    view.addEntry({ kind: 'user', text: 'INJECTED-TURN' });
+    await vi.waitFor(() =>
+      expect(view.getSnapshot().session.entries.some((entry) => entry.kind === 'notice' && entry.text.includes('view-only'))).toBe(true),
+    );
+    expect(view.getServerEntries().some((entry) => entry.kind === 'user' && entry.text === 'INJECTED-TURN')).toBe(false);
+
+    // A machine-wide approval-mode change is a settings write a viewer must not make.
+    await expect(view.setApprovalMode('full-access')).rejects.toThrow('view-only');
+
+    // Display notices still work (the terminal surfaces warnings and slash output this way).
+    view.addEntry({ kind: 'notice', text: 'VIEWER-DISPLAY-NOTE' });
+    await vi.waitFor(() =>
+      expect(view.getServerEntries().some((entry) => entry.kind === 'notice' && entry.text === 'VIEWER-DISPLAY-NOTE')).toBe(true),
+    );
+
+    // Reads still work for a view-only attachment.
+    await expect(view.fetchEntriesRange!(view.getServerEntryCount(), 50)).resolves.toBeTruthy();
+    expect(await view.findAttachment!('missing-id')).toBeNull();
+  }, 20_000);
+});

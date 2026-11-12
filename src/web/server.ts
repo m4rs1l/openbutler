@@ -49,7 +49,7 @@ import {
 import { pickProjectFolder } from './folder-picker.js';
 import { attachTerminalServer } from './terminal-server.js';
 import { readWorkspaceFiles, readWorkspaceFileTree, WorkspaceFilesError } from './files.js';
-import { WebSessions, SessionRequestError } from './sessions.js';
+import { WebSessions, SessionRequestError, WEB_ENTRIES_WINDOW } from './sessions.js';
 import { BoundedSseWriter } from './sse-output.js';
 import { resolveShell } from '../tools/shell.js';
 
@@ -157,6 +157,8 @@ export interface WebServerOptions {
 export interface WebServer {
   readonly url: string;
   readonly pairUrl: string;
+  /** The underlying HTTP server, for socket-level diagnostics and tests. */
+  readonly server: Server;
   /** Re-issues a one-time pairing link, for a second browser or after the first expired. */
   newPairUrl(): string;
   close(): Promise<void>;
@@ -167,6 +169,10 @@ interface SseClient {
   res: ServerResponse;
   writer: BoundedSseWriter;
   lastEntries: Entry[] | null;
+  /** Absolute host index the last window started at; a change means the window slid and a patch can no longer address it. */
+  lastEntriesFrom: number;
+  /** Full transcript length at the last broadcast, so a shrink (compaction) is noticed even while the window stays the same size. */
+  lastTotal: number;
   sessionId: string;
   /** When this stream last carried a byte, so a close can say how silent it was. */
   lastWriteAt: number;
@@ -304,7 +310,10 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
   const startedAt = Date.now();
   // The web server is a chat client like the terminal: it opens the chat the
   // owner left off in, and the custodian stays the host's own conversation.
-  const client: AgentSessionClient = await connectDaemonSession(options.workspaceRoot, resumeChatAttach('web'));
+  const client: AgentSessionClient = await connectDaemonSession(options.workspaceRoot, {
+    ...resumeChatAttach('web'),
+    entriesWindow: WEB_ENTRIES_WINDOW,
+  });
   const sessions = new WebSessions(client, options.workspaceRoot);
 
   // A paired browser must stay paired across restarts: the owner's phone and
@@ -329,12 +338,18 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 
   const snapshotPayload = (entries: Entry[], reset: boolean, from: number, source: AgentSessionClient) => {
     const snapshot = source.getSnapshot();
+    // One value feeds both fields: the host flag is authoritative, and the window
+    // scan is only a fallback, so `projectLocked` must not re-read the raw flag and
+    // disagree with the `hasUserMessage` the browser was told.
+    const hasUserMessage = snapshot.session.hasUserMessage ?? source.getServerEntries().some((entry) => entry.kind === 'user');
     return {
       reset,
       entries,
       updated: [] as { index: number; entry: Entry }[],
-      from,
-      totalEntries: source.getServerEntries().length,
+      // `from` arrives as an index into the window this server holds; the browser
+      // addresses the whole transcript, so shift it into the host's absolute space.
+      from: source.getServerEntriesFrom() + from,
+      totalEntries: source.getServerEntryCount(),
       busy: snapshot.busy,
       runningTurnId: snapshot.runningTurnId,
       queuedMessageCount: snapshot.queuedMessageCount,
@@ -359,9 +374,9 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       session: {
         id: snapshot.session.id,
         title: snapshot.session.title,
-        hasUserMessage: snapshot.session.hasUserMessage ?? source.getServerEntries().some((entry) => entry.kind === 'user'),
+        hasUserMessage,
         ...(snapshot.session.project ? { project: snapshot.session.project } : {}),
-        projectLocked: snapshot.session.project?.locked === true || snapshot.session.hasUserMessage === true,
+        projectLocked: snapshot.session.project?.locked === true || hasUserMessage === true,
       },
       buildId: currentBuildId(),
     };
@@ -393,6 +408,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     if (catalogChanged) for (const target of clients) writeEvent(target, 'sessions-changed', {});
     if (clients.size === 0) return;
     const entries = client.getServerEntries() as Entry[];
+    const entriesFrom = client.getServerEntriesFrom();
+    const total = client.getServerEntryCount();
     for (const target of clients) {
       if (target.sessionId !== boundId) continue;
       if (client.getSnapshot().session.id !== boundId) {
@@ -401,16 +418,21 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       }
       const previous = target.lastEntries;
       const sessionChanged = target.sessionId !== client.getSnapshot().session.id;
+      // The window can slide (the client trimmed its front) or the transcript can
+      // shrink (a compaction). Either makes a local-index patch address the wrong
+      // entries, so both force a fresh window rather than a corrupting delta.
+      const windowSlid = entriesFrom !== target.lastEntriesFrom;
+      const shrunk = total < target.lastTotal;
       let payload: ReturnType<typeof snapshotPayload>;
       let resetReason: string | null = null;
-      if (!previous || sessionChanged || entries.length < previous.length) {
-        resetReason = !previous ? 'first' : sessionChanged ? 'session' : 'shrunk';
+      if (!previous || sessionChanged || windowSlid || shrunk) {
+        resetReason = !previous ? 'first' : sessionChanged ? 'session' : shrunk ? 'shrunk' : 'window';
         const from = tailWindowStart(entries);
         payload = snapshotPayload(entries.slice(from), true, from, client);
       } else {
         const updated: { index: number; entry: Entry }[] = [];
         for (let index = 0; index < previous.length; index += 1) {
-          if (entries[index] !== previous[index]) updated.push({ index, entry: entries[index] });
+          if (entries[index] !== previous[index]) updated.push({ index: entriesFrom + index, entry: entries[index] });
         }
         // A reset is not a cheaper patch: it replaces the reader's list with the
         // newest window, so every group is rebuilt and the reader loses the place
@@ -437,10 +459,12 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         logger.info('web.stream.reset', {
           reason: resetReason,
           from: payload.from,
-          total: entries.length,
+          total,
           previous: previous?.length ?? null,
         });
       target.lastEntries = entries;
+      target.lastEntriesFrom = entriesFrom;
+      target.lastTotal = total;
       target.sessionId = client.getSnapshot().session.id;
       writeEvent(target, payload.reset ? 'snapshot' : 'patch', payload);
     }
@@ -1144,9 +1168,14 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const snapshot = client.getSnapshot();
       if (url.searchParams.get('sessionId') !== snapshot.session.id) return sendJson(res, 404, { error: 'Image unavailable.' });
       const id = url.searchParams.get('id');
-      const attachment = snapshot.session.entries
-        .flatMap((entry) => (entry.kind === 'user' ? (entry.attachments ?? []) : []))
-        .find((file) => file.id === id && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.mediaType));
+      if (!id) return sendJson(res, 404, { error: 'Image unavailable.' });
+      // A windowed client may not hold the turn an attachment belongs to, so the
+      // host resolves it across the full transcript; a full client searches locally.
+      const attachment = client.findAttachment
+        ? await client.findAttachment(id)
+        : snapshot.session.entries
+            .flatMap((entry) => (entry.kind === 'user' ? (entry.attachments ?? []) : []))
+            .find((file) => file.id === id && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.mediaType));
       if (!attachment) return sendJson(res, 404, { error: 'Image unavailable.' });
       try {
         verifyAttachmentPath(attachment.path);
@@ -1168,17 +1197,32 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const snapshot = client.getSnapshot();
       if (url.searchParams.get('sessionId') !== snapshot.session.id) return sendJson(res, 409, { error: 'The active chat changed.' });
       const entries = client.getServerEntries() as Entry[];
-      const beforeRaw = Number(url.searchParams.get('before') ?? entries.length);
+      const entriesFrom = client.getServerEntriesFrom();
+      const total = client.getServerEntryCount();
+      const beforeRaw = Number(url.searchParams.get('before') ?? total);
       const limitRaw = Number(url.searchParams.get('limit') ?? 50);
-      const before = Number.isFinite(beforeRaw) ? Math.max(0, Math.min(Math.floor(beforeRaw), entries.length)) : entries.length;
+      const before = Number.isFinite(beforeRaw) ? Math.max(0, Math.min(Math.floor(beforeRaw), total)) : total;
       const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(Math.floor(limitRaw), MAX_PAGE_ENTRIES)) : 50;
       const start = Math.max(0, before - limit);
+      // The window is the tail `[entriesFrom, total)`. A page that reaches below it
+      // is history this server no longer holds, so the host answers it in absolute
+      // indices; a page inside the window is sliced locally and shifted back.
+      if (client.fetchEntriesRange && start < entriesFrom) {
+        const range = await client.fetchEntriesRange(before, limit);
+        return sendJson(res, 200, {
+          sessionId: snapshot.session.id,
+          from: range.from,
+          to: range.to,
+          total: range.total,
+          entries: range.entries,
+        });
+      }
       return sendJson(res, 200, {
-        sessionId: client.getSnapshot().session.id,
+        sessionId: snapshot.session.id,
         from: start,
         to: before,
-        total: entries.length,
-        entries: entries.slice(start, before),
+        total,
+        entries: entries.slice(start - entriesFrom, before - entriesFrom),
       });
     }
 
@@ -1193,16 +1237,23 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       let socketError: string | null = null;
       // A socket error is the one signal that separates "the browser went away"
       // from "this machine could not write any more".
-      res.on('error', (problem: Error) => {
+      const onResponseError = (problem: Error) => {
         socketError = problem.name;
-      });
-      req.socket.on('error', (problem: Error) => {
+      };
+      const onSocketError = (problem: Error) => {
         socketError = problem.name;
-      });
+      };
+      res.on('error', onResponseError);
+      // The socket outlives this request under keep-alive, so its listener must be
+      // removed when the stream closes; otherwise every reconnect on a reused
+      // socket piles up another handler (and its closure) on the same socket.
+      req.socket.on('error', onSocketError);
       const target: SseClient = {
         res,
         writer: new BoundedSseWriter(res),
         lastEntries: null,
+        lastEntriesFrom: client.getServerEntriesFrom(),
+        lastTotal: client.getServerEntryCount(),
         sessionId: client.getSnapshot().session.id,
         lastWriteAt: Date.now(),
       };
@@ -1211,6 +1262,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       clients.add(target);
       const entries = client.getServerEntries() as Entry[];
       target.lastEntries = entries;
+      target.lastEntriesFrom = client.getServerEntriesFrom();
+      target.lastTotal = client.getServerEntryCount();
       const from = tailWindowStart(entries);
       writeEvent(target, 'snapshot', snapshotPayload(entries.slice(from), true, from, client));
       const heartbeat = setInterval(() => {
@@ -1228,6 +1281,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       const device = /iphone|ipad|android/i.test(agent) ? 'mobile' : 'desktop';
       logger.info('web.stream.open', { device, port: req.socket.remotePort ?? null, agent: agent.slice(0, 80), clients: clients.size });
       req.on('close', () => {
+        req.socket.removeListener('error', onSocketError);
+        res.removeListener('error', onResponseError);
         release();
         clearInterval(heartbeat);
         clients.delete(target);
@@ -1283,11 +1338,16 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       // the session, so a message carries neither and no surface can move the
       // chat from the outside.
       // The run outlives this request. Waiting for it here made a phone browser
-      // abandon the request with a network error on any long turn, so the message
-      // is handed over and the answer returns at once; progress arrives over SSE.
-      void client.sendMessage({ text, images }).catch((problem: unknown) => {
+      // abandon the request with a network error on any long turn, so the
+      // answer returns as soon as the host accepts the message; progress
+      // arrives over SSE. Acceptance is awaited, because a 200 for a message
+      // the host never accepted would lose it silently (web.log is not a user).
+      try {
+        await client.sendMessage({ text, images });
+      } catch (problem: unknown) {
         logger.warn('web.message.failed', { error: problem instanceof Error ? problem.message : String(problem) });
-      });
+        return sendJson(res, 502, { error: 'The message was not accepted. Please try again.' });
+      }
       return sendJson(res, 200, { ok: true });
     }
 
@@ -1446,6 +1506,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
   return {
     url: browserWebAddress(host, port),
     pairUrl,
+    server,
     newPairUrl: issuePairToken,
     async close() {
       settingsWatcher.stop();

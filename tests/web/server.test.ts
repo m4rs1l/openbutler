@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { browserWebAddress, startWebServer, tailWindowStart, type WebServer } from '../../src/web/server.js';
+import { WEB_ENTRIES_WINDOW } from '../../src/web/sessions.js';
 import {
   BRAND_LOGO_URL,
   BRAND_FAVICON_SVG_URL,
@@ -75,6 +76,8 @@ const client = {
   // The merged view carries this client's own notices; index-addressed callers
   // read the host entries only.
   getServerEntries: () => snapshot.session.entries.filter((entry) => !localNotices.has(entry)),
+  getServerEntriesFrom: () => 0,
+  getServerEntryCount: () => snapshot.session.entries.filter((entry) => !localNotices.has(entry)).length,
   subscribe: (listener: () => void) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
@@ -125,6 +128,8 @@ function actor(id: string): AgentSessionClient {
     },
     getSnapshot: () => state,
     getServerEntries: () => state.session.entries,
+    getServerEntriesFrom: () => 0,
+    getServerEntryCount: () => state.session.entries.length,
     subscribe: (listener: () => void) => {
       subscribers.add(listener);
       return () => subscribers.delete(listener);
@@ -411,9 +416,13 @@ describe('browser session controls', () => {
       ...Array.from({ length: 120 }, () => ({ kind: 'assistant' as const, text: 'Fixture' })),
     ];
     const response = await fetch(`${server.url}/api/snapshot`, { headers: { cookie } });
-    const payload = (await response.json()) as { session: { hasUserMessage: boolean }; entries: SessionEntry[] };
+    const payload = (await response.json()) as { session: { hasUserMessage: boolean; projectLocked: boolean }; entries: SessionEntry[] };
     expect(payload.session.hasUserMessage).toBe(true);
     expect(payload.entries.some((entry) => entry.kind === 'user')).toBe(false);
+    // The lock the browser is told must agree with the presence it was told: a chat
+    // with a user message is locked even when the host flag is absent and presence
+    // was recovered from the window scan.
+    expect(payload.session.projectLocked).toBe(true);
   });
   it('routes messages and stop controls to the addressed chat, with no cross-chat fallback', async () => {
     snapshot.busy = true;
@@ -444,7 +453,11 @@ describe('browser session controls', () => {
     expect(send).toHaveBeenCalledWith({ text: 'Hello', images: [] });
   });
   it('declares web identity on the connection and ignores identity in the HTTP message body', async () => {
-    expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', { clientKind: 'web', chatSessionId: 'session-a' });
+    expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', {
+      clientKind: 'web',
+      chatSessionId: 'session-a',
+      entriesWindow: WEB_ENTRIES_WINDOW,
+    });
     const response = await post('/api/message', {
       text: 'Browser message',
       sessionId: 'session-a',
@@ -468,23 +481,32 @@ describe('browser session controls', () => {
     ).toBe(400);
     expect(send).not.toHaveBeenCalled();
   });
-  it('answers a send without waiting for the run it started', async () => {
+  it('answers once the host accepts the send, without waiting for the run', async () => {
     let release!: () => void;
-    const running = new Promise<void>((resolve) => {
+    const accepted = new Promise<void>((resolve) => {
       release = resolve;
     });
     send.mockImplementationOnce(async () => {
-      await running;
+      await accepted;
+      // The daemon accepted the message; the run continues server-side.
       return undefined;
     });
     const started = Date.now();
-    const response = await post('/api/message', { text: 'long task', sessionId: 'session-a' });
-    const elapsed = Date.now() - started;
-    expect(response.status).toBe(200);
-    // A phone browser abandons a request that stays open for the whole turn.
-    expect(elapsed).toBeLessThan(1000);
+    const response = post('/api/message', { text: 'long task', sessionId: 'session-a' });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith({ text: 'long task', images: [] }));
+    // The run is still going while the answer comes back after acceptance.
     release();
-    await running;
+    const result = await response;
+    expect(result.status).toBe(200);
+    expect(Date.now() - started).toBeLessThan(1000);
+    await accepted;
+  });
+
+  it('reports a send the host never accepted instead of answering 200', async () => {
+    send.mockRejectedValueOnce(new Error('host unreachable'));
+    const response = await post('/api/message', { text: 'lost?', sessionId: 'session-a' });
+    expect(response.status).toBe(502);
+    expect(send).toHaveBeenCalledWith({ text: 'lost?', images: [] });
   });
   it('lists configured models without credentials and accepts only configured choices', async () => {
     const models = await (await fetch(`${server.url}/api/models`, { headers: { cookie } })).json();
@@ -697,4 +719,32 @@ describe('browser session controls', () => {
       await reader.cancel();
     }
   });
+
+  it('removes its socket error listener when an SSE stream closes', async () => {
+    // The socket outlives one request under keep-alive, so a handler that registers
+    // an error listener on it must take that listener back off when the stream ends;
+    // otherwise every reconnect on a reused socket piles up another closure.
+    const { connect: netConnect } = await import('node:net');
+    const address = new URL(server.url);
+    let serverSocket: import('node:net').Socket | undefined;
+    server.server.once('connection', (socket) => {
+      serverSocket = socket;
+    });
+    const clientSocket = netConnect({ host: address.hostname, port: Number(address.port) });
+    await new Promise<void>((resolveConnect) => clientSocket.once('connect', () => resolveConnect()));
+    await vi.waitFor(() => expect(serverSocket).toBeDefined());
+    const baseline = serverSocket!.listeners('error');
+    let received = '';
+    clientSocket.on('data', (chunk: Buffer) => {
+      received += chunk.toString('utf8');
+    });
+    clientSocket.write(
+      `GET /api/events HTTP/1.1\r\nHost: ${address.host}\r\nCookie: ${cookie}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n`,
+    );
+    await vi.waitFor(() => expect(received).toContain('event: snapshot'));
+    const added = serverSocket!.listeners('error').filter((listener) => !baseline.includes(listener));
+    expect(added).toHaveLength(1);
+    clientSocket.destroy();
+    await vi.waitFor(() => expect(serverSocket!.listeners('error')).not.toContain(added[0]));
+  }, 15_000);
 });

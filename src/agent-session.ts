@@ -17,6 +17,7 @@ import {
   type SavedSession,
   type SessionEntry,
   type SessionEntryMeta,
+  type SessionEntriesRange,
   type SessionSummary,
   type NoticeTone,
 } from './session-store.js';
@@ -255,6 +256,18 @@ export interface AgentSessionClient {
    * point at the wrong entries the moment one arrives or expires.
    */
   getServerEntries: () => readonly SessionEntry[];
+  /**
+   * Absolute host index of `getServerEntries()[0]`. A client that holds the full
+   * transcript reports 0; one that holds only a tail window reports where that
+   * window begins, so an index-addressed consumer can translate to host space.
+   */
+  getServerEntriesFrom: () => number;
+  /** Full transcript length, which a windowed client's `getServerEntries()` does not reach. */
+  getServerEntryCount: () => number;
+  /** Pages older history from the host when this client holds only a tail window. */
+  fetchEntriesRange?: (before: number, limit: number) => Promise<SessionEntriesRange>;
+  /** Resolves an attachment by id across the full transcript, including history below the window. */
+  findAttachment?: (id: string) => Promise<{ path: string; mediaType: string } | null>;
   subscribe: (listener: () => void) => () => void;
   readonly isBusy: boolean;
   addEntry(entry: SessionEntry): void;
@@ -509,6 +522,9 @@ export class AgentSessionController implements AgentSessionClient {
   }
   /** The controller has no client-local notices, so both views are the same. */
   getServerEntries = (): readonly SessionEntry[] => this.snapshot.session.entries;
+  /** The controller holds the whole transcript, so its window starts at 0 and spans everything. */
+  getServerEntriesFrom = (): number => 0;
+  getServerEntryCount = (): number => this.snapshot.session.entries.length;
   get isBusy(): boolean {
     return this.busy;
   }

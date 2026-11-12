@@ -2,6 +2,15 @@ import type { AgentSessionClient } from '../agent-session.js';
 import { connectDaemonSession } from '../daemon-client.js';
 import type { SessionSummary } from '../session-store.js';
 
+/**
+ * How much transcript a web connection keeps in memory. The browser only ever
+ * renders a tail window and pages older history on demand, so the server has no
+ * reason to hold a whole long chat — and a transcript large enough to exceed the
+ * IPC frame limit would otherwise fail to attach at all. The terminal does not
+ * window: its scrollback geometry needs every entry.
+ */
+export const WEB_ENTRIES_WINDOW = 400;
+
 type Connection = { client: AgentSessionClient; unsubscribe: () => void; views: number; touched: number; signature: string };
 
 export class SessionRequestError extends Error {
@@ -88,7 +97,7 @@ export class WebSessions {
       this.makeRoom();
       this.opening++;
       try {
-        return this.remember(await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', chatSessionId: id }));
+        return this.remember(await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', chatSessionId: id, entriesWindow: WEB_ENTRIES_WINDOW }));
       } finally {
         this.opening--;
       }
@@ -105,7 +114,7 @@ export class WebSessions {
     this.makeRoom();
     this.opening++;
     try {
-      const client = await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', newChatSession: true, projectId });
+      const client = await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', newChatSession: true, projectId, entriesWindow: WEB_ENTRIES_WINDOW });
       if (client.getSnapshot().session.id === this.defaultClient.getSnapshot().session.id) {
         void client.close();
         throw new Error('The host did not open a new chat.');
