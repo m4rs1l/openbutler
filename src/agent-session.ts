@@ -26,7 +26,7 @@ import { isToolRequestWhitelisted, rememberToolRequest } from './tool-permission
 import { daemonCommandAction } from './commands/registry.js';
 import { ensureHostOwnedRoots } from './host-owned-paths.js';
 import { consumeApproval, recordDeniedAction } from './review-overrides.js';
-import { resolveReasoningVariant, type ReasoningSupport, type ReasoningVariant } from './provider/registry.js';
+import { mergeProviderOptions, resolveReasoningVariant, type ReasoningSupport, type ReasoningVariant } from './provider/registry.js';
 import type { ModelState } from './model-state.js';
 import { geminiToolSchemaSanitizer } from './provider/gemini-schema.js';
 import { isProviderCommand, runProviderCommand } from './provider/provider-command.js';
@@ -137,6 +137,11 @@ export interface AgentEnvironment extends AgentSessionRuntimeView {
   supportsImageToolResult: boolean;
   disableImageInput?: () => void;
   getReasoningProviderOptions: (variantId: string, visible: boolean) => ReasoningVariant['providerOptions'];
+  /**
+   * The provider options fragment naming this chat's conversation to a gateway
+   * that supports session affinity; absent where the provider documents none.
+   */
+  sessionAffinityProviderOptions?: (sessionId: string) => ReasoningVariant['providerOptions'];
   /** Cheapest expressible reasoning options for permission reviews; live with model switches. */
   getReviewProviderOptions: () => ReasoningVariant['providerOptions'];
   registry: ToolRegistry;
@@ -539,6 +544,18 @@ export class AgentSessionController implements AgentSessionClient {
     const state = this.currentState();
     return state ? state.getReasoningProviderOptions(variantId, visible) : this.runtime.getReasoningProviderOptions(variantId, visible);
   }
+  /**
+   * What every model request of this chat carries: the effort level it maps
+   * to, plus the gateway session id that pins this conversation to one
+   * credential's cache. A provider that documents no session affinity merges
+   * to the reasoning options alone. Title generation is deliberately not in
+   * here: it is a different conversation and must not share the pin.
+   */
+  private stateRequestProviderOptions(variantId: string, visible: boolean): ReasoningVariant['providerOptions'] {
+    const state = this.currentState();
+    const affinity = state ? state.sessionAffinityProviderOptions : this.runtime.sessionAffinityProviderOptions;
+    return mergeProviderOptions(this.stateReasoningOptions(variantId, visible), affinity ? affinity(this.session.id) : {});
+  }
   private stateContextWindowTokens(): number | null {
     return this.currentState()?.contextWindowTokens ?? this.runtime.contextWindowTokens;
   }
@@ -707,7 +724,8 @@ export class AgentSessionController implements AgentSessionClient {
       // every later retry. Waiters still receive the original writer failure.
       if (this.sessionSavePromise === saving) this.sessionSavePromise = null;
       this.publish(false);
-      if (!this.closed && !sameSessionContent(sessionContentStamp(this.persistableSession()), this.lastPersistedContent)) this.scheduleSave();
+      if (!this.closed && !sameSessionContent(sessionContentStamp(this.persistableSession()), this.lastPersistedContent))
+        this.scheduleSave();
     }
   }
 
@@ -1056,6 +1074,9 @@ export class AgentSessionController implements AgentSessionClient {
       reasoningMetadataSource: this.runtime.reasoningMetadataSource,
       reasoningSupport: this.runtime.reasoningSupport,
       getReasoningProviderOptions: this.runtime.getReasoningProviderOptions,
+      ...(this.runtime.sessionAffinityProviderOptions
+        ? { sessionAffinityProviderOptions: this.runtime.sessionAffinityProviderOptions }
+        : {}),
       registry: this.runtime.registry,
     };
   }
@@ -2327,7 +2348,7 @@ export class AgentSessionController implements AgentSessionClient {
                       ? {
                           force: true,
                           ...(pendingCompaction.recovery ? { recovery: true } : {}),
-                          providerOptions: this.stateReasoningOptions(this.sessionReasoning(), this.sessionShowReasoning()),
+                          providerOptions: this.stateRequestProviderOptions(this.sessionReasoning(), this.sessionShowReasoning()),
                         }
                       : {}),
                     onStart: () => {
@@ -2426,7 +2447,7 @@ export class AgentSessionController implements AgentSessionClient {
               },
               getProviderOptions: () => {
                 const live = this.liveTurnPreferences();
-                return this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
+                return this.stateRequestProviderOptions(live.reasoningVariantId, live.showReasoning);
               },
               onTextDelta: (delta) => {
                 streamedTextReceived = true;
@@ -2512,7 +2533,7 @@ export class AgentSessionController implements AgentSessionClient {
               },
               getProviderOptions: () => {
                 const live = this.liveTurnPreferences();
-                return this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
+                return this.stateRequestProviderOptions(live.reasoningVariantId, live.showReasoning);
               },
               onTextDelta: (delta) => {
                 this.activeEventAssistantText += delta;
@@ -2735,7 +2756,7 @@ export class AgentSessionController implements AgentSessionClient {
         outputLimitTokens: this.stateOutputLimitTokens(),
         ...(this.lastContextUsage !== undefined ? { previousContextTokens: this.lastContextUsage } : {}),
         ...(this.lastContextEstimate !== undefined ? { previousContextEstimateTokens: this.lastContextEstimate } : {}),
-        providerOptions: this.stateReasoningOptions(this.sessionReasoning(), this.sessionShowReasoning()),
+        providerOptions: this.stateRequestProviderOptions(this.sessionReasoning(), this.sessionShowReasoning()),
         onStepUsage: (report) => this.onStepUsage(report, 'compaction'),
         onStart: () => {
           this.flushStreamedEntries();

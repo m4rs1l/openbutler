@@ -20,6 +20,7 @@ import {
   reasoningSupportStatus,
   resolveReasoningVariant,
   routingProviderOptions,
+  sessionAffinityProviderOptions,
   supportsImageToolResult,
   type ReasoningVariant,
   type ResolvedProvider,
@@ -421,6 +422,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
           const effective = resolveReasoningVariant(parts.variants, variantId);
           return mergeProviderOptions(withReasoningVisibility(parts.resolved, effective.providerOptions, visible), parts.routing);
         },
+        sessionAffinityProviderOptions: (sessionId: string) => sessionAffinityProviderOptions(parts.resolved, sessionId),
         get registry() {
           return registryFor(parts.inputModalities);
         },
@@ -464,6 +466,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         reasoningMetadataSource: runtime.reasoningMetadataSource,
         reasoningSupport: runtime.reasoningSupport,
         getReasoningProviderOptions: (variantId: string, visible: boolean) => runtime.getReasoningProviderOptions(variantId, visible),
+        sessionAffinityProviderOptions: (sessionId: string) => sessionAffinityProviderOptions(activeResolved, sessionId),
         get registry() {
           return runtime.registry;
         },
@@ -573,6 +576,7 @@ export async function createAgentRuntime(options: CreateAgentRuntimeOptions = {}
         const effective = resolveReasoningVariant(activeVariants, variantId);
         return mergeProviderOptions(withReasoningVisibility(activeResolved, effective.providerOptions, visible), activeRouting);
       },
+      sessionAffinityProviderOptions: (sessionId) => sessionAffinityProviderOptions(activeResolved, sessionId),
       getReviewProviderOptions: () =>
         mergeProviderOptions(
           reviewer.resolved

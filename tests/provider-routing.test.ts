@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { mergeProviderOptions, routingProviderOptions, type ResolvedProvider } from '../src/provider/registry.js';
+import {
+  mergeProviderOptions,
+  routingProviderOptions,
+  sessionAffinityProviderOptions,
+  type ResolvedProvider,
+} from '../src/provider/registry.js';
 
 function provider(npm: string, id = 'test'): ResolvedProvider {
   return { id, displayName: id, npm, apiKey: null, apiKeys: [], baseURL: undefined, options: {}, custom: false };
@@ -31,6 +36,28 @@ describe('routing adapter table', () => {
     expect(routingProviderOptions(provider('@openrouter/ai-sdk-provider', 'openrouter'), undefined)).toEqual({});
     expect(routingProviderOptions(provider('@openrouter/ai-sdk-provider', 'openrouter'), {})).toEqual({});
     expect(routingProviderOptions(provider('@ai-sdk/anthropic', 'anthropic'), { order: ['x'] })).toEqual({});
+  });
+});
+
+describe('sessionAffinityProviderOptions', () => {
+  it('names this conversation under the gateway namespace', () => {
+    expect(sessionAffinityProviderOptions(provider('@ai-sdk/gateway', 'vercel'), 'sess-1')).toEqual({
+      gateway: { sessionId: 'sess-1' },
+    });
+  });
+
+  it('is empty for packages that document no session affinity', () => {
+    expect(sessionAffinityProviderOptions(provider('@openrouter/ai-sdk-provider', 'openrouter'), 'sess-1')).toEqual({});
+    expect(sessionAffinityProviderOptions(provider('@ai-sdk/openai-compatible', 'my-gateway'), 'sess-1')).toEqual({});
+    expect(sessionAffinityProviderOptions(provider('@ai-sdk/anthropic', 'anthropic'), 'sess-1')).toEqual({});
+  });
+
+  it('survives the merge with routing fields in the same namespace', () => {
+    const merged = mergeProviderOptions(
+      { gateway: { only: ['parasail'] } },
+      sessionAffinityProviderOptions(provider('@ai-sdk/gateway', 'vercel'), 'sess-1'),
+    );
+    expect(merged).toEqual({ gateway: { only: ['parasail'], sessionId: 'sess-1' } });
   });
 });
 

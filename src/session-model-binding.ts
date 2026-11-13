@@ -28,6 +28,7 @@ import {
   reasoningSupportStatus,
   resolveReasoningVariant,
   routingProviderOptions,
+  sessionAffinityProviderOptions,
   settingsEffortVariants,
   supportsImageToolResult,
   withReasoningVisibility,
@@ -122,6 +123,7 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
       const effective = resolveReasoningVariant(variants, variantId);
       return mergeProviderOptions(withReasoningVisibility(built.resolved, effective.providerOptions, visible), routing);
     },
+    sessionAffinityProviderOptions: (sessionId: string) => sessionAffinityProviderOptions(built.resolved, sessionId),
     get registry() {
       return base.registry;
     },
@@ -161,6 +163,7 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
       const effective = resolveReasoningVariant(variants, variantId);
       return mergeProviderOptions(withReasoningVisibility(built.resolved, effective.providerOptions, visible), routing);
     },
+    sessionAffinityProviderOptions: (sessionId: string) => sessionAffinityProviderOptions(built.resolved, sessionId),
     saveReasoningPreference: (variantId: string) => {
       saveSettings({ ...loadSettings(), reasoning: normalizeReasoningVariantId(variantId) });
       local.reasoningPreference = normalizeReasoningVariantId(variantId);

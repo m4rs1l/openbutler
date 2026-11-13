@@ -316,6 +316,17 @@ describe('live runtime settings', () => {
     expect(settings.loadSettings().defaultModel).toBe('minimax');
   });
 
+  it('carries this conversation session id on a gateway provider, live and in every model state', async () => {
+    // The runtime's own model: the member reads the resolved provider live, so a
+    // model switch changes what it names without a new object.
+    expect(runtime.sessionAffinityProviderOptions?.('sess-1')).toEqual({ gateway: { sessionId: 'sess-1' } });
+    // Both ways a chat obtains a state: the runtime's own pair and another pair.
+    const own = await runtime.modelFor!('fixture', 'modelx');
+    expect(own.sessionAffinityProviderOptions?.('sess-1')).toEqual({ gateway: { sessionId: 'sess-1' } });
+    const other = await runtime.modelFor!('fixture', 'minimax');
+    expect(other.sessionAffinityProviderOptions?.('sess-1')).toEqual({ gateway: { sessionId: 'sess-1' } });
+  });
+
   it('updates reviewer selection and preferences and can return to the main reviewer model', async () => {
     const latest = settings.loadSettings();
     latest.autoReviewProvider = 'fixture';

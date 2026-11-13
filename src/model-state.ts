@@ -33,6 +33,11 @@ export interface ModelState {
   readonly reasoningSupport: ReasoningSupport;
   /** The provider options an effort maps to on THIS model. */
   readonly getReasoningProviderOptions: (variantId: string, visible: boolean) => ReasoningVariant['providerOptions'];
+  /**
+   * The provider options fragment naming this chat's conversation to a gateway
+   * that supports session affinity; absent where the provider documents none.
+   */
+  readonly sessionAffinityProviderOptions?: (sessionId: string) => ReasoningVariant['providerOptions'];
   /** The tool catalogue for this model's input modalities. */
   readonly registry: ToolRegistry;
 }

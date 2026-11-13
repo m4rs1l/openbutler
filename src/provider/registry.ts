@@ -599,6 +599,11 @@ interface RoutingAdapter {
   optionsKey: (provider: ResolvedProvider) => string | null;
   /** Wraps the native routing object into that namespace's value. */
   wrap: (routing: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * providerOptions namespace this gateway reads a session id from, when it
+   * documents conversation affinity at all. Absent means no affinity is sent.
+   */
+  sessionAffinityKey?: (provider: ResolvedProvider) => string | null;
 }
 
 const ROUTING_ADAPTERS: Record<string, RoutingAdapter> = {
@@ -611,6 +616,11 @@ const ROUTING_ADAPTERS: Record<string, RoutingAdapter> = {
   '@ai-sdk/gateway': {
     optionsKey: () => 'gateway',
     wrap: (routing) => routing,
+    // Vercel names a conversation by `providerOptions.gateway.sessionId`, its
+    // documented first source, which pins the request to one credential - the
+    // pin a conversation fingerprint cannot give. Only this package documents
+    // the field, so no other adapter claims it.
+    sessionAffinityKey: () => 'gateway',
   },
   // OpenAI-compatible gateways in the OpenRouter mould take the same `provider`
   // object; the namespace is the provider's own name, as the SDK expects.
@@ -640,6 +650,21 @@ export function routingProviderOptions(
   const key = adapter?.optionsKey(provider) ?? null;
   if (!adapter || !key) return {};
   return { [key]: adapter.wrap(routing) } as ReasoningVariant['providerOptions'];
+}
+
+/**
+ * The providerOptions fragment naming this conversation to a gateway that
+ * supports session affinity.
+ *
+ * Empty for a package that documents no affinity, so the caller merges it
+ * unconditionally. The id is the chat's own session UUID: stable across turns
+ * and compaction and shared by every request of one conversation, which is
+ * what a gateway needs to keep that conversation on one credential's cache.
+ */
+export function sessionAffinityProviderOptions(provider: ResolvedProvider, sessionId: string): ReasoningVariant['providerOptions'] {
+  const key = routingAdapter(provider.npm)?.sessionAffinityKey?.(provider) ?? null;
+  if (!key) return {};
+  return { [key]: { sessionId } } as ReasoningVariant['providerOptions'];
 }
 
 /** Merges two providerOptions fragments, combining any namespace both share. */

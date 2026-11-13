@@ -2123,6 +2123,38 @@ describe('session compaction persistence and continuation', () => {
     expect(runtime.getReasoningProviderOptions).toHaveBeenCalledWith('xhigh', true);
   });
 
+  it('pins every request of this chat to its session id on a gateway provider', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const { sessionAffinityProviderOptions } = await import('../src/provider/registry.js');
+    const model = new MockLanguageModelV3({ doStream: [fixtureText('Answer.')] });
+    const runtime = runtimeFor(model);
+    // The fragment comes from the real registry, so the namespace decision is
+    // the production one; the chat's job is to merge it into every request.
+    runtime.sessionAffinityProviderOptions = (sessionId) =>
+      sessionAffinityProviderOptions(
+        {
+          id: 'vercel',
+          displayName: 'Vercel',
+          npm: '@ai-sdk/gateway',
+          apiKey: null,
+          apiKeys: [],
+          baseURL: undefined,
+          options: {},
+          custom: false,
+        },
+        sessionId,
+      );
+    session = new AgentSessionController(runtime);
+    const opened = createSession('fixture', 'fixture');
+    await session.openSession(opened);
+    await session.sendMessage({ text: 'Hello.', images: [] });
+    expect(model.doStreamCalls.length).toBeGreaterThan(0);
+    for (const request of model.doStreamCalls) {
+      expect(request.providerOptions?.gateway).toEqual({ sessionId: opened.id });
+    }
+  });
+
   it('resolves the machine default against the ladder of the model this chat runs', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
     const { createSession } = await import('../src/session-store.js');
