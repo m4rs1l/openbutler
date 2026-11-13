@@ -603,6 +603,60 @@ describe('shared host and session IPC', () => {
     );
   });
 
+  it('holds a chat reopen until its eviction flush settles instead of racing the writer', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const chat = await newChat();
+    const chatId = chat.getSnapshot().session.id;
+    await chat.sendMessage({ text: 'Preserve the chat across its eviction.', images: [] });
+    await vi.waitFor(() => expect(chat.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant')).toBe(true));
+    await chat.flushSave();
+    await chat.close();
+    await vi.waitFor(() => expect(host.getStatus().connectedClients).toBe(0));
+    const nextChat = await newChat();
+    expect(host.getStatus().workspaceCount).toBe(3);
+    // The eviction deletes the workspace entry before it flushes/closes, so a reopen that
+    // does not wait for the marker would open a second controller for the same chat while
+    // the first still holds the writer. Holding the flush open pins that window.
+    let releaseFlush!: () => void;
+    const flushGate = new Promise<void>((resolve) => {
+      releaseFlush = resolve;
+    });
+    const originalFlush = AgentSessionController.prototype.flushSave;
+    const flushSave = vi
+      .spyOn(AgentSessionController.prototype, 'flushSave')
+      .mockImplementation(async function (
+        this: InstanceType<typeof AgentSessionController>,
+        options: Parameters<typeof originalFlush>[0],
+      ) {
+        if (this.getSnapshot().session.id === chatId) await flushGate;
+        return originalFlush.apply(this, [options]);
+      });
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 30 * 60_000 + 1_000);
+    let reopening: ReturnType<typeof openChat> | null = null;
+    try {
+      // Detaching sweeps other workspaces: the old chat expires into its gated eviction.
+      await nextChat.close();
+      await vi.waitFor(() => expect(host.getStatus().workspaceCount).toBe(2));
+      reopening = openChat(chatId);
+      // The reopen must stay pending while the eviction holds the writer: it may not
+      // settle, and it may not create a workspace for the same chat in the meantime.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await expect(
+        Promise.race([reopening.then(() => 'settled'), new Promise((resolve) => setTimeout(() => resolve('pending'), 0))]),
+      ).resolves.toBe('pending');
+      expect(host.getStatus().workspaceCount).toBe(2);
+    } finally {
+      releaseFlush();
+      clock.mockRestore();
+      flushSave.mockRestore();
+    }
+    const reopened = await reopening!;
+    expect(reopened.getSnapshot().session.id).toBe(chatId);
+    expect(reopened.getSnapshot().session.entries).toContainEqual(
+      expect.objectContaining({ kind: 'user', text: 'Preserve the chat across its eviction.' }),
+    );
+  });
+
   it('restores a closed chat after a host restart and leaves the custodian record alone', async () => {
     const { loadSavedSession } = await import('../src/session-store.js');
     const { CUSTODIAN_SESSION_ID } = await import('../src/session-paths.js');

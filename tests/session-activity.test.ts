@@ -134,7 +134,7 @@ describe('recent ordering reads content activity', () => {
 
     // Pure navigation: load the same conversation back through openSession.
     const loaded = store.loadSavedSession(file.id)!;
-    controller.openSession(loaded);
+    await controller.openSession(loaded);
     expect(readFileSync(file.path, 'utf8')).toBe(before);
 
     // Real content: a new message must persist and move the activity stamp.
@@ -192,7 +192,7 @@ describe('session persistence responsiveness', () => {
     controller.addEntry({ kind: 'user', text: 'pending save' });
     const previousId = controller.getSnapshot().session.id;
     const pending = controller.flushSave();
-    controller.openSession(next);
+    await controller.openSession(next);
     await pending;
     await controller.flushSave();
     expect(controller.getSnapshot().session.id).toBe(next.id);
@@ -210,12 +210,165 @@ describe('session persistence responsiveness', () => {
     ensureSessionDirectory(id);
     const path = sessionFilePath(id);
     mkdirSync(path);
-    await controller.flushSave();
+    await expect(controller.flushSave()).rejects.toThrow();
     expect(controller.getSnapshot().sessionSaveError).toEqual(expect.any(String));
     rmSync(path, { recursive: true });
     await controller.flushSave();
     expect(controller.getSnapshot().sessionSaveError).toBeNull();
     expect(store.loadSavedSession(id)!.entries[0]).toMatchObject({ text: 'durable after retry' });
+  });
+
+  describe.each(['disk', 'spy'] as const)('explicit save failures (%s)', (failure) => {
+    it.each(['flush', 'open', 'load', 'new', 'close'] as const)('rejects %s, retains dirty state, and allows retry', async (action) => {
+      const { AgentSessionController } = await import('../src/agent-session.js');
+      const { ensureSessionDirectory, sessionFilePath } = await import('../src/session-paths.js');
+      const writer = await import('../src/session-writer.js');
+      const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+      controller = new AgentSessionController(runtimeFor(model));
+      const source = {
+        ...withUser(store, 'previous message'),
+        conversation: [{ role: 'user' as const, content: 'previous context' }],
+        conversationArchive: [{ role: 'assistant' as const, content: 'archived context' }],
+      };
+      await controller.openSession(source);
+      controller.addEntry({ kind: 'user', text: 'unsaved message' });
+      controller.setReasoningPreference('high');
+      controller.setShowReasoningPreference(false);
+      const before = controller.getSnapshot().session;
+      // The load path is scope-checked: the destination must carry the
+      // controller's workspace scope or loadSavedSession filters it out.
+      const next = store.saveSession({ ...withUser(store, 'destination'), workspaceRoot: process.cwd() });
+      const navigate = () => {
+        switch (action) {
+          case 'flush': return controller!.flushSave();
+          case 'open': return controller!.openSession(next);
+          case 'load': return controller!.loadSession(next.id);
+          case 'new': return controller!.createNewSession();
+          case 'close': return controller!.close();
+        }
+      };
+      const path = sessionFilePath(source.id);
+      const spy = failure === 'spy' ? vi.spyOn(writer, 'writeSessionSnapshot').mockRejectedValue(new Error('fixture disk failure')) : null;
+      if (failure === 'disk') {
+        ensureSessionDirectory(source.id);
+        mkdirSync(path);
+      }
+      try {
+        // Promise.resolve also tests the old synchronous openSession without masking
+        // its false success: all explicit boundaries must reject on writer failure.
+        await expect(Promise.resolve(navigate())).rejects.toThrow();
+        expect(controller.getSnapshot().session).toEqual(before);
+        expect(controller.getSnapshot().sessionSaveError).toEqual(expect.any(String));
+        // In disk mode the save path is a directory, so a store read cannot run
+        // until the fixture is removed; only the spy failure can read back null here.
+        if (failure === 'spy') expect(store.loadSavedSession(source.id)).toBeNull();
+      } finally {
+        spy?.mockRestore();
+        if (failure === 'disk') rmSync(path, { recursive: true, force: true });
+      }
+      // After the blocking directory is gone the failed save must still have
+      // persisted nothing before the retry below.
+      expect(store.loadSavedSession(source.id)).toBeNull();
+      await navigate();
+      const saved = store.loadSavedSession(source.id)!;
+      expect(saved).toMatchObject({
+        entries: before.entries,
+        reasoning: 'high',
+        showReasoning: false,
+        conversation: source.conversation,
+        conversationArchive: source.conversationArchive,
+      });
+      expect(controller.getSnapshot().sessionSaveError).toBeNull();
+      if (action === 'open' || action === 'load') expect(controller.getSnapshot().session.id).toBe(next.id);
+      else if (action === 'new') expect(controller.getSnapshot().session.id).not.toBe(source.id);
+      else expect(controller.getSnapshot().session.id).toBe(source.id);
+    });
+  });
+
+  it('shares an in-flight close but retries a failed final flush', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const writer = await import('../src/session-writer.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'initial shutdown snapshot' });
+    const id = controller.getSnapshot().session.id;
+    const write = writer.writeSessionSnapshot;
+    const spy = vi.spyOn(writer, 'writeSessionSnapshot')
+      .mockImplementationOnce(write)
+      .mockRejectedValueOnce(new Error('final flush failed'));
+    const idle = vi.spyOn(controller, 'waitUntilIdle').mockImplementationOnce(async () => {
+      controller!.addEntry({ kind: 'assistant', text: 'settled during shutdown' });
+    });
+    try {
+      const first = controller.close();
+      expect(controller.close()).toBe(first);
+      await expect(first).rejects.toThrow('final flush failed');
+      expect(controller.getSnapshot().sessionSaveError).toBe('final flush failed');
+      expect(store.loadSavedSession(id)!.entries).toHaveLength(1);
+      const retry = controller.close();
+      expect(retry).not.toBe(first);
+      await retry;
+      expect(controller.close()).toBe(retry);
+      expect(controller.getSnapshot().sessionSaveError).toBeNull();
+      expect(store.loadSavedSession(id)!.entries.at(-1)).toMatchObject({ text: 'settled during shutdown' });
+    } finally {
+      idle.mockRestore();
+      spy.mockRestore();
+    }
+  });
+
+  it('handles a timed save rejection and explicitly retries the same dirty snapshot', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const writer = await import('../src/session-writer.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    controller = new AgentSessionController(runtimeFor(model));
+    vi.useFakeTimers();
+    const spy = vi.spyOn(writer, 'writeSessionSnapshot').mockRejectedValue(new Error('timed write failed'));
+    try {
+      controller.addEntry({ kind: 'user', text: 'timed dirty snapshot' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(controller.getSnapshot().sessionSaveError).toBe('timed write failed');
+      spy.mockRestore();
+      vi.useRealTimers();
+      await controller.flushSave();
+      expect(controller.getSnapshot().sessionSaveError).toBeNull();
+      expect(store.loadSavedSession(controller.getSnapshot().session.id)!.entries[0]).toMatchObject({ text: 'timed dirty snapshot' });
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('propagates an in-flight failure to waiting navigation and saves newer content on retry', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const writer = await import('../src/session-writer.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    const next = store.saveSession(withUser(store, 'destination'));
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'first snapshot' });
+    const id = controller.getSnapshot().session.id;
+    let fail!: (error: Error) => void;
+    const spy = vi.spyOn(writer, 'writeSessionSnapshot').mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+    try {
+      const first = controller.flushSave();
+      controller.addEntry({ kind: 'assistant', text: 'newer dirty content' });
+      const opening = Promise.resolve(controller.openSession(next));
+      const results = Promise.allSettled([first, opening]);
+      expect(controller.getSnapshot().session.id).toBe(id);
+      fail(new Error('pending write failed'));
+      expect((await results).map((result) => result.status)).toEqual(['rejected', 'rejected']);
+      expect(controller.getSnapshot().session.id).toBe(id);
+      expect(controller.getSnapshot().session.entries.at(-1)).toMatchObject({ text: 'newer dirty content' });
+      expect(controller.getSnapshot().sessionSaveError).toBe('pending write failed');
+      spy.mockRestore();
+      await controller.openSession(next);
+      expect(store.loadSavedSession(id)!.entries.at(-1)).toMatchObject({ text: 'newer dirty content' });
+      expect(controller.getSnapshot().session.id).toBe(next.id);
+    } finally {
+      // Settle the writer even if a pre-fix navigation assertion fails.
+      fail(new Error('fixture cleanup'));
+      spy.mockRestore();
+    }
   });
 
   it('never serializes the whole transcript on the controller thread', async () => {

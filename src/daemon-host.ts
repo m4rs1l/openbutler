@@ -47,7 +47,8 @@ import {
 import {
   listSavedSessions,
   loadSavedSession,
-  loadSessionForChat,
+  loadSavedSessionAsync,
+  loadSessionForChatAsync,
   type SessionEntry,
   type SessionEntriesRange,
   type SavedSession,
@@ -1283,7 +1284,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     chat?: { saved: ReturnType<typeof loadSavedSession>; projectId?: string | null },
   ): Promise<WorkspaceHost> {
     const restartSessionId = chat ? null : ledger.getState(RESTART_SESSION_KEY_PREFIX + key);
-    const restartSaved = restartSessionId ? loadSavedSession(restartSessionId, root) : null;
+    const restartSaved = restartSessionId ? await loadSavedSessionAsync(restartSessionId, root) : null;
     const selected = chat?.saved ?? restartSaved;
     const runtime = await createSessionRuntime(
       chat?.saved?.project?.workspaceRoot ??
@@ -1300,7 +1301,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       onSessionSaved: acknowledgeSavedWorkerReads,
     });
     try {
-      if (chat?.saved) controller.openSession(chat.saved);
+      if (chat?.saved) await controller.openSession(chat.saved);
       else if (chat) controller.selectProject(chat.projectId ?? null, controller.getSnapshot().session.id);
       if (restartSessionId) {
         await controller.loadSession(restartSessionId);
@@ -1344,6 +1345,13 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     if (closing) throw new Error('OpenButler host is shutting down.');
     // Checked before any lookup: the custodian is not a chat, so no attach may land on it.
     if (sessionId === CUSTODIAN_SESSION_ID) throw new Error('The machine custodian is not a chat; it opens through the custodian surface.');
+    const key = `chat:${sessionId ?? randomUUID()}`;
+    // A chat eviction deletes the workspace entry first and then flushes/closes:
+    // a reopen for the same chat key must wait for that writer to settle instead
+    // of reading a stale file or opening a competing controller for the same id.
+    const eviction = sessionId ? workspaceEvictions.get(key) : undefined;
+    if (eviction) await withDeadline(() => eviction, LOAD_DEADLINE_MS, 'Workspace eviction');
+    if (closing) throw new Error('OpenButler host is shutting down.');
     const live = sessionId ? findLiveSessionById(sessionId) : null;
     if (live) {
       const privateSessionId = live.main
@@ -1351,16 +1359,18 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         : ([...live.workspace.privateSessions].find(([, session]) => session.controller === live.controller)?.[0] ?? null);
       return { workspace: live.workspace, controller: live.controller, privateSessionId };
     }
-    const key = `chat:${sessionId ?? randomUUID()}`;
     let pending = chatLoads.get(key);
     if (!pending) {
-      const saved = sessionId ? loadSessionForChat(sessionId, scopeRoot) : null;
-      if (sessionId && !saved) throw new Error('Chat not found.');
-      // The custodian is an internal session: it opens through the custodian surface only.
-      if (sessionId === CUSTODIAN_SESSION_ID)
-        throw new Error('The machine custodian is not a chat; it opens through the custodian surface.');
-      pending = createWorkspace(scopeRoot, key, { saved, ...(projectId !== undefined ? { projectId } : {}) });
-      chatLoads.set(key, pending);
+      const loading = (async () => {
+        const saved = sessionId ? await loadSessionForChatAsync(sessionId, scopeRoot) : null;
+        if (sessionId && !saved) throw new Error('Chat not found.');
+        // The custodian is an internal session: it opens through the custodian surface only.
+        if (sessionId === CUSTODIAN_SESSION_ID)
+          throw new Error('The machine custodian is not a chat; it opens through the custodian surface.');
+        return createWorkspace(scopeRoot, key, { saved, ...(projectId !== undefined ? { projectId } : {}) });
+      })();
+      chatLoads.set(key, loading);
+      pending = loading;
     }
     try {
       const workspace = await withDeadline(() => pending, LOAD_DEADLINE_MS, 'Chat load');
@@ -1469,7 +1479,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       } else {
         // A machine that has never run this version owns no custodian record yet, so this
         // is where the machine's own session comes into being.
-        controller.startCustodianSession();
+        await controller.startCustodianSession();
       }
       const workspace: WorkspaceHost = {
         root: custodianRoot,
@@ -1530,12 +1540,29 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       maxIdle: MAX_IDLE_WORKSPACES,
     });
     for (const key of keys) {
+      if (workspaceEvictions.has(key)) continue;
+      // A chat workspace is keyed by a random key at creation, while a reopen is addressed
+      // by session id: expose the eviction under the session-id key too, so the reopen can
+      // find the marker and wait for the writer instead of racing it. For a reopened chat
+      // both keys are already the same and this is a no-op.
+      const sessionId = workspaces.get(key)?.controller.getSnapshot().session.id;
+      const sessionKey = key.startsWith('chat:') && sessionId ? `chat:${sessionId}` : null;
       const eviction = evictWorkspace(key);
       workspaceEvictions.set(key, eviction);
+      if (sessionKey && sessionKey !== key) workspaceEvictions.set(sessionKey, eviction);
+      // The retirement marker stays until the eviction actually settles. Removing
+      // it on the housekeeping deadline would let a later admission race an
+      // eviction whose flush/close is still running.
+      const settle = (): void => {
+        if (workspaceEvictions.get(key) === eviction) workspaceEvictions.delete(key);
+        if (sessionKey && workspaceEvictions.get(sessionKey) === eviction) workspaceEvictions.delete(sessionKey);
+      };
+      void eviction.then(settle, settle);
       try {
         await withDeadline(() => eviction, LOAD_DEADLINE_MS, 'Workspace eviction');
-      } finally {
-        if (workspaceEvictions.get(key) === eviction) workspaceEvictions.delete(key);
+      } catch {
+        // Deadline elapsed but the writer may still be running; the marker above
+        // remains until it settles and admissions keep surfacing bounded errors.
       }
     }
   }

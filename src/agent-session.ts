@@ -11,7 +11,7 @@ import {
   compactionContextWindowTokens,
   createSession,
   listSavedSessions,
-  loadSavedSession,
+  loadSavedSessionAsync,
   saveSession,
   saveSessionAsync,
   sessionTitle,
@@ -634,7 +634,8 @@ export class AgentSessionController implements AgentSessionClient {
     this.sessionSaveTimer = setTimeout(
       () => {
         this.sessionSaveTimer = null;
-        if (!this.sessionSavePromise && this.latestSessionSnapshot) void this.persistLatest(this.latestSessionSnapshot);
+        // Timed saves report failures in the snapshot; explicit flushes reject.
+        if (!this.sessionSavePromise && this.latestSessionSnapshot) void this.persistLatest(this.latestSessionSnapshot).catch(() => {});
       },
       this.busy ? 1_000 : 400,
     );
@@ -693,12 +694,18 @@ export class AgentSessionController implements AgentSessionClient {
       })
       .catch((error: unknown) => {
         if (generation === this.sessionGeneration) this.sessionSaveError = error instanceof Error ? error.message : String(error);
+        throw error;
       });
     this.sessionSavePromise = saving;
-    await saving;
-    if (this.sessionSavePromise === saving) this.sessionSavePromise = null;
-    this.publish(false);
-    if (!this.closed && !sameSessionContent(sessionContentStamp(this.persistableSession()), this.lastPersistedContent)) this.scheduleSave();
+    try {
+      await saving;
+    } finally {
+      // A failed write stays dirty, but must not leave a rejected promise blocking
+      // every later retry. Waiters still receive the original writer failure.
+      if (this.sessionSavePromise === saving) this.sessionSavePromise = null;
+      this.publish(false);
+      if (!this.closed && !sameSessionContent(sessionContentStamp(this.persistableSession()), this.lastPersistedContent)) this.scheduleSave();
+    }
   }
 
   async flushSave(options: { allowEmpty?: boolean } = {}): Promise<void> {
@@ -846,15 +853,16 @@ export class AgentSessionController implements AgentSessionClient {
 
   async loadSession(id: string): Promise<SavedSession | null> {
     await this.flushSave();
-    const session = loadSavedSession(id, this.sessionWorkspaceScope);
-    if (session) this.openSession(session);
+    const session = await loadSavedSessionAsync(id, this.sessionWorkspaceScope);
+    if (session) await this.openSession(session);
     return session;
   }
 
-  openSession(session: SavedSession): void {
+  async openSession(session: SavedSession): Promise<void> {
+    if (this.busy) return;
+    await this.flushSave();
     if (this.busy) return;
     if (session.id !== this.session.id) this.cancelTitleGeneration();
-    void this.flushSave();
     this.sessionGeneration += 1;
     this.session = {
       ...session,
@@ -913,8 +921,9 @@ export class AgentSessionController implements AgentSessionClient {
     // layer, so this controller never replaces its own record.
     if (this.session.id === CUSTODIAN_SESSION_ID) throw new Error('The custodian session is fixed; new chats open in the chat layer.');
     const project = projectId === undefined ? undefined : sessionProject(projectId, this.runtime.workspaceRoot);
-    this.cancelTitleGeneration();
     await this.flushSave();
+    if (this.busy) return;
+    this.cancelTitleGeneration();
     this.sessionGeneration += 1;
     this.lastPersistedContent = null;
     this.session = {
@@ -959,7 +968,7 @@ export class AgentSessionController implements AgentSessionClient {
    * needed to recognize it later. The file is written even though the record is still
    * empty: the machine must own its session on disk from the moment the host starts.
    */
-  startCustodianSession(): void {
+  async startCustodianSession(): Promise<void> {
     const record = saveSession(
       {
         ...createSession(
@@ -972,7 +981,7 @@ export class AgentSessionController implements AgentSessionClient {
       },
       { allowEmpty: true },
     );
-    this.openSession(record);
+    await this.openSession(record);
   }
 
   /** The compaction row becomes `failed` in place, keeping its start size; a later attempt appends its own row. */
@@ -1256,7 +1265,13 @@ export class AgentSessionController implements AgentSessionClient {
   }
 
   close(): Promise<void> {
-    this.closePromise ??= this.closeSession();
+    this.closePromise ??= this.closeSession().catch((error: unknown) => {
+      // A failed final flush must not stick: the controller stays usable and a
+      // later close retries instead of returning the same rejected promise.
+      this.closePromise = null;
+      this.closed = false;
+      throw error;
+    });
     return this.closePromise;
   }
 

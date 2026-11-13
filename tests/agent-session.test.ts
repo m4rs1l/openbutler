@@ -192,7 +192,7 @@ describe('owner replies and safe steering', () => {
     session = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doStream: async () => fixtureText('Done') })));
     const previousId = session.getSnapshot().session.id;
 
-    session.startCustodianSession();
+    await session.startCustodianSession();
     expect(session.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
     expect(session.getSnapshot().session.id).not.toBe(previousId);
     const stored = loadSavedSession(CUSTODIAN_SESSION_ID);
@@ -934,7 +934,7 @@ describe('model spec refresh without a restart', () => {
       registry: new ToolRegistry(),
     });
     session = new AgentSessionController(runtime);
-    session.openSession(createSession('fixture', 'fixture'));
+    await session.openSession(createSession('fixture', 'fixture'));
     await session.restoreSessionModel();
     expect(session.getSnapshot().session.contextWindowTokens).toBe(100_000);
 
@@ -1582,7 +1582,7 @@ describe('session compaction persistence and continuation', () => {
       },
     ];
     session = new AgentSessionController(runtime, undefined, { sessionWorkspaceRoot: null });
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       conversation: original,
       entries: [{ kind: 'user', text: 'Original task: inspect both results.' }],
@@ -1662,7 +1662,7 @@ describe('session compaction persistence and continuation', () => {
     runtime.contextWindowTokens = 100_000;
     runtime.outputLimitTokens = 20_000;
     session = new AgentSessionController(runtime);
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Keep the original task.' }],
       conversation: [{ role: 'user', content: 'Keep the original task.' }],
@@ -1707,7 +1707,7 @@ describe('session compaction persistence and continuation', () => {
     runtime.contextWindowTokens = 10_000;
     const oversized = 'context '.repeat(50_000);
     session = new AgentSessionController(runtime);
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: oversized }],
       conversation: [{ role: 'user', content: oversized }],
@@ -1870,7 +1870,7 @@ describe('session compaction persistence and continuation', () => {
     ];
     const source = structuredClone(raw);
     session = new AgentSessionController(runtimeFor(model));
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Preserve the active task.' }],
       conversation: raw,
@@ -1941,7 +1941,7 @@ describe('session compaction persistence and continuation', () => {
     runtime.outputLimitTokens = 32_768;
     runtime.getReasoningProviderOptions = vi.fn(() => providerOptions);
     session = new AgentSessionController(runtime);
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Continue the implementation.' }],
       conversation: raw,
@@ -2006,7 +2006,7 @@ describe('session compaction persistence and continuation', () => {
     });
     runtime.getReasoningProviderOptions = vi.fn(() => ({}));
     session = new AgentSessionController(runtime);
-    session.openSession(createSession('fixture', 'fixture'));
+    await session.openSession(createSession('fixture', 'fixture'));
     // The chat never chose an effort, so it inherits the machine default.
     await session.sendMessage({ text: 'Hello.', images: [] });
     // The inherited default is resolved against THIS chat's ladder, so the
@@ -2085,7 +2085,7 @@ describe('session compaction persistence and continuation', () => {
     };
     session = new AgentSessionController(runtime);
     const estimate = estimateContextTokens(getAgentContext(raw, undefined, dataDir));
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Continue this task.' }],
       conversation: raw,
@@ -2132,7 +2132,7 @@ describe('session compaction persistence and continuation', () => {
     const options = { fixture: { reasoningEffort: 'xhigh' } };
     runtime.getReasoningProviderOptions = () => options;
     session = new AgentSessionController(runtime);
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       entries: [{ kind: 'user', text: 'Preserve the complete user message.' }],
       conversation: raw,
@@ -2187,7 +2187,7 @@ describe('session compaction persistence and continuation', () => {
       ],
     });
     session = new AgentSessionController(runtimeFor(model));
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       title: 'Existing task',
       entries: [{ kind: 'user', text: 'Implement the runtime; do not restart services.' }],
@@ -2241,7 +2241,7 @@ describe('session compaction persistence and continuation', () => {
       doStream: [fixtureText('Incomplete checkpoint must not be committed.', 'length'), fixtureText('Continuing the original request.')],
     });
     session = new AgentSessionController(runtimeFor(model));
-    session.openSession({
+    await session.openSession({
       ...createSession('fixture', 'fixture'),
       title: 'Existing task',
       entries: [{ kind: 'user', text: 'The unfinished original request.' }],
