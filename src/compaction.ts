@@ -15,20 +15,32 @@ import {
 export { COMPACTION_SUMMARY_MARKER, TOOL_REFERENCE_MARKER, COMPACTION_CONTINUE_MESSAGE } from './conversation.js';
 
 /**
- * Components of the automatic trigger reserve and its bounds.
+ * Components of the automatic trigger reserve.
  *
- * The reserve is additive, never a share of the window: the model's declared
- * output (passed in), the compaction instruction, and one step of measured
- * growth. Measured step growth p99 is 11_442 tokens (2026-11-13, `state.db`
- * consecutive chat inputs, compaction-affected pairs excluded). The summary
- * request's own output ceiling is the measured compaction-output p99, 20_596
- * tokens (2026-11-13, 134 `compaction` rows); the 1_024 margin matches the
- * existing summary-slack guard. The trigger share therefore rises naturally
- * with the window instead of pinning at a fixed ratio.
+ * Invariant: at the trigger, one more control step (measured growth) plus the
+ * compaction request itself must still fit the window:
+ *   window >= trigger + growth + instruction + summary + margin.
+ * Every term is measured or derived in this repo; none is model-specific:
+ * - growth: step growth p99 = 11_583 tokens (2026-11-14, `state.db`, 20_296
+ *   consecutive positive chat input deltas; refines 11_442 from 2026-11-13).
+ *   At p99 growth the room left at fire time equals summary + margin exactly,
+ *   which is why these constants are sized together with it.
+ * - instruction: `estimateTokens(COMPACTION_PROMPT)`, derived from the prompt
+ *   itself at module init and passed per call, never hardcoded here.
+ * - summary: 26_024 = the observed MAXIMUM of 144 `compaction` output rows
+ *   (state.db, 2026-11-14; p50 8_789, p90 14_955, p95 17_298). A percentile
+ *   would allow cutting a larger summary, and a summary is never cut, so the
+ *   observed maximum is the correct statistic.
+ * - margin: 1_024, the existing summary-slack guard.
+ *
+ * The model's declared output limit never enters this reserve: ordinary
+ * requests run below the trigger and the provider caps their output itself;
+ * the only output inside the reserve is the compaction request's own summary
+ * ceiling, counted above.
  * `autoCompactionTriggerTokens` owns the rule.
  */
-const COMPACTION_HEADROOM_TOKENS = 11_442;
-const COMPACTION_SUMMARY_MAX_TOKENS = 20_596;
+const COMPACTION_HEADROOM_TOKENS = 11_583;
+const COMPACTION_SUMMARY_MAX_TOKENS = 26_024;
 const COMPACTION_SUMMARY_MARGIN_TOKENS = 1_024;
 
 /**
@@ -98,29 +110,23 @@ Write the continuation checkpoint in English regardless of the language of the c
 /**
  * The input-token count at which the automatic trigger fires.
  *
- * `window - reserve`, never a share of the window. The reserve is what the next
- * ordinary request may still ask for - the model's declared output plus the
- * compaction instruction - so it scales with the model instead of a ratio: a
- * large window with a small output budget is allowed to fill further, and a
- * model whose declared output is huge compacts earlier because its next request
- * could be huge. At the trigger the next request can still ask for its full
- * declared output; that boundary is exact, which is why it is a function rather
- * than an inline comparison. The result is clamped to `[0.5 * window, window -
- * prompt - summary ceiling - margin]` so the summarization request itself
- * always fits, and a post-compaction landing never retriggers immediately.
+ * `max(0.5 * window, window - reserve)`, never a share of the window and
+ * never derived from any model-declared value. The reserve is what the
+ * compaction request itself needs when it fires - one step of measured growth,
+ * the compaction instruction, the summary ceiling, and the estimate margin
+ * (see the constant block above) - so the summarization request fits the
+ * window by construction at the worst control step. The 0.5 floor is a
+ * guardrail for tiny windows only: it binds below 80_420 tokens, where no
+ * formula could fit a useful summary anyway. There is no upper clamp: the
+ * reserve is strictly positive, so the result is always below the window.
  *
  * Exported for the tests: the rule is arithmetic they must pin exactly, not a
  * side effect they can only observe through a provider fixture.
  */
-export function autoCompactionTriggerTokens(
-  contextWindowTokens: number,
-  outputLimitTokens?: number | null,
-  promptTokens: number = COMPACTION_PROMPT_TOKENS,
-): number {
-  const reserve = Math.max(0, outputLimitTokens ?? 0) + promptTokens + COMPACTION_HEADROOM_TOKENS;
+export function autoCompactionTriggerTokens(contextWindowTokens: number, promptTokens: number = COMPACTION_PROMPT_TOKENS): number {
+  const reserve = promptTokens + COMPACTION_SUMMARY_MAX_TOKENS + COMPACTION_SUMMARY_MARGIN_TOKENS + COMPACTION_HEADROOM_TOKENS;
   const floor = Math.floor(contextWindowTokens * 0.5);
-  const upper = contextWindowTokens - promptTokens - COMPACTION_SUMMARY_MAX_TOKENS - COMPACTION_SUMMARY_MARGIN_TOKENS;
-  return Math.min(Math.max(contextWindowTokens - reserve, floor), upper);
+  return Math.max(contextWindowTokens - reserve, floor);
 }
 
 export interface CompactionContext {
@@ -220,7 +226,7 @@ export async function compactConversation(
 
   if (!options.force) {
     if (!contextLimit) return { kind: 'skipped', reason: 'no-budget' };
-    const triggerTokens = autoCompactionTriggerTokens(contextLimit, options.outputLimitTokens, compactionPromptTokens);
+    const triggerTokens = autoCompactionTriggerTokens(contextLimit, compactionPromptTokens);
     if (activeContextTokens < triggerTokens) return { kind: 'skipped', reason: 'below-threshold' };
   }
 

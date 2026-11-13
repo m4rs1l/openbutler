@@ -613,7 +613,7 @@ describe('full-context LLM compaction', () => {
     expect(model.doStreamCalls[0]!.maxOutputTokens).toBe(32_768);
   });
 
-  it('reserves the full model output budget plus the compaction instruction before the next ordinary request', async () => {
+  it('fires at the compaction reserve while the declared output limit still caps the summary budget', async () => {
     const messages: ModelMessage[] = [
       {
         role: 'assistant',
@@ -633,7 +633,7 @@ describe('full-context LLM compaction', () => {
       providerOptions,
       contextWindowTokens: 262_144,
       outputLimitTokens: 32_768,
-      previousContextTokens: autoCompactionTriggerTokens(262_144, 32_768),
+      previousContextTokens: autoCompactionTriggerTokens(262_144),
       previousContextEstimateTokens: estimateContextTokens({ system, messages }),
     });
     expect(result).not.toBeNull();
@@ -778,7 +778,7 @@ describe('full-context LLM compaction', () => {
     expect(messages).toEqual(snapshot);
   });
 
-  it('compacts at the window minus the declared output reserve and not one token earlier', async () => {
+  it('compacts at the window minus the compaction reserve and not one token earlier', async () => {
     const model = new MockLanguageModelV3({ doStream: async () => textStream('Checkpoint') });
     const base = {
       system: 'Normal system',
@@ -797,8 +797,8 @@ describe('full-context LLM compaction', () => {
       outputLimitTokens: 20_000,
     };
     // Literal on purpose: the gate must land on this number, not on whatever the helper returns.
-    // 100_000 - (20_000 declared output + 1_579 prompt + 11_442 measured headroom), inside [50_000, 76_801].
-    const trigger = 66_979;
+    // 100_000 - (1_579 instruction + 26_024 summary ceiling + 1_024 margin + 11_583 growth step), above the 50_000 floor.
+    const trigger = 59_790;
     expect(await compactConversation({ ...base, previousContextTokens: trigger - 1 })).toMatchObject({
       kind: 'skipped',
       reason: 'below-threshold',
@@ -808,24 +808,25 @@ describe('full-context LLM compaction', () => {
     expect(model.doStreamCalls).toHaveLength(1);
   });
 
-  it('scales the trigger with the window and the declared output instead of a fixed share', () => {
-    // window - (declared output + prompt 1_579 + headroom 11_442), clamped to [0.5 * window, window - 23_199].
-    expect(autoCompactionTriggerTokens(100_000, 20_000)).toBe(66_979);
-    expect(autoCompactionTriggerTokens(307_200, 32_768)).toBe(261_411);
-    expect(autoCompactionTriggerTokens(1_000_000, 20_000)).toBe(966_979);
+  it('derives the trigger from the compaction reserve with no declared output in the formula', () => {
+    // window - 40_210 (instruction 1_579 + summary ceiling 26_024 + margin 1_024 + growth step 11_583), floored at 0.5 * window.
+    expect(autoCompactionTriggerTokens(100_000)).toBe(59_790);
+    expect(autoCompactionTriggerTokens(262_144)).toBe(221_934);
+    expect(autoCompactionTriggerTokens(307_200)).toBe(266_990);
+    expect(autoCompactionTriggerTokens(1_000_000)).toBe(959_790);
   });
 
-  it('bounds the trigger when no output limit is declared or the declared one pushes it to the floor or ceiling', () => {
-    // No declared output: the window minus prompt/headroom exceeds the ceiling, so the ceiling binds.
-    expect(autoCompactionTriggerTokens(100_000)).toBe(76_801);
-    expect(autoCompactionTriggerTokens(100_000, null)).toBe(76_801);
-    // Declared output 40_000 pushes the raw trigger below the 0.5 * window floor.
-    expect(autoCompactionTriggerTokens(100_000, 40_000)).toBe(50_000);
+  it('holds the 0.5 floor where the subtractive branch would land under half the window', () => {
+    // Below 80_420 tokens the reserve branch lands under 0.5 * window, so the floor binds.
+    expect(autoCompactionTriggerTokens(64_000)).toBe(32_000);
+    expect(autoCompactionTriggerTokens(32_768)).toBe(16_384);
+    expect(autoCompactionTriggerTokens(100_000)).toBe(59_790);
   });
 
-  it('keeps the summarization request inside the window when the raw trigger would be too late', () => {
-    // 128_000 - 1_579 prompt - 20_596 measured summary ceiling - 1_024 margin = 104_801.
-    expect(autoCompactionTriggerTokens(128_000)).toBe(104_801);
+  it('leaves exactly the reserve between the trigger and the window', () => {
+    // 128_000 - 40_210 reserve = 87_790: the room kept for the compaction request is the reserve itself.
+    expect(autoCompactionTriggerTokens(128_000)).toBe(87_790);
+    expect(128_000 - autoCompactionTriggerTokens(128_000)).toBe(40_210);
   });
 
   it('accounts for a large tool result added after the last provider measurement', async () => {
