@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -81,8 +81,16 @@ it('recovers an unresponsive host only after its native process identity is veri
   expect(alive(child.pid!)).toBe(false);
 });
 
-it('does not terminate a process when a stale PID record points to a different process identity', async () => {
+it('prunes a stale PID record that points to a different process identity without terminating that process', async () => {
   writeFileSync(join(root, 'daemon.pid'), JSON.stringify({ ...record, identity: 'different-process' }));
+  expireShutdownGrace();
+  expect(await daemon.stopDaemon(true)).toBe(false);
+  expect(existsSync(join(root, 'daemon.pid'))).toBe(false);
+  expect(alive(child.pid!)).toBe(true);
+});
+
+it('does not terminate an unresponsive process whose identity cannot be verified', async () => {
+  writeFileSync(join(root, 'daemon.pid'), JSON.stringify({ pid: record.pid, startedAt: record.startedAt }));
   expireShutdownGrace();
   await expect(daemon.stopDaemon(true)).rejects.toThrow('Its process identity cannot be verified');
   expect(alive(child.pid!)).toBe(true);

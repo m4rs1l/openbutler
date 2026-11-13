@@ -27,7 +27,8 @@ import { describeModelReasoning } from '../provider/model-view.js';
 import { watchSettingsFiles } from '../settings-watch.js';
 import { addProviderKeys } from '../provider/keys.js';
 import { verifyAttachmentPath } from '../attachments.js';
-import { connectDaemonSession, resumeChatAttach } from '../daemon-client.js';
+import { connectDaemonSession, resumeChatAttach, type DaemonSessionConnection } from '../daemon-client.js';
+import { BUILD_ID } from '../build-info.js';
 import { getDaemonStatus, hostVintage, hostVintageMismatchWarning } from '../daemon.js';
 import type { AgentSessionClient, AgentSessionSnapshot } from '../agent-session.js';
 import { ActivityLedger } from '../activity-ledger.js';
@@ -310,7 +311,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
   const startedAt = Date.now();
   // The web server is a chat client like the terminal: it opens the chat the
   // owner left off in, and the custodian stays the host's own conversation.
-  const client: AgentSessionClient = await connectDaemonSession(options.workspaceRoot, {
+  const client: DaemonSessionConnection = await connectDaemonSession(options.workspaceRoot, {
     ...resumeChatAttach('web'),
     entriesWindow: WEB_ENTRIES_WINDOW,
   });
@@ -325,8 +326,15 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
   let pairUsed = false;
 
   const logger = createLogger({ sink: fileSink(join(getDataPath('logs'), 'web.log')), context: { process: 'web' } });
-  const vintageWarning = hostVintageMismatchWarning(process.argv[1], client.hostEntry);
-  if (vintageWarning) logger.warn('web.host.vintage-mismatch', { host: client.hostEntry, client: process.argv[1] ?? null });
+  const vintageWarning = hostVintageMismatchWarning(process.argv[1], client.hostEntry, BUILD_ID, client.hostBuildId);
+  if (vintageWarning)
+    logger.warn('web.host.vintage-mismatch', {
+      message: vintageWarning,
+      host: client.hostEntry,
+      client: process.argv[1] ?? null,
+      hostBuildId: client.hostBuildId ?? null,
+      clientBuildId: BUILD_ID,
+    });
   const clients = new Set<SseClient>();
 
   const issuePairToken = (): string => {
@@ -589,7 +597,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
     if (querySessionId && headerSessionId && querySessionId !== headerSessionId)
       return sendJson(res, 400, { error: 'Conflicting chat IDs.' });
     const requestedSessionId = querySessionId ?? headerSessionId;
-    const client = protectedPath && requestedSessionId ? await sessions.get(requestedSessionId) : sessions.defaultClient;
+    const client: DaemonSessionConnection =
+      protectedPath && requestedSessionId ? await sessions.get(requestedSessionId) : sessions.defaultClient;
 
     if (url.pathname === '/api/health') {
       return sendJson(res, 200, { ok: true, clients: clients.size, uptimeMs: Date.now() - startedAt });
@@ -814,6 +823,8 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
         logPath: getDataPath(join('logs', 'openbutler.log')),
         uptimeMs: Date.now() - startedAt,
         buildId: currentBuildId(),
+        backendBuildId: BUILD_ID,
+        hostBuildId: client.hostBuildId ?? null,
         providerId: client.runtime.providerId,
         modelId: client.runtime.modelId,
         contextWindowTokens: client.runtime.contextWindowTokens ?? null,

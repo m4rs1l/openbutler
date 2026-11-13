@@ -244,7 +244,7 @@ it('preserves an owner stop across saves and releases it only on explicit input'
   session!.stop({ holdQueue: true });
   release();
   await first;
-  session!.flushSave();
+  await session!.flushSave();
   const { loadSavedSession } = await import('../src/session-store.js');
   const saved = loadSavedSession(session!.getSnapshot().session.id)!;
   expect(saved.automaticWakeHeld).toBe(true);

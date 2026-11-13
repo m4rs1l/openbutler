@@ -20,6 +20,8 @@ export type DaemonStatus = {
   unresponsive?: true;
   /** The entry script the host process runs: a built bundle or the source tree. Clients compare it with their own entry to notice a code-vintage skew. */
   entry?: string;
+  /** Immutable compiled backend identity; null for source runs, absent on older hosts. */
+  buildId?: string | null;
 };
 
 export type RuntimeViewData = Omit<
@@ -83,6 +85,8 @@ export type DaemonRequest = { version: 2; id: string; action: string; [key: stri
 export interface AttachResult {
   /** How the host process was launched: a built bundle or the source tree. */
   hostEntry?: string;
+  /** Immutable compiled backend identity; null for source runs, absent on older hosts. */
+  hostBuildId?: string | null;
   /** The host can attach to a conversation without replacing another controller. */
   sessionAttachments?: true;
   workspaceKey?: string;

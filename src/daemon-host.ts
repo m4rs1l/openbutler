@@ -2,6 +2,7 @@ import { storeAttachment, verifyAttachmentPath, type FileAttachment } from './at
 import { daemonCommandAction } from './commands/registry.js';
 import { TEAM_CAPABILITY_MAX_AGE_MS } from './team/contracts.js';
 import { randomUUID } from 'node:crypto';
+import { BUILD_ID } from './build-info.js';
 import { DaemonFrameDecoder } from './daemon-frames.js';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -1032,6 +1033,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     pid: process.pid,
     startedAt: options.startedAt,
     entry: process.argv[1] ?? '',
+    buildId: BUILD_ID,
     workspaceCount: workspaces.size + (custodianWorkspace ? 1 : 0),
     connectedClients:
       [...workspaces.values()].reduce(
@@ -1047,6 +1049,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
 
   const host: DaemonHost = {
     async start() {
+      // Chats reopen by their saved id, so these old workspace markers were never read.
+      ledger.deleteStateByPrefix(RESTART_SESSION_KEY_PREFIX + 'chat:');
       ledger.recoverInterruptedEvents();
       ledger.recoverInterruptedActions();
       recoverWorkers(ledger);
@@ -1299,7 +1303,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       if (chat?.saved) controller.openSession(chat.saved);
       else if (chat) controller.selectProject(chat.projectId ?? null, controller.getSnapshot().session.id);
       if (restartSessionId) {
-        controller.loadSession(restartSessionId);
+        await controller.loadSession(restartSessionId);
         await controller.restoreSessionModel();
         ledger.setState(RESTART_SESSION_KEY_PREFIX + key, '');
       }
@@ -1459,7 +1463,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         pendingReports: () => serveReportLine(CUSTODIAN_SESSION_ID),
       });
       if (saved) {
-        controller.loadSession(CUSTODIAN_SESSION_ID);
+        await controller.loadSession(CUSTODIAN_SESSION_ID);
         // The restored record may carry a scope the runtime was not built with.
         await controller.restoreSessionModel();
       } else {
@@ -1543,7 +1547,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     workspaces.delete(key);
     workspace.unsubscribe();
     const sessionId = workspace.controller.getSnapshot().session.id;
-    if (sessionId) ledger.setState(RESTART_SESSION_KEY_PREFIX + key, sessionId);
+    if (sessionId && !key.startsWith('chat:')) ledger.setState(RESTART_SESSION_KEY_PREFIX + key, sessionId);
     try {
       await workspace.controller.flushSave();
     } catch (error) {
@@ -1661,13 +1665,13 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         ...(registry ? { registry } : {}),
       },
     );
-    if (extra.restoreSessionId) controller.loadSession(extra.restoreSessionId);
+    if (extra.restoreSessionId) await controller.loadSession(extra.restoreSessionId);
     const stateKey = persistentKey ? `session:${persistentKey}` : null;
     if (stateKey) {
       const savedId = ledger.getState(stateKey);
       if (savedId) {
         try {
-          controller.loadSession(savedId);
+          await controller.loadSession(savedId);
         } catch (error) {
           options.log(`Could not restore ${persistentKey}: ${String(error)}`);
         }
@@ -1692,7 +1696,10 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       const lineage = readWorkerRecord(ledger, next.session.id);
       if (!closing && lineage?.background && !previous.busy && next.busy)
         writeWorkerRecord(ledger, next.session.id, { ...lineage, finished: false });
-      if (!closing && lineage?.background && previous.busy && !next.busy) finishBackgroundWorker(privateSession);
+      if (!closing && lineage?.background && previous.busy && !next.busy)
+        void finishBackgroundWorker(privateSession).catch((error: unknown) =>
+          options.log(`Background worker could not settle: ${String(error)}`),
+        );
 
       const event = makeSessionEvent(previous, next, workspace.runtime);
       for (const client of privateSession.clients) writeEvent(client, event);
@@ -2006,7 +2013,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     const custodian = await getCustodianWorkspace(custodianWorkspace?.runtime.workspaceRoot ?? settings.workspaceRoot ?? custodianRoot);
     const custodianSessionId = custodian.controller.getSnapshot().session.id;
     if (attachment?.image) {
-      custodian.controller.flushSave({ allowEmpty: true });
+      await custodian.controller.flushSave({ allowEmpty: true });
       if (custodian.controller.getSnapshot().sessionSaveError) throw new Error('The attachment session could not be saved.');
       file = storeAttachment(custodianSessionId, attachment.image.bytes, attachment.image.filename, attachment.image.mediaType);
     }
@@ -2604,7 +2611,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
     void chat.controller
       .sendMessage({ text: custodianFramedText(senderSessionId, input.instruction), images: [], communication: { source: 'worker' } })
       .catch((error: unknown) => options.log(`The created session's first turn failed: ${String(error)}`));
-    chat.controller.flushSave({ allowEmpty: true });
+    await chat.controller.flushSave({ allowEmpty: true });
     return { status: 'created', session: sessionId };
   }
 
@@ -3106,8 +3113,9 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         if (request.restart !== undefined && typeof request.restart !== 'boolean') throw new Error('restart must be a boolean.');
         const restarting = request.restart === true;
         if (restarting) {
-          for (const [key, workspace] of workspaces)
-            ledger.setState(RESTART_SESSION_KEY_PREFIX + key, workspace.controller.getSnapshot().session.id);
+          for (const [key, workspace] of workspaces) {
+            if (!key.startsWith('chat:')) ledger.setState(RESTART_SESSION_KEY_PREFIX + key, workspace.controller.getSnapshot().session.id);
+          }
         }
         options.log(`OpenButler host ${restarting ? 'restart' : 'stop'} requested over IPC.`);
         for (const client of sockets) {
@@ -3247,6 +3255,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           if (socket.destroyed) return;
           writeResponse(socket, request.id, true, {
             hostEntry: process.argv[1] ?? '',
+            hostBuildId: BUILD_ID,
             sessionAttachments: true,
             workspaceKey: chat.workspace.root,
             clientKind,
@@ -3356,6 +3365,7 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         });
         const result: AttachResult = {
           hostEntry: process.argv[1] ?? '',
+          hostBuildId: BUILD_ID,
           sessionAttachments: true,
           clientKind,
           // The attachment binds to the workspace that hosts the session, which for a
@@ -3562,10 +3572,13 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           writeResponse(socket, request.id, true, { accepted: true });
           return;
         }
-        case 'session.flush':
-          controller.flushSave();
+        case 'session.flush': {
+          await controller.flushSave();
+          const error = controller.getSnapshot().sessionSaveError;
+          if (error) throw new Error(error);
           writeResponse(socket, request.id, true, { saved: true });
           return;
+        }
         case 'runtime.save-reasoning': {
           const variantId = requireString(request.variantId, 'variantId', 256);
           // Session-scoped by design: the effort recorded here belongs to this

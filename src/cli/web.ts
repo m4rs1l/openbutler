@@ -1,4 +1,5 @@
 import { writeFileSync } from 'node:fs';
+import { BUILD_ID } from '../build-info.js';
 import * as ui from './ui.js';
 import type { Parsed } from './args.js';
 import {
@@ -65,7 +66,7 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
       // Verifying here keeps the friendly message and the vintage warning on this
       // terminal instead of losing both in the detached child's log.
       const hostStatus = await requireBackgroundHost();
-      const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry);
+      const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
       if (vintageWarning) ui.warn(vintageWarning);
       const child = await startWebProcess(process.argv[1], port, host, workspaceRoot);
       ui.success(`Web server running in the background (pid ${child.pid}).`);
@@ -97,7 +98,7 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
   }
 
   const hostStatus = await requireBackgroundHost(serving ? SERVE_HOST_WAIT_MS : 0);
-  const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry);
+  const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
   if (vintageWarning) ui.warn(vintageWarning);
   let server: WebServer | null = null;
   try {

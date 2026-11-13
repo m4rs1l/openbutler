@@ -69,7 +69,12 @@ export function resumeChatAttach(clientKind: LocalClientKind): AttachOptions {
   return resumed ? { clientKind, chatSessionId: resumed.id } : { clientKind, newChatSession: true };
 }
 
-export async function connectDaemonSession(workspacePath: string, options: AttachOptions): Promise<AgentSessionClient> {
+export interface DaemonSessionConnection extends AgentSessionClient {
+  /** The host's imported backend identity; null or absent means it is not known. */
+  readonly hostBuildId?: string | null;
+}
+
+export async function connectDaemonSession(workspacePath: string, options: AttachOptions): Promise<DaemonSessionConnection> {
   const workspaceRoot = canonicalScopeRoot(workspacePath);
   const socket = await connectSocket();
   const client = new DaemonSessionClient(socket, workspaceRoot, options);
@@ -82,7 +87,7 @@ export async function connectDaemonSession(workspacePath: string, options: Attac
   }
 }
 
-class DaemonSessionClient implements AgentSessionClient {
+class DaemonSessionClient implements DaemonSessionConnection {
   private frames = new DaemonFrameDecoder(MAX_DAEMON_FRAME_BYTES);
   private readonly pending = new Map<string, PendingRequest>();
   private readonly listeners = new Set<() => void>();
@@ -116,6 +121,8 @@ class DaemonSessionClient implements AgentSessionClient {
   private workspaceKey: string;
   /** The host's launch entry, carried on every attach. */
   hostEntry: string | null = null;
+  /** Refreshed from attach metadata, never from the files a rebuild can overwrite. */
+  hostBuildId: string | null = null;
   private savedSessions: SessionSummary[] = [];
 
   readonly runtime: AgentSessionRuntimeView;
@@ -218,6 +225,7 @@ class DaemonSessionClient implements AgentSessionClient {
     });
     if (!isAttachResult(result)) throw new Error('The OpenButler host returned an invalid session attachment.');
     this.hostEntry = typeof result.hostEntry === 'string' && result.hostEntry ? result.hostEntry : null;
+    this.hostBuildId = typeof result.hostBuildId === 'string' && result.hostBuildId ? result.hostBuildId : null;
     // A host that cannot even identify a web client is older than one that cannot open chats, so
     // it is reported first: the owner should see the cause, not the first symptom of it.
     if (options.clientKind === 'web' && result.clientKind !== 'web')
@@ -348,8 +356,8 @@ class DaemonSessionClient implements AgentSessionClient {
     return this.request('session.select-project', { projectId, sessionId }).then(() => undefined);
   }
 
-  flushSave(): Promise<void> {
-    return this.submit('session.flush');
+  async flushSave(): Promise<void> {
+    await this.request('session.flush');
   }
 
   close(): void {
@@ -741,6 +749,7 @@ function isAttachResult(value: unknown): value is AttachResult {
     isSessionSnapshotData(value.snapshot) &&
     isRuntimeViewData(value.runtime) &&
     Array.isArray(value.savedSessions) &&
+    (value.hostBuildId === undefined || value.hostBuildId === null || typeof value.hostBuildId === 'string') &&
     (value.clientKind === undefined || LOCAL_CLIENT_KINDS.some((kind) => kind === value.clientKind))
   );
 }

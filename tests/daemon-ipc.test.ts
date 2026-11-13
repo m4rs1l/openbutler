@@ -363,6 +363,28 @@ async function replaceFixtureHost() {
 }
 
 describe('shared host and session IPC', () => {
+  it('carries the imported backend build identity through status and attachments', async () => {
+    const { BUILD_ID } = await import('../src/build-info.js');
+    expect(host.getStatus()).toHaveProperty('buildId', BUILD_ID);
+    const attached = await client({ isolatedSession: true });
+    expect(attached).toHaveProperty('hostBuildId', BUILD_ID);
+  });
+
+  it('does not acknowledge an explicit flush when the session writer fails', async () => {
+    const { ensureSessionDirectory, sessionFilePath } = await import('../src/session-paths.js');
+    const attached = await client({ isolatedSession: true });
+    attached.addEntry({ kind: 'user', text: 'Keep this message after a failed write.' });
+    const id = attached.getSnapshot().session.id;
+    ensureSessionDirectory(id);
+    const path = sessionFilePath(id);
+    mkdirSync(path);
+    await expect(attached.flushSave()).rejects.toThrow();
+    rmSync(path, { recursive: true });
+    await attached.flushSave();
+    const { loadSavedSession } = await import('../src/session-store.js');
+    expect(loadSavedSession(id)?.entries[0]).toMatchObject({ text: 'Keep this message after a failed write.' });
+  });
+
   it('demands an explicit target and keeps the custodian out of the chat layer', async () => {
     const { listSavedSessions, loadSavedSession } = await import('../src/session-store.js');
     const { CUSTODIAN_SESSION_ID } = await import('../src/session-paths.js');
@@ -432,6 +454,153 @@ describe('shared host and session IPC', () => {
     expect(catalog.find((session) => session.id === bId)?.running).toBe(true);
     b.stop();
     await vi.waitFor(() => expect(b.isBusy).toBe(false));
+  });
+
+  it('cleans only obsolete chat restart markers at startup and still restores root sessions', async () => {
+    const { ActivityLedger } = await import('../src/activity-ledger.js');
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession, loadSavedSession, saveSession } = await import('../src/session-store.js');
+    const { CUSTODIAN_SESSION_ID } = await import('../src/session-paths.js');
+    const { scopeMapKey } = await import('../src/workspace-origin.js');
+    const custodianRecord = loadSavedSession(CUSTODIAN_SESSION_ID)!;
+    const chat = await newChat();
+    const chatId = chat.getSnapshot().session.id;
+    await chat.sendMessage({ text: 'Keep the saved chat transcript.', images: [] });
+    await vi.waitFor(() => expect(chat.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant')).toBe(true));
+    await chat.flushSave();
+    await chat.close();
+    const chatRecord = loadSavedSession(chatId)!;
+    const rootSession = createSession('fixture', 'fixture', 262_144, root);
+    rootSession.entries.push({ kind: 'user', text: 'Keep the root transcript.' });
+    const savedRoot = saveSession(rootSession);
+    const prefix = 'host.restart.workspace:chat:';
+    const stale = [prefix, `${prefix}stale-session`, `${prefix}%_*[legacy`];
+    const rootKey = `host.restart.workspace:${scopeMapKey(root)}`;
+    const preserved = new Map([
+      [rootKey, savedRoot.id],
+      ['host.restart.workspace:chat', 'no-trailing-colon'],
+      ['host.restart.workspace:Chat:keep', 'case-sensitive'],
+      ['host.restart.workspace:chats:keep', 'adjacent-prefix'],
+      ['unrelated:host.restart.workspace:chat:keep', 'unrelated-state'],
+      ['session:schedule:keep', 'schedule-session'],
+    ]);
+    const sentinel = join(root, 'keep-unrelated.txt');
+    writeFileSync(sentinel, 'Keep this file.');
+    const writer = new ActivityLedger(join(root, 'state.db'));
+    try {
+      for (const key of stale) writer.setState(key, chatId);
+      for (const [key, value] of preserved) writer.setState(key, value);
+    } finally {
+      writer.close();
+    }
+    const loadSession = vi.spyOn(AgentSessionController.prototype, 'loadSession');
+    try {
+      await replaceFixtureHost();
+      const reader = new ActivityLedger(join(root, 'state.db'), { readOnly: true });
+      try {
+        for (const key of stale) expect(reader.getState(key)).toBeNull();
+        for (const [key, value] of preserved) expect(reader.getState(key)).toBe(value);
+      } finally {
+        reader.close();
+      }
+      expect(readFileSync(sentinel, 'utf8')).toBe('Keep this file.');
+      expect(loadSavedSession(chatId)).toEqual(chatRecord);
+      expect(loadSavedSession(CUSTODIAN_SESSION_ID)).toMatchObject({
+        id: custodianRecord.id,
+        updatedAt: custodianRecord.updatedAt,
+        entries: custodianRecord.entries,
+      });
+      await client({ isolatedSession: true });
+      const restoreIndex = loadSession.mock.calls.findIndex(([id]) => id === savedRoot.id);
+      expect(restoreIndex).toBeGreaterThanOrEqual(0);
+      const restoredRoot = loadSession.mock.instances[restoreIndex] as InstanceType<typeof AgentSessionController>;
+      expect(restoredRoot.getSnapshot().session).toMatchObject({ id: savedRoot.id, entries: savedRoot.entries });
+    } finally {
+      loadSession.mockRestore();
+    }
+  });
+
+  it('skips chat restart markers on IPC restart while preserving root restoration', async () => {
+    const { ActivityLedger } = await import('../src/activity-ledger.js');
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession, saveSession } = await import('../src/session-store.js');
+    const { scopeMapKey } = await import('../src/workspace-origin.js');
+    const rootSession = createSession('fixture', 'fixture', 262_144, root);
+    rootSession.entries.push({ kind: 'user', text: 'Restore the root after IPC restart.' });
+    const savedRoot = saveSession(rootSession);
+    const rootKey = `host.restart.workspace:${scopeMapKey(root)}`;
+    const writer = new ActivityLedger(join(root, 'state.db'));
+    try {
+      writer.setState(rootKey, savedRoot.id);
+    } finally {
+      writer.close();
+    }
+    const isolated = await client({ isolatedSession: true });
+    const chat = await newChat();
+    const chatId = chat.getSnapshot().session.id;
+    await chat.sendMessage({ text: 'Preserve the restarted chat.', images: [] });
+    await vi.waitFor(() => expect(chat.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant')).toBe(true));
+    await chat.flushSave();
+    const setState = vi.spyOn(ActivityLedger.prototype, 'setState');
+    const loadSession = vi.spyOn(AgentSessionController.prototype, 'loadSession');
+    try {
+      await requestHost('stop', { restart: true });
+      expect(setState.mock.calls.filter(([key]) => key.startsWith('host.restart.workspace:chat:'))).toEqual([]);
+      const reader = new ActivityLedger(join(root, 'state.db'), { readOnly: true });
+      try {
+        expect(reader.getState(rootKey)).toBe(savedRoot.id);
+      } finally {
+        reader.close();
+      }
+      await Promise.all([chat.close(), isolated.close()]);
+      await replaceFixtureHost();
+      const restoredChat = await openChat(chatId);
+      expect(restoredChat.getSnapshot().session.entries).toContainEqual(
+        expect.objectContaining({ kind: 'user', text: 'Preserve the restarted chat.' }),
+      );
+      await client({ isolatedSession: true });
+      const restoreIndex = loadSession.mock.calls.findIndex(([id]) => id === savedRoot.id);
+      expect(restoreIndex).toBeGreaterThanOrEqual(0);
+      const restoredRoot = loadSession.mock.instances[restoreIndex] as InstanceType<typeof AgentSessionController>;
+      expect(restoredRoot.getSnapshot().session).toMatchObject({ id: savedRoot.id, entries: savedRoot.entries });
+    } finally {
+      setState.mockRestore();
+      loadSession.mockRestore();
+    }
+  });
+
+  it('skips chat restart markers on idle eviction without losing saved chats', async () => {
+    const { ActivityLedger } = await import('../src/activity-ledger.js');
+    const { loadSavedSession } = await import('../src/session-store.js');
+    const chat = await newChat();
+    const chatId = chat.getSnapshot().session.id;
+    await chat.sendMessage({ text: 'Preserve the evicted chat.', images: [] });
+    await vi.waitFor(() => expect(chat.getSnapshot().session.entries.some((entry) => entry.kind === 'assistant')).toBe(true));
+    await chat.flushSave();
+    await chat.close();
+    await vi.waitFor(() => expect(host.getStatus().connectedClients).toBe(0));
+    const nextChat = await newChat();
+    expect(host.getStatus().workspaceCount).toBe(3);
+    const setState = vi.spyOn(ActivityLedger.prototype, 'setState');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 30 * 60_000 + 1_000);
+    try {
+      // Detaching sweeps other workspaces: the old chat expires, while the just-detached
+      // chat gets a fresh last-activity time and the custodian is never a candidate.
+      await nextChat.close();
+      await vi.waitFor(() => expect(host.getStatus().workspaceCount).toBe(2));
+      expect(setState.mock.calls.filter(([key]) => key.startsWith('host.restart.workspace:chat:'))).toEqual([]);
+      expect(loadSavedSession(chatId)?.entries).toContainEqual(
+        expect.objectContaining({ kind: 'user', text: 'Preserve the evicted chat.' }),
+      );
+    } finally {
+      clock.mockRestore();
+      setState.mockRestore();
+    }
+    const reopened = await openChat(chatId);
+    expect(reopened.getSnapshot().session.id).toBe(chatId);
+    expect(reopened.getSnapshot().session.entries).toContainEqual(
+      expect.objectContaining({ kind: 'user', text: 'Preserve the evicted chat.' }),
+    );
   });
 
   it('restores a closed chat after a host restart and leaves the custodian record alone', async () => {
@@ -2801,9 +2970,11 @@ describe('shared host and session IPC', () => {
       releaseWorker = resolve;
     });
     let parentStep = 0;
+    let workerStarted = false;
     model.doStream = vi.fn(async (options: { prompt?: unknown }) => {
       const serialized = JSON.stringify(options.prompt ?? []);
       if (serialized.includes('You are a worker:')) {
+        workerStarted = true;
         await workerGate;
         return textStream('WORKER-REPORT: view test done.');
       }
@@ -2828,6 +2999,7 @@ describe('shared host and session IPC', () => {
     await vi.waitFor(() =>
       expect(viewer.getSnapshot().session.entries.some((entry) => entry.kind === 'tool' && entry.running === true)).toBe(true),
     );
+    await vi.waitFor(() => expect(workerStarted).toBe(true));
 
     const live = await client({ runningWorkerOf: mainId });
     expect(live.getSnapshot().session.id).not.toBe(mainId);
@@ -3160,7 +3332,35 @@ describe('shared host and session IPC', () => {
     expect(noteResult).toContain('1 call');
     expect(noteResult).toContain('parent_message');
 
+    const workerId = spawnResult?.kind === 'tool' ? spawnResult.session : undefined;
+    if (!workerId) throw new Error('Missing worker id.');
+    const store = await import('../src/session-store.js');
+    const save = store.saveSessionAsync;
+    let writingStarted = false;
+    let releasePersistence!: () => void;
+    const persistenceGate = new Promise<void>((resolve) => (releasePersistence = resolve));
+    const saveSpy = vi.spyOn(store, 'saveSessionAsync').mockImplementation(async (saved, options) => {
+      if (saved.id === workerId && saved.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('WORKER-REPORT'))) {
+        writingStarted = true;
+        await persistenceGate;
+      }
+      return save(saved, options);
+    });
     releaseWorker();
+    try {
+      await vi.waitFor(() => expect(writingStarted).toBe(true), { timeout: 5_000 });
+      const { ActivityLedger } = await import('../src/activity-ledger.js');
+      const { readWorkerRecord } = await import('../src/worker-records.js');
+      const reader = new ActivityLedger(join(root, 'state.db'), { readOnly: true });
+      try {
+        expect(readWorkerRecord(reader, workerId)?.finished).toBe(false);
+      } finally {
+        reader.close();
+      }
+    } finally {
+      releasePersistence();
+      saveSpy.mockRestore();
+    }
     await vi.waitFor(() =>
       expect(
         viewer

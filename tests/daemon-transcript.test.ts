@@ -22,10 +22,12 @@ let runtime: RuntimeViewData;
 let connect: typeof import('../src/daemon-client.js').connectDaemonSession;
 let supportsClientKind: boolean;
 let supportsChats: boolean;
+let hostBuildId: string | null | undefined;
 
 beforeEach(async () => {
   supportsClientKind = true;
   supportsChats = true;
+  hostBuildId = undefined;
   root = mkdtempSync(join(tmpdir(), 'openbutler-transcript-'));
   vi.stubEnv('OPENBUTLER_DATA_DIR', root);
   vi.resetModules();
@@ -85,6 +87,7 @@ beforeEach(async () => {
               snapshot,
               runtime,
               savedSessions: [],
+              ...(hostBuildId !== undefined ? { hostBuildId } : {}),
               ...(supportsClientKind ? { clientKind: request.clientKind ?? 'terminal' } : {}),
               ...(supportsChats ? { sessionAttachments: true, workspaceKey: root } : {}),
             },
@@ -129,6 +132,13 @@ function patch(append: SessionEntry[] = [], appendText: Array<{ index: number; d
     patch: { ...snapshot, session, runtime, entriesPatch: { kind: 'delta', append, appendText, replace: [] } },
   });
 }
+
+it.each([undefined, null, '', 'compiled-generation'])('carries optional host build identity %s without inventing an ID', async (id) => {
+  hostBuildId = id;
+  const attached = await connect(root, { isolatedSession: true });
+  client = attached;
+  expect(attached.hostBuildId).toBe(id || null);
+});
 
 it('asks for a restart instead of falling back when the host cannot identify the client or open chats', async () => {
   supportsClientKind = false;

@@ -206,22 +206,34 @@ export async function getDaemonStatus(): Promise<DaemonStatus | null> {
   return null;
 }
 
-/** The host entry decides its code vintage: a `.ts`/`.tsx` entry runs the source tree, anything else runs a built bundle. */
+/** The host entry decides its code vintage: a `.ts`/`.tsx` entry runs the source tree, anything else runs compiled code. */
 export function hostVintage(entry: string | undefined | null): 'source' | 'dist' | 'unknown' {
   if (!entry) return 'unknown';
   return /\.tsx?$/i.test(entry) ? 'source' : 'dist';
 }
 
 /**
- * A client and a host built from different code behave differently while looking
- * identical, so the skew is named once when a client attaches.
+ * Name source/dist skew or unequal immutable compiled identities when a client
+ * attaches. Missing IDs from older hosts cannot prove a compiled-build mismatch.
  */
-export function hostVintageMismatchWarning(clientEntry: string | undefined | null, hostEntry: string | undefined | null): string | null {
+export function hostVintageMismatchWarning(
+  clientEntry: string | undefined | null,
+  hostEntry: string | undefined | null,
+  clientBuildId?: string | null,
+  hostBuildId?: string | null,
+): string | null {
   const client = hostVintage(clientEntry);
   const host = hostVintage(hostEntry);
-  if (client === 'unknown' || host === 'unknown' || client === host) return null;
-  const label = (kind: 'source' | 'dist') => (kind === 'source' ? 'source (tsx)' : 'a built bundle');
-  return `Code vintage mismatch: this client runs ${label(client)} but the background host runs ${label(host)}. Run \`openbutler restart\` here to relaunch the host from this client.`;
+  if (client === 'unknown' || host === 'unknown') return null;
+  const restart = 'Run `openbutler restart` here to relaunch the host from this client.';
+  if (client !== host) {
+    const label = (kind: 'source' | 'dist') => (kind === 'source' ? 'source (tsx)' : 'a built bundle');
+    return `Code vintage mismatch: this client runs ${label(client)} but the background host runs ${label(host)}. ${restart}`;
+  }
+  if (client === 'dist' && clientBuildId && hostBuildId && clientBuildId !== hostBuildId) {
+    return `Backend build mismatch: this client runs compiled build ${clientBuildId} but the background host runs compiled build ${hostBuildId}. ${restart}`;
+  }
+  return null;
 }
 
 /**
@@ -1001,7 +1013,8 @@ function isDaemonStatus(value: unknown): value is DaemonStatus {
     typeof value.pid === 'number' &&
     typeof value.startedAt === 'string' &&
     Number.isSafeInteger(value.workspaceCount) &&
-    Number.isSafeInteger(value.connectedClients)
+    Number.isSafeInteger(value.connectedClients) &&
+    (value.buildId === undefined || value.buildId === null || typeof value.buildId === 'string')
   );
 }
 

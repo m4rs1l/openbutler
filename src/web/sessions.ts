@@ -97,7 +97,9 @@ export class WebSessions {
       this.makeRoom();
       this.opening++;
       try {
-        return this.remember(await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', chatSessionId: id, entriesWindow: WEB_ENTRIES_WINDOW }));
+        return this.remember(
+          await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', chatSessionId: id, entriesWindow: WEB_ENTRIES_WINDOW }),
+        );
       } finally {
         this.opening--;
       }
@@ -114,7 +116,12 @@ export class WebSessions {
     this.makeRoom();
     this.opening++;
     try {
-      const client = await connectDaemonSession(this.workspaceRoot, { clientKind: 'web', newChatSession: true, projectId, entriesWindow: WEB_ENTRIES_WINDOW });
+      const client = await connectDaemonSession(this.workspaceRoot, {
+        clientKind: 'web',
+        newChatSession: true,
+        projectId,
+        entriesWindow: WEB_ENTRIES_WINDOW,
+      });
       if (client.getSnapshot().session.id === this.defaultClient.getSnapshot().session.id) {
         void client.close();
         throw new Error('The host did not open a new chat.');

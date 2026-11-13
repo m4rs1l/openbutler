@@ -146,6 +146,29 @@ export interface UsageRow {
 const TERMINAL_ACTION_STATES = new Set<ToolActionState>(['completed', 'failed', 'cancelled', 'denied']);
 const MAX_STORED_JSON_CHARS = 32_000;
 
+// Preview and deletion use the same selection; age alone never settles work.
+const PRUNABLE_ACTIONS_SQL = `
+  SELECT request_id FROM openbutler_actions
+  WHERE state IN (${[...TERMINAL_ACTION_STATES].map((state) => `'${state}'`).join(',')})
+    AND created_at < ? AND updated_at < ?
+`;
+const PRUNABLE_EVENTS_SQL = `
+  SELECT e.event_id FROM openbutler_events e
+  WHERE e.received_at < ? AND e.updated_at < ?
+    AND e.status IN ('delivered', 'ignored')
+    AND e.source != 'worker'
+    AND e.kind NOT IN ('schedule.at', 'schedule.window')
+    AND (e.source != 'owner-inbox' OR EXISTS (
+      SELECT 1 FROM openbutler_state
+      WHERE key = 'owner-inbox:read:' || e.event_id OR key = 'owner-inbox:reply:' || e.event_id
+    ))
+    AND (e.source != 'agent-inbox' OR e.status = 'ignored' OR EXISTS (
+      SELECT 1 FROM openbutler_state WHERE key = 'agent-inbox:read:' || e.event_id
+    ))
+    AND e.event_id NOT IN (SELECT event_id FROM openbutler_actions WHERE event_id IS NOT NULL)
+    AND e.event_id NOT IN (SELECT event_id FROM openbutler_usage WHERE event_id IS NOT NULL)
+`;
+
 /** Table and index definitions shared by the writer and the in-memory reader. */
 const LEDGER_SCHEMA = `
   CREATE TABLE IF NOT EXISTS openbutler_events (
@@ -689,6 +712,13 @@ export class ActivityLedger {
       .run(key, value);
   }
 
+  /** Deletes only state keys beginning with a nonempty literal, case-sensitive prefix. */
+  deleteStateByPrefix(prefix: string): number {
+    this.assertOpen();
+    if (!prefix) throw new Error('State prefix must not be empty.');
+    return Number(this.database.prepare('DELETE FROM openbutler_state WHERE instr(key, ?) = 1').run(prefix).changes);
+  }
+
   listActions(limit = 30): ToolActionRow[] {
     this.assertOpen();
     if (!this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'openbutler_actions'").get()) return [];
@@ -745,41 +775,45 @@ export class ActivityLedger {
     return summary;
   }
 
-  /** Counts what an explicit prune would remove, without writing anything. */
+  /** Counts the explicit prune selection in one read-only snapshot. */
   previewPruneBefore(cutoffIso: string, target: LedgerPruneTarget): LedgerPruneCounts {
     this.assertOpen();
-    return target === 'events'
-      ? {
-          events: this.count('SELECT COUNT(*) AS count FROM openbutler_events WHERE received_at < ?', cutoffIso),
-          actions: 0,
-          transitions: 0,
-        }
-      : {
-          events: 0,
-          actions: this.count('SELECT COUNT(*) AS count FROM openbutler_actions WHERE created_at < ?', cutoffIso),
-          transitions: this.count(
-            `SELECT COUNT(*) AS count FROM openbutler_action_transitions
-             WHERE created_at < ? OR request_id IN (SELECT request_id FROM openbutler_actions WHERE created_at < ?)`,
-            cutoffIso,
-            cutoffIso,
-          ),
-        };
+    if (target === 'events') {
+      return {
+        events: this.count(`SELECT COUNT(*) AS count FROM (${PRUNABLE_EVENTS_SQL})`, cutoffIso, cutoffIso),
+        actions: 0,
+        transitions: 0,
+      };
+    }
+    const counts = this.database
+      .prepare(
+        `WITH selected_actions AS (${PRUNABLE_ACTIONS_SQL})
+        SELECT (SELECT COUNT(*) FROM selected_actions) AS actions,
+          (SELECT COUNT(*) FROM openbutler_action_transitions
+           WHERE request_id IN (SELECT request_id FROM selected_actions)) AS transitions`,
+      )
+      .get(cutoffIso, cutoffIso) as { actions: number; transitions: number };
+    return { events: 0, actions: Number(counts.actions), transitions: Number(counts.transitions) };
   }
 
-  /** Removes records older than the cutoff. Only explicit user pruning calls this. */
+  /** Worker and one-shot event identities remain replay guards even after delivery. */
   pruneBefore(cutoffIso: string, target: LedgerPruneTarget): LedgerPruneCounts {
-    this.assertOpen();
-    if (target === 'events') {
-      return { events: this.remove('DELETE FROM openbutler_events WHERE received_at < ?', cutoffIso), actions: 0, transitions: 0 };
-    }
-    const transitions = this.remove(
-      `DELETE FROM openbutler_action_transitions
-       WHERE created_at < ? OR request_id IN (SELECT request_id FROM openbutler_actions WHERE created_at < ?)`,
-      cutoffIso,
-      cutoffIso,
-    );
-    const actions = this.remove('DELETE FROM openbutler_actions WHERE created_at < ?', cutoffIso);
-    return { events: 0, actions, transitions };
+    return this.transaction(() => {
+      if (target === 'events') {
+        return {
+          events: this.remove(`DELETE FROM openbutler_events WHERE event_id IN (${PRUNABLE_EVENTS_SQL})`, cutoffIso, cutoffIso),
+          actions: 0,
+          transitions: 0,
+        };
+      }
+      const transitions = this.remove(
+        `DELETE FROM openbutler_action_transitions WHERE request_id IN (${PRUNABLE_ACTIONS_SQL})`,
+        cutoffIso,
+        cutoffIso,
+      );
+      const actions = this.remove(`DELETE FROM openbutler_actions WHERE request_id IN (${PRUNABLE_ACTIONS_SQL})`, cutoffIso, cutoffIso);
+      return { events: 0, actions, transitions };
+    });
   }
 
   private count(sql: string, ...parameters: Array<string | number>): number {

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { MockLanguageModelV3 } from 'ai/test';
@@ -60,6 +60,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await controller?.close();
+  await (await import('../src/session-writer.js')).closeIdleSessionWriter();
   controller = undefined;
   if (previousDataDir === undefined) delete process.env.OPENBUTLER_DATA_DIR;
   else process.env.OPENBUTLER_DATA_DIR = previousDataDir;
@@ -125,7 +126,7 @@ describe('recent ordering reads content activity', () => {
     const model = new MockLanguageModelV3({ modelId: 'model-a', doStream: async () => Promise.reject(new Error('unused')) });
     controller = new AgentSessionController(runtimeFor(model));
     controller.addEntry({ kind: 'user', text: 'hello' });
-    controller.flushSave();
+    await controller.flushSave();
 
     const file = store.listSessionFiles().find((entry) => entry.id === controller!.getSnapshot().session.id)!;
     const before = readFileSync(file.path, 'utf8');
@@ -138,10 +139,104 @@ describe('recent ordering reads content activity', () => {
 
     // Real content: a new message must persist and move the activity stamp.
     controller.addEntry({ kind: 'user', text: 'second' });
-    controller.flushSave();
+    await controller.flushSave();
     const after = readFileSync(file.path, 'utf8');
     expect(after).not.toBe(before);
     expect(store.readSessionHeader(file.path, file.id)!.lastActivityAt! >= (activityBefore ?? '')).toBe(true);
+  });
+});
+
+describe('session persistence responsiveness', () => {
+  it('preserves JSON semantics for provider URLs and binary image data', async () => {
+    const original = {
+      ...withUser(store, 'image references'),
+      conversation: [
+        {
+          role: 'user' as const,
+          content: [
+            { type: 'image' as const, image: new URL('https://example.com/fixture.png') },
+            { type: 'image' as const, image: Buffer.from([1, 2, 3]) },
+          ],
+        },
+      ],
+    };
+    const expected = JSON.parse(JSON.stringify(original.conversation));
+    await store.saveSessionAsync(original);
+    const file = store.listSessionFiles().find((candidate) => candidate.id === original.id)!;
+    expect(JSON.parse(readFileSync(file.path, 'utf8')).conversation).toEqual(expected);
+  });
+
+  it('orders overlapping saves without replacing newer live content', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'first' });
+    const first = controller.flushSave();
+    controller.addEntry({ kind: 'assistant', text: 'newer content' });
+    const second = controller.flushSave();
+    await Promise.all([first, second]);
+    expect(controller.getSnapshot().session.entries.at(-1)).toMatchObject({ text: 'newer content' });
+    const id = controller.getSnapshot().session.id;
+    expect(store.loadSavedSession(id)!.entries.at(-1)).toMatchObject({ text: 'newer content' });
+    const file = store.listSessionFiles().find((candidate) => candidate.id === id)!;
+    const before = readFileSync(file.path, 'utf8');
+    await controller.flushSave();
+    expect(readFileSync(file.path, 'utf8')).toBe(before);
+  });
+
+  it('keeps navigation isolated from an earlier save completing', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    const next = store.saveSession(withUser(store, 'other session'));
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'pending save' });
+    const previousId = controller.getSnapshot().session.id;
+    const pending = controller.flushSave();
+    controller.openSession(next);
+    await pending;
+    await controller.flushSave();
+    expect(controller.getSnapshot().session.id).toBe(next.id);
+    expect(controller.getSnapshot().session.entries).toEqual(next.entries);
+    expect(store.loadSavedSession(previousId)!.entries[0]).toMatchObject({ text: 'pending save' });
+  });
+
+  it('reports a failed worker write and retries without a synchronous fallback', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { ensureSessionDirectory, sessionFilePath } = await import('../src/session-paths.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'durable after retry' });
+    const id = controller.getSnapshot().session.id;
+    ensureSessionDirectory(id);
+    const path = sessionFilePath(id);
+    mkdirSync(path);
+    await controller.flushSave();
+    expect(controller.getSnapshot().sessionSaveError).toEqual(expect.any(String));
+    rmSync(path, { recursive: true });
+    await controller.flushSave();
+    expect(controller.getSnapshot().sessionSaveError).toBeNull();
+    expect(store.loadSavedSession(id)!.entries[0]).toMatchObject({ text: 'durable after retry' });
+  });
+
+  it('never serializes the whole transcript on the controller thread', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const model = new MockLanguageModelV3({ doStream: async () => Promise.reject(new Error('unused')) });
+    controller = new AgentSessionController(runtimeFor(model));
+    controller.addEntry({ kind: 'user', text: 'large transcript' });
+    controller.addEntry({ kind: 'assistant', text: 'x'.repeat(2_000_000) });
+    const stringify = JSON.stringify;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (value && typeof value === 'object' && Array.isArray(value.entries)) throw new Error('Transcript serialized on host thread');
+      return stringify(value, ...args);
+    });
+    try {
+      await controller.flushSave();
+      expect(controller.getSnapshot().sessionSaveError).toBeNull();
+      const saved = store.loadSavedSession(controller.getSnapshot().session.id)!;
+      expect(saved.entries.at(-1)).toMatchObject({ text: 'x'.repeat(2_000_000) });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
@@ -154,13 +249,13 @@ describe('a chat without a message is not a store file', () => {
 
     // Picking a project on the fresh chat must not create the file either.
     controller.selectProject(null, id);
-    controller.createNewSession(null);
+    await controller.createNewSession(null);
     expect(store.listSessionFiles()).toHaveLength(0);
     expect(store.listSavedSessions()).toEqual([]);
 
     // The first message is what brings the chat into existence.
     controller.addEntry({ kind: 'user', text: 'first' });
-    controller.flushSave();
+    await controller.flushSave();
     const files = store.listSessionFiles();
     expect(files).toHaveLength(1);
     expect(store.readSessionHeader(files[0]!.path, files[0]!.id)).toMatchObject({ hasUserMessage: true });

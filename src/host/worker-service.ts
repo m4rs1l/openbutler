@@ -338,7 +338,7 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     const running = countRunningWorkers(senderSessionId);
     const limitError = workerLimitError({ parentDepth: depth - 1, runningForParent: running.forParent, runningTotal: running.total, caps });
     if (limitError) return { status: 'busy', error: limitError };
-    parent.controller.flushSave();
+    await parent.controller.flushSave();
     if (parent.controller.getSnapshot().sessionSaveError)
       return { status: 'error', error: 'The parent session could not be persisted before delegation.' };
     const workspace =
@@ -362,9 +362,9 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     workers.set(workerId, workerRecord);
     writeWorkerRecord(ledger, workerId, { ...workerRecord, finished: false });
     if (request.background) {
-      void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }).catch((error: unknown) => {
+      void worker.controller.sendMessage({ text: workerTaskText(request), images: [] }).catch(async (error: unknown) => {
         releaseWorkerLeases(workerId);
-        worker.controller.flushSave();
+        await worker.controller.flushSave();
         options.log(`Background subagent failed to run (session ${workerId}): ${String(error)}`);
         if (!isClosing() && !readWorkerRecord(ledger, workerId)?.finished) {
           completeWorker(ledger, workerId, { report: 'The worker did not start successfully.', error: String(error) });
@@ -377,8 +377,8 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
       await worker.controller.sendMessage({ text: workerTaskText(request), images: [] });
-      worker.controller.flushSave();
-      const error = worker.controller.getLastRunError();
+      await worker.controller.flushSave();
+      const error = worker.controller.getLastRunError() ?? worker.controller.getSnapshot().sessionSaveError;
       markWorkerFinished(workerId);
       if (error) return { status: 'error', error: `The worker failed: ${error}`, session: workerId, mode: request.mode, depth };
       return {
@@ -413,16 +413,16 @@ export function createWorkerService(deps: WorkerServiceDeps) {
     return { toolCalls, lastTool };
   }
 
-  /** A terminal run publishes one versioned, durable result and one parent event. */
-  function finishBackgroundWorker(worker: PrivateSessionHost): void {
+  async function finishBackgroundWorker(worker: PrivateSessionHost): Promise<void> {
     if (isClosing()) return;
     const id = worker.controller.getSnapshot().session.id;
     releaseWorkerLeases(id);
+    await worker.controller.flushSave();
+    if (isClosing()) return;
     completeWorker(ledger, id, {
       report: lastAssistantReport(worker.controller.getSnapshot().session.entries),
-      error: worker.controller.getLastRunError(),
+      error: worker.controller.getLastRunError() ?? worker.controller.getSnapshot().sessionSaveError,
     });
-    worker.controller.flushSave();
     pumpEvents();
   }
 

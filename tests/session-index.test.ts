@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -138,6 +139,297 @@ async function buildEmbeddings(): Promise<void> {
     await index.close();
   }
 }
+
+/** A populated pre-external-content database, including a previously embedded row. */
+async function seedLegacyIndex(): Promise<SavedSession> {
+  const { EMBEDDING_RUNTIME_KEY } = await import('../src/memory-index.js');
+  const token = 'ghp_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij';
+  const text = `Earlier context ${'padding words '.repeat(20)}migrationalpha Crème brûlée ${token} final context`;
+  const session = saveSession({
+    title: `Legacy title ${token}`,
+    entries: [
+      { kind: 'user', text },
+      { kind: 'assistant', text: 'migrationalpha second reply' },
+      { kind: 'tool', command: 'legacycommand run', result: 'legacyoutput payload' },
+    ],
+  });
+  const file = store.listSessionFiles().find((candidate) => candidate.id === session.id)!;
+  const vector = new Float32Array(dimensions);
+  vector[7] = 1;
+  const database = openDb();
+  try {
+    database.exec(`
+      PRAGMA user_version = 37;
+      CREATE TABLE unrelated_state (value TEXT);
+      INSERT INTO unrelated_state VALUES ('untouched');
+      CREATE TABLE session_sources (
+        session_id TEXT PRIMARY KEY, title TEXT NOT NULL, workspace_root TEXT, updated_at TEXT NOT NULL,
+        entries_count INTEGER NOT NULL, file_mtime_ms INTEGER NOT NULL, file_size_bytes INTEGER NOT NULL,
+        embedding_model_key TEXT NOT NULL DEFAULT '', indexed_at TEXT NOT NULL
+      );
+      CREATE INDEX session_sources_workspace_idx ON session_sources(workspace_root);
+      CREATE TABLE session_entries (
+        session_id TEXT NOT NULL, entry INTEGER NOT NULL, chunk INTEGER NOT NULL, kind TEXT NOT NULL,
+        text TEXT NOT NULL, text_sha TEXT NOT NULL,
+        embedding BLOB CHECK(embedding IS NULL OR length(embedding) = ${dimensions * 4}),
+        PRIMARY KEY (session_id, entry, chunk)
+      ) WITHOUT ROWID;
+      CREATE INDEX session_entries_kind_idx ON session_entries(kind);
+      CREATE VIRTUAL TABLE session_fts USING fts5(text, session_id UNINDEXED, entry UNINDEXED, chunk UNINDEXED);
+    `);
+    database
+      .prepare('INSERT INTO session_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        session.id,
+        session.title,
+        session.workspaceRoot!,
+        session.updatedAt,
+        3,
+        Math.floor(file.modifiedAt),
+        file.sizeBytes,
+        EMBEDDING_RUNTIME_KEY,
+        'legacy-indexed-at',
+      );
+    const rows = [
+      { rowid: 41, entry: 1, chunk: 0, kind: 'user', text, embedding: new Uint8Array(vector.buffer) },
+      { rowid: 7, entry: 2, chunk: 0, kind: 'assistant', text: 'migrationalpha second reply', embedding: null },
+      { rowid: 93, entry: 3, chunk: 0, kind: 'command', text: 'legacycommand run', embedding: null },
+      { rowid: 94, entry: 3, chunk: 1, kind: 'output', text: 'legacyoutput payload', embedding: null },
+    ];
+    for (const row of rows) {
+      database
+        .prepare('INSERT INTO session_entries VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(session.id, row.entry, row.chunk, row.kind, row.text, createHash('sha256').update(row.text).digest('hex'), row.embedding);
+      database
+        .prepare('INSERT INTO session_fts (rowid, text, session_id, entry, chunk) VALUES (?, ?, ?, ?, ?)')
+        .run(row.rowid, row.text, session.id, row.entry, row.chunk);
+    }
+  } finally {
+    database.close();
+  }
+  return session;
+}
+
+function withDb<T>(callback: (database: DatabaseSync) => T): T {
+  const database = openDb();
+  try {
+    return callback(database);
+  } finally {
+    database.close();
+  }
+}
+
+function indexSnapshot(database: DatabaseSync) {
+  return {
+    sources: database.prepare('SELECT * FROM session_sources ORDER BY session_id').all(),
+    entries: database
+      .prepare(
+        `
+      SELECT session_id, entry, chunk, kind, text, text_sha, hex(embedding) AS embedding
+      FROM session_entries ORDER BY session_id, entry, chunk
+    `,
+      )
+      .all(),
+    lexical: database
+      .prepare(
+        `
+      SELECT rowid, session_id, entry, chunk, text, snippet(session_fts, 0, '', '', '…', 16) AS excerpt,
+             bm25(session_fts) AS rank
+      FROM session_fts WHERE session_fts MATCH 'migrationalpha*' ORDER BY bm25(session_fts), entry, chunk
+    `,
+      )
+      .all(),
+    version: database.prepare('PRAGMA user_version').get(),
+    unrelated: database.prepare('SELECT * FROM unrelated_state').all(),
+  };
+}
+
+function expectNoFtsMatches(database: DatabaseSync, query: string): void {
+  expect(database.prepare('SELECT rowid FROM session_fts WHERE session_fts MATCH ?').all(query)).toEqual([]);
+  database.exec("INSERT INTO session_fts(session_fts, rank) VALUES ('integrity-check', 1)");
+}
+
+describe('session index: lossless external-content migration', () => {
+  it('upgrades populated legacy storage without changing text, vectors, metadata, excerpts, or ranking', async () => {
+    const session = await seedLegacyIndex();
+    const before = withDb(indexSnapshot);
+    const legacyIds = withDb((database) =>
+      database.prepare('SELECT rowid, session_id, entry, chunk FROM session_fts ORDER BY rowid').all(),
+    );
+
+    const result = await search('migrationalpha');
+    expect(result.indexedEmbeddings).toBe(1);
+    expect(result.pendingEmbeddings).toBe(0);
+    expect(result.matches.map((match) => match.entry)).toEqual(before.lexical.map((row) => row.entry));
+    const user = result.matches.find((match) => match.entry === 1)!;
+    expect(user).toMatchObject({
+      sessionId: session.id,
+      entry: 1,
+      kind: 'user',
+      workspaceRoot: session.workspaceRoot,
+      updatedAt: session.updatedAt,
+      score: 1.2,
+    });
+    expect(user.snippet).toContain('migrationalpha Crème brûlée [redacted]');
+    expect(user.snippet).toContain('…');
+    expect(JSON.stringify(result)).not.toContain('ghp_');
+    expect(fake.session.run).not.toHaveBeenCalled();
+    expect((await search('legacyoutput', { includeOutputs: true })).matches[0]).toMatchObject({ entry: 3, kind: 'output' });
+
+    withDb((database) => {
+      expect(indexSnapshot(database)).toEqual(before);
+      expect(
+        database.prepare('SELECT content_id AS rowid, session_id, entry, chunk FROM session_entries ORDER BY content_id').all(),
+      ).toEqual(legacyIds);
+      expect(database.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_fts_content'").get()).toBeUndefined();
+      expect(database.prepare('PRAGMA table_info(session_entries)').all()).toContainEqual(
+        expect.objectContaining({
+          name: 'content_id',
+          type: 'INTEGER',
+          pk: 1,
+        }),
+      );
+      expect(() =>
+        database.exec(`
+        INSERT INTO session_entries (session_id, entry, chunk, kind, text, text_sha, embedding)
+        SELECT session_id, entry, chunk, kind, text, text_sha, embedding FROM session_entries LIMIT 1
+      `),
+      ).toThrow(/UNIQUE/);
+      database.exec("INSERT INTO session_fts(session_fts, rank) VALUES ('integrity-check', 1)");
+    });
+  });
+
+  it('preserves legacy rowid ordering for tied lexical ranks', async () => {
+    await seedLegacyIndex();
+    withDb((database) => {
+      const row = database.prepare('SELECT text, text_sha FROM session_entries WHERE entry = 1').get() as {
+        text: string;
+        text_sha: string;
+      };
+      database.prepare('UPDATE session_entries SET text = ?, text_sha = ? WHERE entry = 2').run(row.text, row.text_sha);
+      database.prepare('UPDATE session_fts SET text = ? WHERE entry = 2').run(row.text);
+      expect(
+        database.prepare("SELECT entry FROM session_fts WHERE session_fts MATCH 'migrationalpha' ORDER BY bm25(session_fts)").all(),
+      ).toEqual([{ entry: 2 }, { entry: 1 }]);
+    });
+    expect((await search('migrationalpha')).matches.map((match) => match.entry)).toEqual([2, 1]);
+  });
+
+  it.each(['missing postings', 'missing table'])('copies every legacy content row even with %s', async (mode) => {
+    await seedLegacyIndex();
+    const before = withDb(indexSnapshot);
+    withDb((database) => database.exec(mode === 'missing table' ? 'DROP TABLE session_fts' : 'DELETE FROM session_fts WHERE entry = 1'));
+    const result = await search('migrationalpha');
+    expect(result.total).toBe(2);
+    expect(result.indexedEntries).toBe(4);
+    expect(result.indexedEmbeddings).toBe(1);
+    withDb((database) => {
+      const after = indexSnapshot(database);
+      expect(after.entries).toEqual(before.entries);
+      expect(after.sources).toEqual(before.sources);
+      database.exec("INSERT INTO session_fts(session_fts, rank) VALUES ('integrity-check', 1)");
+    });
+  });
+
+  it.each(['missing', 'internal'])('reopens idempotently and repairs %s FTS without replacing content IDs or vectors', async (mode) => {
+    await seedLegacyIndex();
+    await search('migrationalpha');
+    const before = withDb(indexSnapshot);
+    const ids = withDb((database) => database.prepare('SELECT content_id FROM session_entries ORDER BY content_id').all());
+    const postings = withDb((database) => database.prepare('SELECT id, hex(block) AS block FROM session_fts_data ORDER BY id').all());
+
+    await search('migrationalpha');
+    withDb((database) => {
+      expect(database.prepare('SELECT id, hex(block) AS block FROM session_fts_data ORDER BY id').all()).toEqual(postings);
+      database.exec('DROP TABLE session_fts');
+      if (mode === 'internal') {
+        database.exec(`
+          CREATE VIRTUAL TABLE session_fts USING fts5(text, session_id UNINDEXED, entry UNINDEXED, chunk UNINDEXED);
+          INSERT INTO session_fts (text, session_id, entry, chunk) SELECT text, session_id, entry, chunk FROM session_entries;
+        `);
+      }
+    });
+
+    expect((await search('migrationalpha')).indexedEmbeddings).toBe(1);
+    withDb((database) => {
+      expect(indexSnapshot(database)).toEqual(before);
+      expect(database.prepare('SELECT content_id FROM session_entries ORDER BY content_id').all()).toEqual(ids);
+      expect(database.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_fts_content'").get()).toBeUndefined();
+      database.exec("INSERT INTO session_fts(session_fts, rank) VALUES ('integrity-check', 1)");
+    });
+  });
+
+  it('rolls back a failed postings rebuild and retries migration on the same instance', async () => {
+    await seedLegacyIndex();
+    const before = withDb(indexSnapshot);
+    const originalExec = DatabaseSync.prototype.exec;
+    const exec = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (/VALUES\s*\('rebuild'\)/i.test(sql)) throw new Error('injected FTS rebuild failure');
+      return originalExec.call(this, sql);
+    });
+    const index = new SessionIndexCtor(root);
+    try {
+      expect(() => index.collectCounts()).toThrow('injected FTS rebuild failure');
+      exec.mockRestore();
+      withDb((database) => {
+        expect(indexSnapshot(database)).toEqual(before);
+        expect(database.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_fts_content'").get()).toBeDefined();
+        expect(database.prepare('PRAGMA table_info(session_entries)').all()).not.toContainEqual(
+          expect.objectContaining({ name: 'content_id' }),
+        );
+        expect(database.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_entries_migration'").get()).toBeUndefined();
+      });
+      expect(index.collectCounts()).toMatchObject({ sessions: 1, entries: 4, embeddings: 1 });
+    } finally {
+      exec.mockRestore();
+      await index.close();
+    }
+    expect((await search('migrationalpha')).total).toBe(2);
+  });
+
+  it('refreshes and prunes transactionally with no ghost postings', async () => {
+    const session = await seedLegacyIndex();
+    await search('migrationalpha');
+    const before = withDb(indexSnapshot);
+    withDb((database) =>
+      database.exec(`CREATE TRIGGER block_refresh BEFORE DELETE ON session_entries BEGIN
+      SELECT RAISE(ABORT, 'blocked refresh'); END;`),
+    );
+    const updated = store.loadSavedSession(session.id)!;
+    updated.entries = [{ kind: 'user', text: 'replacementmarker updated content' }];
+    store.saveSession(updated);
+    await expect(search('replacementmarker')).rejects.toThrow('blocked refresh');
+    withDb((database) => {
+      expect(indexSnapshot(database)).toEqual(before);
+      database.exec('DROP TRIGGER block_refresh');
+    });
+
+    expect((await search('replacementmarker')).total).toBe(1);
+    expect((await search('migrationalpha')).total).toBe(0);
+    const refreshed = withDb((database) => {
+      expectNoFtsMatches(database, 'migrationalpha OR legacycommand OR legacyoutput');
+      database.exec(`CREATE TRIGGER block_prune BEFORE DELETE ON session_sources BEGIN
+        SELECT RAISE(ABORT, 'blocked prune'); END;`);
+      return indexSnapshot(database);
+    });
+
+    const index = new SessionIndexCtor(root);
+    try {
+      expect(() => index.removeSessions([session.id])).toThrow('blocked prune');
+      withDb((database) => {
+        expect(indexSnapshot(database)).toEqual(refreshed);
+        expect(database.prepare("SELECT rowid FROM session_fts WHERE session_fts MATCH 'replacementmarker'").all()).toHaveLength(1);
+        database.exec('DROP TRIGGER block_prune');
+      });
+      rmSync(sessionPath(session.id));
+      index.removeSessions([session.id]);
+      expect(index.collectCounts()).toMatchObject({ sessions: 0, entries: 0, embeddings: 0 });
+    } finally {
+      await index.close();
+    }
+    withDb((database) => expectNoFtsMatches(database, 'replacementmarker'));
+  });
+});
 
 describe('session index: lexical search', () => {
   it('finds user, assistant, and command entries with display numbering', async () => {

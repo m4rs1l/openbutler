@@ -7,6 +7,7 @@ import { toolEntryDetails } from './tool-display.js';
  * interactive output stays animated.
  */
 import { parseArgs, questionFrom, type Parsed } from './cli/args.js';
+import { BUILD_ID } from './build-info.js';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
@@ -634,7 +635,7 @@ async function runQuestion(question: string, workspaceRoot: string): Promise<voi
   if (!(await defaultModelReady())) throw new Error('Configure a default model first: openbutler setup');
 
   const hostStatus = await requireBackgroundHost();
-  const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry);
+  const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
   if (vintageWarning) ui.warn(vintageWarning);
   const controller = await connectDaemonSession(workspaceRoot, { isolatedSession: true });
   const runtime = controller.runtime;
@@ -789,7 +790,7 @@ async function runSession(workspaceRoot: string): Promise<void> {
   ui.kv('Workspace', workspaceRoot);
   const hostStatus = await requireBackgroundHost();
   ui.info(`Background host running (pid ${hostStatus.pid}).`);
-  const warning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry);
+  const warning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
   if (warning) ui.warn(warning);
   ui.kv(
     'Automatic startup',
@@ -1418,8 +1419,12 @@ async function runSessionsCommand(parsed: Parsed): Promise<void> {
     throw new Error('Usage: openbutler sessions [index [--rebuild] | prune --older-than <duration> [--yes]]');
   const olderThan = parsed.flags.get('older-than');
   if (!olderThan) throw new Error('Usage: openbutler sessions prune --older-than <duration> [--yes]');
+  if (parsed.booleans.has('yes') && (await getDaemonStatus())) {
+    throw new Error('Stop the background host first (`openbutler daemon stop`) so sessions are not in use while pruning.');
+  }
   const cutoff = Date.now() - parseRetentionDuration(olderThan);
   const { listSessionFiles, removeSavedSession } = await import('./session-store.js');
+  const { savedSessionFilePath } = await import('./session-paths.js');
   // Retention never deletes the machine's own session: it is not a chat, and nothing
   // recreates it except the host starting again with an empty record.
   const files = selectFilesToPrune(
@@ -1443,6 +1448,11 @@ async function runSessionsCommand(parsed: Parsed): Promise<void> {
   const removedIds: string[] = [];
   for (const file of files) {
     try {
+      const current = statSync(file.path);
+      if (savedSessionFilePath(file.id) !== file.path || current.mtimeMs !== file.modifiedAt || current.size !== file.sizeBytes) {
+        failed += 1;
+        continue;
+      }
       removeSavedSession(file.id);
       removed += 1;
       removedIds.push(file.id);
@@ -1504,7 +1514,7 @@ async function runLedgerPrune(kind: 'events' | 'actions', parsed: Parsed): Promi
   }
   const cutoffIso = new Date(Date.now() - parseRetentionDuration(olderThan)).toISOString();
   const { ActivityLedger } = await import('./activity-ledger.js');
-  const ledger = new ActivityLedger(path);
+  const ledger = new ActivityLedger(path, { readOnly: !parsed.booleans.has('yes') });
   try {
     const counts = parsed.booleans.has('yes') ? ledger.pruneBefore(cutoffIso, kind) : ledger.previewPruneBefore(cutoffIso, kind);
     const total = counts.events + counts.actions + counts.transitions;

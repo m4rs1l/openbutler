@@ -32,6 +32,7 @@ import {
 import { isWithinPhysicalDirectory } from './workspace-scope.js';
 import { appendTranscriptArchiveReference, repairQueuedMessageOrder, retireCoveredToolPreviews } from './conversation.js';
 import type { TurnCompletion } from './turn-types.js';
+import { writeSessionSnapshot } from './session-writer.js';
 
 export type NoticeTone = 'info' | 'warn' | 'error';
 
@@ -1027,10 +1028,10 @@ export function loadSavedSession(id: string, workspaceRoot?: string | null): Sav
   return restored;
 }
 
-export function saveSession(session: SavedSession, options: { allowEmpty?: boolean } = {}): SavedSession {
+function prepareSessionSave(session: SavedSession, options: { allowEmpty?: boolean } = {}): SavedSession | null {
   if (!isSavedSession(session)) throw new Error('Cannot save an invalid session.');
   const hasUserMessage = session.entries.some((entry) => entry.kind === 'user');
-  if (!hasUserMessage && !options.allowEmpty) return session;
+  if (!hasUserMessage && !options.allowEmpty) return null;
   // Built field by field rather than spread, because the listing reads a header from the front of
   // the file and needs `hasUserMessage` and `preview` to be serialised before `entries`. A spread
   // would append any key the incoming session does not already carry to the very end of the object,
@@ -1066,11 +1067,25 @@ export function saveSession(session: SavedSession, options: { allowEmpty?: boole
     conversation: session.conversation,
     ...(session.conversationArchive === undefined ? {} : { conversationArchive: session.conversationArchive }),
   };
-  ensureSessionDirectory(session.id);
-  const path = sessionFilePath(session.id);
+  return saved;
+}
+
+export function saveSession(session: SavedSession, options: { allowEmpty?: boolean } = {}): SavedSession {
+  const saved = prepareSessionSave(session, options);
+  if (!saved) return session;
+  ensureSessionDirectory(saved.id);
+  const path = sessionFilePath(saved.id);
   const temporaryPath = `${path}.tmp`;
   writeFileSync(temporaryPath, `${JSON.stringify(saved, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   renameSync(temporaryPath, path);
+  return saved;
+}
+
+export async function saveSessionAsync(session: SavedSession, options: { allowEmpty?: boolean } = {}): Promise<SavedSession> {
+  const saved = prepareSessionSave(session, options);
+  if (!saved) return session;
+  ensureSessionDirectory(saved.id);
+  await writeSessionSnapshot(sessionFilePath(saved.id), saved);
   return saved;
 }
 

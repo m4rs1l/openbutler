@@ -13,6 +13,7 @@ import {
   listSavedSessions,
   loadSavedSession,
   saveSession,
+  saveSessionAsync,
   sessionTitle,
   type SavedSession,
   type SessionEntry,
@@ -42,6 +43,7 @@ import { attachmentReferences, storeAttachment, type FileAttachment } from './at
 import { decodeBase64Image, MAX_IMAGE_BYTES } from './image-data.js';
 import type { ProjectContext } from './projects/types.js';
 import { projectFolder, sessionProject, ProjectInputError } from './projects/store.js';
+import { closeIdleSessionWriter } from './session-writer.js';
 
 export type AgentProviderOptions = Record<string, Record<string, JSONValue>>;
 export type ApprovalDecision = 'allow' | 'deny' | 'always';
@@ -343,6 +345,38 @@ function stampCompactionOutput(entries: SessionEntry[]): SessionEntry[] {
 }
 
 /** Owns conversation/session state and runs independently of any terminal UI. */
+type SessionContentStamp = {
+  metadata: string;
+  entries: SessionEntry[];
+  conversation: ModelMessage[];
+  archive: ModelMessage[];
+};
+
+function sessionContentStamp(session: SavedSession): SessionContentStamp {
+  return {
+    metadata: JSON.stringify({
+      ...session,
+      updatedAt: undefined,
+      hasUserMessage: undefined,
+      preview: undefined,
+      firstUserMessage: undefined,
+      lastAssistantMessage: undefined,
+      entries: undefined,
+      conversation: undefined,
+      conversationArchive: undefined,
+    }),
+    entries: session.entries,
+    conversation: session.conversation,
+    archive: session.conversationArchive ?? [],
+  };
+}
+
+function sameSessionContent(left: SessionContentStamp, right: SessionContentStamp | null): boolean {
+  if (!right || left.metadata !== right.metadata) return false;
+  const sameRows = <T>(a: T[], b: T[]): boolean => a.length === b.length && a.every((row, index) => row === b[index]);
+  return sameRows(left.entries, right.entries) && sameRows(left.conversation, right.conversation) && sameRows(left.archive, right.archive);
+}
+
 export class AgentSessionController implements AgentSessionClient {
   private session: SavedSession;
   private conversation: ModelMessage[] = [];
@@ -401,8 +435,9 @@ export class AgentSessionController implements AgentSessionClient {
   private sessionHasUserMessage = false;
   private latestSessionSnapshot: SavedSession | null = null;
   private sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Persistable content of the last successful save or open; a navigation that matches it writes nothing. */
-  private lastPersistedContent: string | null = null;
+  private lastPersistedContent: SessionContentStamp | null = null;
+  private sessionSavePromise: Promise<void> | null = null;
+  private sessionGeneration = 0;
   /** The model/effort choice on record, so a choice made before any message still counts as a change. */
   private lastPersistedChoice: string | null = null;
   private sessionSaveError: string | null = null;
@@ -592,14 +627,14 @@ export class AgentSessionController implements AgentSessionClient {
 
   private scheduleSave(): void {
     this.latestSessionSnapshot = this.persistableSession();
-    if (this.sessionSaveTimer !== null) return;
+    if (this.closed || this.sessionSaveTimer !== null) return;
     // A model/effort choice is worth keeping on its own: a chat configured before its
     // first message must not reopen on some older model.
     if (!this.session.entries.some((entry) => entry.kind === 'user') && !this.choiceChanged(this.latestSessionSnapshot)) return;
     this.sessionSaveTimer = setTimeout(
       () => {
         this.sessionSaveTimer = null;
-        this.persistLatest();
+        if (!this.sessionSavePromise && this.latestSessionSnapshot) void this.persistLatest(this.latestSessionSnapshot);
       },
       this.busy ? 1_000 : 400,
     );
@@ -614,14 +649,11 @@ export class AgentSessionController implements AgentSessionClient {
       // initialized from the global default before this session was restored.
       providerId: this.session.providerId,
       modelId: this.session.modelId,
-      conversation: this.conversation,
-      ...(this.conversationArchive.length > 0 ? { conversationArchive: this.conversationArchive } : {}),
+      keyPositions: { ...this.session.keyPositions },
+      entries: [...this.session.entries],
+      conversation: [...this.conversation],
+      ...(this.conversationArchive.length > 0 ? { conversationArchive: [...this.conversationArchive] } : {}),
     };
-  }
-
-  /** The content a save would write, with the write timestamp normalised away. */
-  private persistableContentKey(): string {
-    return JSON.stringify({ ...this.persistableSession(), updatedAt: '' });
   }
 
   /** The model/effort choice alone: a chat can be configured before it has a single message. */
@@ -641,35 +673,39 @@ export class AgentSessionController implements AgentSessionClient {
     this.session = { ...this.session, lastActivityAt: new Date().toISOString() };
   }
 
-  private persistLatest(allowEmpty = false): void {
-    const latest = this.latestSessionSnapshot;
-    if (!latest) return;
+  private async persistLatest(latest: SavedSession, allowEmpty = false): Promise<void> {
+    const generation = this.sessionGeneration;
     const hasUserMessage = latest.entries.some((entry) => entry.kind === 'user');
     const choiceMoved = this.choiceChanged(latest);
     if (!allowEmpty && !hasUserMessage && !choiceMoved) return;
-    // Opening or switching conversations carries no content change; rewriting
-    // the file there would move the chat in every recent list without a reason.
-    const key = JSON.stringify({ ...latest, updatedAt: '' });
-    if (key === this.lastPersistedContent) return;
-    try {
-      // An empty chat is written only because its choice changed; the chat list
-      // already hides records without a user message, so nothing new surfaces.
-      this.session = saveSession(latest, { allowEmpty: allowEmpty || !hasUserMessage });
-      this.lastPersistedContent = this.persistableContentKey();
-      this.lastPersistedChoice = this.persistableChoiceKey(latest);
-      this.options.onSessionSaved?.(this.session);
-      this.sessionSaveError = null;
-    } catch (error) {
-      this.sessionSaveError = error instanceof Error ? error.message : String(error);
-    }
+    const stamp = sessionContentStamp(latest);
+    while (this.sessionSavePromise) await this.sessionSavePromise;
+    if (generation === this.sessionGeneration && sameSessionContent(stamp, this.lastPersistedContent)) return;
+    const saving = saveSessionAsync(latest, { allowEmpty: allowEmpty || !hasUserMessage })
+      .then((saved) => {
+        if (generation === this.sessionGeneration) {
+          this.session = { ...this.session, updatedAt: saved.updatedAt, hasUserMessage };
+          this.lastPersistedContent = stamp;
+          this.lastPersistedChoice = this.persistableChoiceKey(latest);
+          this.sessionSaveError = null;
+        }
+        this.options.onSessionSaved?.(saved);
+      })
+      .catch((error: unknown) => {
+        if (generation === this.sessionGeneration) this.sessionSaveError = error instanceof Error ? error.message : String(error);
+      });
+    this.sessionSavePromise = saving;
+    await saving;
+    if (this.sessionSavePromise === saving) this.sessionSavePromise = null;
     this.publish(false);
+    if (!this.closed && !sameSessionContent(sessionContentStamp(this.persistableSession()), this.lastPersistedContent)) this.scheduleSave();
   }
 
-  flushSave(options: { allowEmpty?: boolean } = {}): void {
+  async flushSave(options: { allowEmpty?: boolean } = {}): Promise<void> {
     if (this.sessionSaveTimer !== null) clearTimeout(this.sessionSaveTimer);
     this.sessionSaveTimer = null;
     this.latestSessionSnapshot = this.persistableSession();
-    this.persistLatest(options.allowEmpty === true);
+    await this.persistLatest(this.latestSessionSnapshot, options.allowEmpty === true);
   }
 
   addEntry(entry: SessionEntry): void {
@@ -808,7 +844,8 @@ export class AgentSessionController implements AgentSessionClient {
     return listSavedSessions(this.sessionWorkspaceScope);
   }
 
-  loadSession(id: string): SavedSession | null {
+  async loadSession(id: string): Promise<SavedSession | null> {
+    await this.flushSave();
     const session = loadSavedSession(id, this.sessionWorkspaceScope);
     if (session) this.openSession(session);
     return session;
@@ -817,7 +854,8 @@ export class AgentSessionController implements AgentSessionClient {
   openSession(session: SavedSession): void {
     if (this.busy) return;
     if (session.id !== this.session.id) this.cancelTitleGeneration();
-    this.flushSave();
+    void this.flushSave();
+    this.sessionGeneration += 1;
     this.session = {
       ...session,
       keyPositions: session.keyPositions ?? {},
@@ -839,7 +877,7 @@ export class AgentSessionController implements AgentSessionClient {
     this.lastContextEstimate = session.contextEstimateTokens;
     this.sessionHasUserMessage = session.entries.some((entry) => entry.kind === 'user');
     // Content is clean on open: a pure navigation must never rewrite the file.
-    this.lastPersistedContent = this.persistableContentKey();
+    this.lastPersistedContent = sessionContentStamp(this.persistableSession());
     this.lastPersistedChoice = this.persistableChoiceKey(this.session);
     this.pendingApproval = null;
     this.pendingApprovalId = null;
@@ -869,14 +907,16 @@ export class AgentSessionController implements AgentSessionClient {
     this.publish(false);
   }
 
-  createNewSession(projectId?: string | null): void {
+  async createNewSession(projectId?: string | null): Promise<void> {
     if (this.busy) return;
     // The custodian is one fixed session; a new chat belongs to the normal chat
     // layer, so this controller never replaces its own record.
     if (this.session.id === CUSTODIAN_SESSION_ID) throw new Error('The custodian session is fixed; new chats open in the chat layer.');
     const project = projectId === undefined ? undefined : sessionProject(projectId, this.runtime.workspaceRoot);
     this.cancelTitleGeneration();
-    this.flushSave();
+    await this.flushSave();
+    this.sessionGeneration += 1;
+    this.lastPersistedContent = null;
     this.session = {
       ...createSession(
         this.runtime.providerId,
@@ -1225,12 +1265,13 @@ export class AgentSessionController implements AgentSessionClient {
     this.cancelTitleGeneration();
     this.stop({ preserveWakePolicy: true });
     this.flushStreamedEntries();
-    this.flushSave();
+    await this.flushSave();
     await this.waitUntilIdle(CLOSE_IDLE_TIMEOUT_MS);
     this.flushStreamedEntries();
     if (this.streamFlushTimer !== null) clearTimeout(this.streamFlushTimer);
     this.streamFlushTimer = null;
-    this.flushSave();
+    await this.flushSave();
+    await closeIdleSessionWriter();
   }
 
   waitUntilIdle(timeoutMs?: number): Promise<void> {

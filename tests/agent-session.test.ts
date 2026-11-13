@@ -176,7 +176,7 @@ describe('owner replies and safe steering', () => {
     await session.waitUntilIdle(1000);
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
     const signal = generate.mock.calls[0]![0]?.abortSignal;
-    session.createNewSession();
+    await session.createNewSession();
     const next = session.getSnapshot().session;
     expect(signal?.aborted).toBe(true);
     complete(titleResponse());
@@ -202,15 +202,15 @@ describe('owner replies and safe steering', () => {
     // chat cannot inherit a cap and no saved field can re-tune compaction.
     expect(compactionContextWindowTokens(CUSTODIAN_SESSION_ID, 1_048_576, 100_000)).toBe(200_000);
     expect(compactionContextWindowTokens(previousId, 1_048_576, 100_000)).toBe(1_048_576);
-    expect(() => session!.createNewSession()).toThrow('The custodian session is fixed; new chats open in the chat layer.');
+    await expect(session.createNewSession()).rejects.toThrow('The custodian session is fixed; new chats open in the chat layer.');
 
     // The identity is the reserved id, so a restart restores the same record with the
     // same budget and cannot quietly turn the custodian back into an ordinary chat.
     const reloaded = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doStream: async () => fixtureText('Done') })));
     try {
-      reloaded.loadSession(CUSTODIAN_SESSION_ID);
+      await reloaded.loadSession(CUSTODIAN_SESSION_ID);
       expect(reloaded.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
-      expect(() => reloaded.createNewSession()).toThrow('The custodian session is fixed; new chats open in the chat layer.');
+      await expect(reloaded.createNewSession()).rejects.toThrow('The custodian session is fixed; new chats open in the chat layer.');
     } finally {
       await reloaded.close();
     }
@@ -889,12 +889,12 @@ describe('restored session model identity', () => {
     });
     session = new AgentSessionController(runtime);
     await session.sendMessage({ text: 'Original task', images: [] });
-    session.flushSave();
+    await session.flushSave();
     const id = session.getSnapshot().session.id;
     runtime.providerId = 'different';
     runtime.modelId = 'default-model';
-    session.loadSession(id);
-    session.flushSave();
+    await session.loadSession(id);
+    await session.flushSave();
     expect(loadSavedSession(id, runtime.workspaceRoot)?.modelId).toBe('fixture');
     await session.restoreSessionModel();
     // The chat runs with the model it saved...
@@ -974,10 +974,10 @@ describe('provider retry reporting', () => {
     const originalId = session.getSnapshot().session.id;
     await session.sendMessage({ text: 'Continue', images: [] });
     expect(first.doStreamCalls).toHaveLength(1);
-    session.createNewSession();
+    await session.createNewSession();
     await session.sendMessage({ text: 'New conversation', images: [] });
     expect(first.doStreamCalls).toHaveLength(2);
-    expect(session.loadSession(originalId)).not.toBeNull();
+    expect(await session.loadSession(originalId)).not.toBeNull();
     await session.sendMessage({ text: 'Resume', images: [] });
     expect(session.getLastRunError()).toBeNull();
     expect(first.doStreamCalls).toHaveLength(2);
@@ -1028,7 +1028,7 @@ describe('provider retry reporting', () => {
     expect(text).toContain('2s');
 
     // It is a real session entry, so it survives a reload.
-    session.flushSave();
+    await session.flushSave();
     const { loadSavedSession } = await import('../src/session-store.js');
     const saved = loadSavedSession(session.getSnapshot().session.id);
     expect(saved?.entries.filter((entry) => entry.kind === 'notice')).toHaveLength(1);
@@ -1502,7 +1502,7 @@ describe('session streaming message boundaries', () => {
     const sessionId = session.getSnapshot().session.id;
 
     await session.sendMessage({ text: 'Inspect, then summarize.', images: [] });
-    session.flushSave();
+    await session.flushSave();
 
     const saved = loadSavedSession(sessionId)!;
     const conversationParts = saved.conversation.flatMap((message) =>
@@ -1593,7 +1593,7 @@ describe('session compaction persistence and continuation', () => {
       images: [],
       communication: { source: 'terminal', replyTo: { channel: 'terminal' } },
     });
-    session.flushSave();
+    await session.flushSave();
     expect(summaryCalls).toBe(2);
     expect(normalCalls).toBe(4);
     expect(executions).toBe(3);
@@ -1669,7 +1669,7 @@ describe('session compaction persistence and continuation', () => {
     });
     const id = session.getSnapshot().session.id;
     await session.sendMessage({ text: 'Inspect the evidence.', images: [] });
-    session.flushSave();
+    await session.flushSave();
     // A summarization failure must never cost the owner their message: the run
     // finished, the transcript explains the failure, and no partial checkpoint
     // was applied (2026-11-03 incident contract).
@@ -1715,7 +1715,7 @@ describe('session compaction persistence and continuation', () => {
     await session.sendMessage({ text: 'Keep going.', images: [] });
     await session.waitUntilIdle(1000);
     await session.compact();
-    session.flushSave();
+    await session.flushSave();
     expect(session.getLastRunError()).toBeNull();
     const notices = session
       .getSnapshot()
@@ -1892,14 +1892,14 @@ describe('session compaction persistence and continuation', () => {
         },
         { timeout: 1_000, interval: 25 },
       );
-      session.flushSave();
+      await session.flushSave();
       expect(loadSavedSession(id)!.conversation).toEqual(source);
       expect(loadSavedSession(id)!.conversationArchive).toBeUndefined();
     } finally {
       finish();
       await pending;
     }
-    session.flushSave();
+    await session.flushSave();
     const saved = loadSavedSession(id)!;
     expect(saved.conversationArchive).toEqual(source);
     expect(JSON.stringify(saved.conversation)).toContain('Summary in progress. The checkpoint is complete.');
@@ -2094,7 +2094,7 @@ describe('session compaction persistence and continuation', () => {
     });
     await session.selectModel('another-endpoint', 'fixture');
     expect(session.getSnapshot().session.contextTokens).toBe(239_000);
-    session.flushSave();
+    await session.flushSave();
     const { loadSavedSession } = await import('../src/session-store.js');
     expect(loadSavedSession(session.getSnapshot().session.id)!.conversation).toEqual(raw);
     await session.sendMessage({ text: 'Continue.', images: [] });
@@ -2140,7 +2140,7 @@ describe('session compaction persistence and continuation', () => {
       contextEstimateTokens: estimateContextTokens(getAgentContext(raw, undefined, dataDir)),
     });
     await session.compact(true);
-    session.flushSave();
+    await session.flushSave();
     const saved = loadSavedSession(session.getSnapshot().session.id)!;
     expect(model.doStreamCalls).toHaveLength(1);
     expect(model.doStreamCalls[0]!.providerOptions).toEqual(options);
@@ -2195,7 +2195,7 @@ describe('session compaction persistence and continuation', () => {
     });
     const id = session.getSnapshot().session.id;
     await session.compact();
-    session.flushSave();
+    await session.flushSave();
     const checkpoint = loadSavedSession(id)!;
     expect(checkpoint.conversationArchive).toEqual(source);
     expect(checkpoint.conversation).toContainEqual(raw[0]);
@@ -2203,14 +2203,14 @@ describe('session compaction persistence and continuation', () => {
     expect(JSON.stringify(checkpoint.conversation)).not.toContain(reasoning);
 
     await session.sendMessage({ text: 'Continue safely.', images: [] });
-    session.flushSave();
+    await session.flushSave();
     const resumed = loadSavedSession(id)!;
     expect(resumed.contextTokens).toBe(100);
     expect(resumed.contextEstimateTokens).toBeGreaterThan(0);
     expect(resumed.conversationArchive!.slice(0, 3)).toEqual(source);
     expect(resumed.conversationArchive).toHaveLength(5);
     await session.compact();
-    session.flushSave();
+    await session.flushSave();
     const repeated = loadSavedSession(id)!;
     expect(repeated.conversationArchive).toEqual(resumed.conversationArchive);
     expect(JSON.stringify(model.doStreamCalls[2]!.prompt)).not.toContain(reasoning);
@@ -2250,7 +2250,7 @@ describe('session compaction persistence and continuation', () => {
     });
     const id = session.getSnapshot().session.id;
     await session.compact();
-    session.flushSave();
+    await session.flushSave();
     const saved = loadSavedSession(id)!;
     expect(saved.conversation).toEqual(source);
     expect(saved.conversationArchive).toBeUndefined();
@@ -2818,7 +2818,7 @@ describe('stored transcript migration', () => {
     });
     const model = new MockLanguageModelV3({ doGenerate: async () => titleResponse(), doStream: async () => fixtureText('ok') });
     session = new AgentSessionController(runtimeFor(model));
-    session.loadSession(saved.id);
+    await session.loadSession(saved.id);
     const reasoning = session.getSnapshot().session.entries.filter((entry) => entry.kind === 'reasoning');
     expect(reasoning.map((entry) => entry.internal)).toEqual(['compaction', undefined]);
     expect(reasoning.map((entry) => entry.text)).toEqual(['Checkpoint thinking', 'Run thinking']);
@@ -2973,7 +2973,7 @@ describe('session-owned reasoning', () => {
 
     // The choice survives a save and reload of the chat.
     const { loadSavedSession } = await import('../src/session-store.js');
-    session.flushSave();
+    await session.flushSave();
     const saved = loadSavedSession(session.getSnapshot().session.id);
     expect(saved?.reasoning).toBe('high');
   });
@@ -3012,7 +3012,7 @@ describe('session-owned reasoning', () => {
     session.setReasoningPreference('high');
     session.setShowReasoningPreference(false);
     const previousId = session.getSnapshot().session.id;
-    session.createNewSession();
+    await session.createNewSession();
     expect(session.getSnapshot().session.id).not.toBe(previousId);
     expect(session.getSnapshot().session.reasoning).toBe('high');
     expect(session.getSnapshot().session.showReasoning).toBe(false);
@@ -3088,7 +3088,7 @@ describe('model and effort persistence', () => {
 
     await session.selectModel('second-endpoint', 'second-model');
     session.setReasoningPreference('high');
-    session.flushSave();
+    await session.flushSave();
 
     const saved = loadSavedSession(id);
     expect(saved).not.toBeNull();
@@ -3107,7 +3107,7 @@ describe('model and effort persistence', () => {
     session = new AgentSessionController(runtimeFor(new MockLanguageModelV3({ doGenerate: async () => titleResponse() })));
     const id = session.getSnapshot().session.id;
 
-    session.flushSave();
+    await session.flushSave();
 
     expect(loadSavedSession(id)).toBeNull();
   });

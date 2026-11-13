@@ -172,7 +172,7 @@ export class SessionIndex {
              s.title AS title, s.workspace_root AS workspaceRoot, s.updated_at AS updatedAt,
              snippet(session_fts, 0, '', '', '…', 16) AS excerpt
       FROM session_fts
-      JOIN session_entries e ON e.session_id = session_fts.session_id AND e.entry = session_fts.entry AND e.chunk = session_fts.chunk
+      JOIN session_entries e ON e.content_id = session_fts.rowid
       JOIN session_sources s ON s.session_id = session_fts.session_id
       WHERE session_fts MATCH ?
       ORDER BY bm25(session_fts)
@@ -427,15 +427,14 @@ export class SessionIndex {
           modelKey,
           new Date().toISOString(),
         );
-      database.prepare('DELETE FROM session_entries WHERE session_id = ?').run(file.id);
-      database.prepare('DELETE FROM session_fts WHERE session_id = ?').run(file.id);
+      this.deleteSessionEntries(database, file.id);
       const insertEntry = database.prepare(
         'INSERT INTO session_entries (session_id, entry, chunk, kind, text, text_sha, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)',
       );
-      const insertFts = database.prepare('INSERT INTO session_fts (text, session_id, entry, chunk) VALUES (?, ?, ?, ?)');
+      const insertFts = database.prepare('INSERT INTO session_fts (rowid, text, session_id, entry, chunk) VALUES (?, ?, ?, ?, ?)');
       for (const row of rows) {
-        insertEntry.run(file.id, row.entry, row.chunk, row.kind, row.text, row.sha, row.embedding);
-        insertFts.run(row.text, file.id, row.entry, row.chunk);
+        const { lastInsertRowid } = insertEntry.run(file.id, row.entry, row.chunk, row.kind, row.text, row.sha, row.embedding);
+        insertFts.run(lastInsertRowid, row.text, file.id, row.entry, row.chunk);
       }
       database.exec('COMMIT');
     } catch (error) {
@@ -445,11 +444,23 @@ export class SessionIndex {
     return true;
   }
 
+  /** Called inside a transaction: external FTS needs the original text to remove its postings. */
+  private deleteSessionEntries(database: DatabaseSync, sessionId: string): void {
+    database.prepare('DELETE FROM session_fts WHERE rowid IN (SELECT content_id FROM session_entries WHERE session_id = ?)').run(sessionId);
+    database.prepare('DELETE FROM session_entries WHERE session_id = ?').run(sessionId);
+  }
+
   private dropSession(sessionId: string): void {
     const database = this.getDatabase();
-    database.prepare('DELETE FROM session_entries WHERE session_id = ?').run(sessionId);
-    database.prepare('DELETE FROM session_fts WHERE session_id = ?').run(sessionId);
-    database.prepare('DELETE FROM session_sources WHERE session_id = ?').run(sessionId);
+    database.exec('BEGIN IMMEDIATE');
+    try {
+      this.deleteSessionEntries(database, sessionId);
+      database.prepare('DELETE FROM session_sources WHERE session_id = ?').run(sessionId);
+      database.exec('COMMIT');
+    } catch (error) {
+      database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private getDatabase(): DatabaseSync {
@@ -469,32 +480,84 @@ export class SessionIndex {
   }
 
   private createSchema(database: DatabaseSync): void {
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS session_sources (
-        session_id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        workspace_root TEXT,
-        updated_at TEXT NOT NULL,
-        entries_count INTEGER NOT NULL,
-        file_mtime_ms INTEGER NOT NULL,
-        file_size_bytes INTEGER NOT NULL,
-        embedding_model_key TEXT NOT NULL DEFAULT '',
-        indexed_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS session_sources_workspace_idx ON session_sources(workspace_root);
-      CREATE TABLE IF NOT EXISTS session_entries (
-        session_id TEXT NOT NULL,
-        entry INTEGER NOT NULL,
-        chunk INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        text TEXT NOT NULL,
-        text_sha TEXT NOT NULL,
-        embedding BLOB CHECK(embedding IS NULL OR length(embedding) = ${EMBEDDING_BYTES}),
-        PRIMARY KEY (session_id, entry, chunk)
-      ) WITHOUT ROWID;
-      CREATE INDEX IF NOT EXISTS session_entries_kind_idx ON session_entries(kind);
-      CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(text, session_id UNINDEXED, entry UNINDEXED, chunk UNINDEXED);
-    `);
+    // state.db is shared: detect our schema directly, never use its user_version.
+    // Hold the write lock while inspecting/migrating so concurrent openers cannot race.
+    database.exec('BEGIN IMMEDIATE');
+    try {
+      const columns = database.prepare('PRAGMA table_info(session_entries)').all() as Array<{ name: string; type: string; pk: number }>;
+      const migrateEntries =
+        columns.length > 0 && !columns.some((column) => column.name === 'content_id' && column.type === 'INTEGER' && column.pk === 1);
+      if (migrateEntries) {
+        database.exec('ALTER TABLE session_entries RENAME TO session_entries_migration');
+      }
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS session_sources (
+          session_id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          workspace_root TEXT,
+          updated_at TEXT NOT NULL,
+          entries_count INTEGER NOT NULL,
+          file_mtime_ms INTEGER NOT NULL,
+          file_size_bytes INTEGER NOT NULL,
+          embedding_model_key TEXT NOT NULL DEFAULT '',
+          indexed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_entries (
+          content_id INTEGER PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          entry INTEGER NOT NULL,
+          chunk INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          text TEXT NOT NULL,
+          text_sha TEXT NOT NULL,
+          embedding BLOB CHECK(embedding IS NULL OR length(embedding) = ${EMBEDDING_BYTES}),
+          UNIQUE (session_id, entry, chunk)
+        );
+      `);
+      if (migrateEntries) {
+        // Preserve legacy FTS rowids too, so bm25 ties/candidate limits keep their ordering.
+        const legacyFts = database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_fts'").get();
+        if (legacyFts) {
+          database.exec(`
+            INSERT OR IGNORE INTO session_entries (content_id, session_id, entry, chunk, kind, text, text_sha, embedding)
+            SELECT f.rowid, e.session_id, e.entry, e.chunk, e.kind, e.text, e.text_sha, e.embedding
+            FROM session_fts f JOIN session_entries_migration e
+              ON e.session_id = f.session_id AND e.entry = f.entry AND e.chunk = f.chunk;
+          `);
+        }
+        // Copy any unposted rows as well; never derive content or vectors from FTS or rebuild().
+        database.exec(`
+          INSERT INTO session_entries (session_id, entry, chunk, kind, text, text_sha, embedding)
+          SELECT e.session_id, e.entry, e.chunk, e.kind, e.text, e.text_sha, e.embedding
+          FROM session_entries_migration e WHERE NOT EXISTS (
+            SELECT 1 FROM session_entries n WHERE n.session_id = e.session_id AND n.entry = e.entry AND n.chunk = e.chunk
+          );
+          DROP TABLE IF EXISTS session_fts;
+          DROP TABLE session_entries_migration;
+        `);
+      }
+      database.exec(`
+        CREATE INDEX IF NOT EXISTS session_sources_workspace_idx ON session_sources(workspace_root);
+        CREATE INDEX IF NOT EXISTS session_entries_kind_idx ON session_entries(kind);
+      `);
+      const fts = database.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'session_fts'").get() as
+        { sql: string } | undefined;
+      if (!fts || !/\bcontent\s*=\s*['"]session_entries['"]/i.test(fts.sql) || !/\bcontent_rowid\s*=\s*['"]content_id['"]/i.test(fts.sql)) {
+        // Also repairs a missing or reinstalled internal-content FTS without touching entries.
+        database.exec(`
+          DROP TABLE IF EXISTS session_fts;
+          CREATE VIRTUAL TABLE session_fts USING fts5(
+            text, session_id UNINDEXED, entry UNINDEXED, chunk UNINDEXED,
+            content='session_entries', content_rowid='content_id'
+          );
+        `);
+        database.exec("INSERT INTO session_fts(session_fts) VALUES ('rebuild')");
+      }
+      database.exec('COMMIT');
+    } catch (error) {
+      database.exec('ROLLBACK');
+      throw error;
+    }
   }
 }
 
