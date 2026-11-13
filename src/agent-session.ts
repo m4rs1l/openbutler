@@ -542,6 +542,9 @@ export class AgentSessionController implements AgentSessionClient {
   private stateContextWindowTokens(): number | null {
     return this.currentState()?.contextWindowTokens ?? this.runtime.contextWindowTokens;
   }
+  private stateOutputLimitTokens(): number | null {
+    return this.currentState()?.outputLimitTokens ?? this.runtime.outputLimitTokens;
+  }
   private stateSupportsVision(): boolean {
     return this.currentState()?.supportsVision ?? this.runtime.supportsVision;
   }
@@ -2317,7 +2320,7 @@ export class AgentSessionController implements AgentSessionClient {
                     archivePath: sessionFilePath(this.session.id),
                     model: this.sessionModel(),
                     contextWindowTokens: this.effectiveContextWindowTokensForCompaction(),
-                    outputLimitTokens: this.runtime.outputLimitTokens,
+                    outputLimitTokens: this.stateOutputLimitTokens(),
                     ...(this.lastContextUsage !== undefined ? { previousContextTokens: this.lastContextUsage } : {}),
                     ...(this.lastContextEstimate !== undefined ? { previousContextEstimateTokens: this.lastContextEstimate } : {}),
                     ...(pendingCompaction
@@ -2729,7 +2732,7 @@ export class AgentSessionController implements AgentSessionClient {
         tools: tools.tools,
         model: this.sessionModel(),
         contextWindowTokens: this.effectiveContextWindowTokensForCompaction(),
-        outputLimitTokens: this.runtime.outputLimitTokens,
+        outputLimitTokens: this.stateOutputLimitTokens(),
         ...(this.lastContextUsage !== undefined ? { previousContextTokens: this.lastContextUsage } : {}),
         ...(this.lastContextEstimate !== undefined ? { previousContextEstimateTokens: this.lastContextEstimate } : {}),
         providerOptions: this.stateReasoningOptions(this.sessionReasoning(), this.sessionShowReasoning()),

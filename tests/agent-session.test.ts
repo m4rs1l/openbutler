@@ -985,6 +985,131 @@ describe('model spec refresh without a restart', () => {
   });
 });
 
+describe('compaction output limit source', () => {
+  it('uses the chat model output limit for automatic compaction', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const { COMPACTION_PROMPT } = await import('../src/compaction.js');
+    let normalCalls = 0;
+    let summaryCalls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async (request) => {
+        const last = request.prompt.at(-1);
+        if (last?.role === 'user' && last.content.some((part) => part.type === 'text' && part.text === COMPACTION_PROMPT)) {
+          summaryCalls++;
+          return fixtureText('Checkpoint: the fixture task continues.');
+        }
+        normalCalls++;
+        return normalCalls === 1
+          ? delayedStream(
+              [{ type: 'tool-call', toolCallId: 'completed-before-compaction', toolName: 'inspect', input: '{}' }],
+              'tool-calls',
+              160_000,
+            )
+          : fixtureText('The task can continue.', 'stop', 160_000);
+      },
+    });
+    const registry = new ToolRegistry();
+    registry.register({
+      providerId: 'host',
+      name: 'inspect',
+      description: 'A local fixture tool',
+      inputSchema: { type: 'object', properties: {} },
+      effect: { change: 'none', data: 'local', network: 'none', reversible: 'full', outbound: 'none' },
+      autoApprove: () => true,
+      execute: async () => ({ evidence: 'Original completed evidence. '.repeat(800) }),
+    });
+    const runtime = runtimeFor(model, registry);
+    runtime.providerId = 'default-provider';
+    runtime.modelId = 'default-model';
+    runtime.contextWindowTokens = 200_000;
+    // The shared runtime slot holds the default model's output. The chat runs
+    // with its own model state; automatic compaction must reserve against the
+    // chat model's output, never the default's.
+    runtime.outputLimitTokens = 1_000;
+    runtime.modelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: 'Local streaming fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: 200_000,
+      outputLimitTokens: 50_000,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'model-unsupported',
+      getReasoningProviderOptions: () => ({}),
+      registry,
+    });
+    session = new AgentSessionController(runtime);
+    await session.openSession(createSession('fixture', 'fixture'));
+    await session.restoreSessionModel();
+    // With window 200k, chat output 50k triggers at 150k; default output 1k
+    // would hold the trigger at 178,421. First step reports 160k, so only the
+    // chat output can fire compaction before the second step.
+    await session.sendMessage({ text: 'Inspect the evidence.', images: [] });
+    await session.flushSave();
+    expect(normalCalls).toBe(2);
+    expect(summaryCalls).toBe(1);
+    expect(session.getLastRunError()).toBeNull();
+  });
+
+  it('uses the chat model output limit for manual compaction', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const { COMPACTION_PROMPT } = await import('../src/compaction.js');
+    let summaryCalls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async (request) => {
+        const last = request.prompt.at(-1);
+        if (last?.role === 'user' && last.content.some((part) => part.type === 'text' && part.text === COMPACTION_PROMPT)) {
+          summaryCalls++;
+          return fixtureText('Checkpoint: the fixture task continues.');
+        }
+        return fixtureText('Unexpected normal call.', 'stop', 10_000);
+      },
+    });
+    const runtime = runtimeFor(model);
+    runtime.providerId = 'default-provider';
+    runtime.modelId = 'default-model';
+    runtime.contextWindowTokens = 1_000_000;
+    runtime.outputLimitTokens = 1_000;
+    runtime.modelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: 'Local streaming fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: 1_000_000,
+      outputLimitTokens: 50_000,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'model-unsupported',
+      getReasoningProviderOptions: () => ({}),
+      registry: new ToolRegistry(),
+    });
+    session = new AgentSessionController(runtime);
+    await session.openSession({
+      ...createSession('fixture', 'fixture'),
+      entries: [{ kind: 'user', text: 'Keep the original task.' }],
+      conversation: [{ role: 'user', content: 'Keep the original task.' }],
+    });
+    await session.restoreSessionModel();
+    (session as unknown as { onContextUsage: (a: number, b: number) => void }).onContextUsage(10_000, 10_000);
+    await session.compact();
+    expect(summaryCalls).toBe(1);
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(model.doStreamCalls[0]!.maxOutputTokens).toBe(50_000);
+    expect(session.getLastRunError()).toBeNull();
+  });
+});
+
 describe('provider retry reporting', () => {
   it('keeps key selection per conversation across new sessions and reloads on a shared runtime', async () => {
     const { createRotatingModel } = await import('../src/provider/retry.js');
