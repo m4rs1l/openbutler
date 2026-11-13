@@ -125,6 +125,8 @@ export const fetchOlder = (before: number, sessionId: string, limit = 50) =>
 
 /** The server sends a heartbeat every 15 s; three missed ones mean the stream is dead. */
 const STALE_MS = 45_000;
+/** How often the visible tab checks that its stream is still delivering. */
+const WATCHDOG_MS = 15_000;
 
 export function subscribe(
   onPayload: (payload: SessionPayload) => void,
@@ -146,6 +148,7 @@ export function subscribe(
   };
   let source: EventSource | null = null;
   let timer: number | null = null;
+  let watchdog: number | null = null;
   let attempt = 0;
   let stopped = false;
 
@@ -196,13 +199,29 @@ export function subscribe(
     connect();
   };
 
+  const watch = () => {
+    if (stopped || document.visibilityState !== 'visible') return;
+    if (!source || source.readyState !== EventSource.OPEN) return;
+    if (Date.now() - lastSeen < STALE_MS) return;
+    // The stream is open but has stopped delivering: its connection died
+    // without an error event, so nothing else will ever notice. Rebuild it;
+    // the server answers the new stream with a fresh snapshot.
+    reportClientEvent('stream-stale', { readyState: source.readyState, silentMs: lastSeen === 0 ? -1 : Date.now() - lastSeen });
+    source.close();
+    source = null;
+    attempt = 0;
+    connect();
+  };
+
   document.addEventListener('visibilitychange', resume);
   window.addEventListener('online', resume);
   connect();
+  watchdog = window.setInterval(watch, WATCHDOG_MS);
 
   return () => {
     stopped = true;
     if (timer !== null) clearTimeout(timer);
+    if (watchdog !== null) clearInterval(watchdog);
     document.removeEventListener('visibilitychange', resume);
     window.removeEventListener('online', resume);
     source?.close();
