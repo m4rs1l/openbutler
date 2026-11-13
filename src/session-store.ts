@@ -32,7 +32,7 @@ import {
 import { isWithinPhysicalDirectory } from './workspace-scope.js';
 import { appendTranscriptArchiveReference, repairQueuedMessageOrder, retireCoveredToolPreviews } from './conversation.js';
 import type { TurnCompletion } from './turn-types.js';
-import { writeSessionSnapshot } from './session-writer.js';
+import { readSessionSnapshot, writeSessionSnapshot } from './session-writer.js';
 
 export type NoticeTone = 'info' | 'warn' | 'error';
 
@@ -996,7 +996,31 @@ export function loadSavedSession(id: string, workspaceRoot?: string | null): Sav
     if (isMissingFile(error)) return null;
     throw error;
   }
-  const session = parseSession(text);
+  return restoreSavedSession(parseSession(text), id, workspaceRoot);
+}
+
+export async function loadSavedSessionAsync(id: string, workspaceRoot?: string | null): Promise<SavedSession | null> {
+  if (!SESSION_ID.test(id)) throw new Error('Invalid session id.');
+  let parsed: unknown;
+  try {
+    const path = savedSessionFilePath(id);
+    if (lstatSync(path).isSymbolicLink() || !isWithinPhysicalDirectory(path, sessionsDirectory()))
+      throw new Error('Invalid session storage path.');
+    parsed = await readSessionSnapshot(path);
+  } catch (error) {
+    if (isMissingFile(error)) return null;
+    throw error;
+  }
+  return restoreSavedSession(isSavedSession(parsed) ? parsed : null, id, workspaceRoot);
+}
+
+export async function loadSessionForChatAsync(id: string, workspaceRoot: string): Promise<SavedSession | null> {
+  const session = await loadSavedSessionAsync(id);
+  if (!session) return null;
+  return !session.workspaceRoot || samePath(session.workspaceRoot, workspaceRoot) ? session : null;
+}
+
+function restoreSavedSession(session: SavedSession | null, id: string, workspaceRoot?: string | null): SavedSession | null {
   if (!session || session.id !== id) throw new Error('This session file is invalid or unsupported.');
   if (workspaceRoot === null && session.workspaceRoot) return null;
   if (typeof workspaceRoot === 'string' && (!session.workspaceRoot || !samePath(session.workspaceRoot, workspaceRoot))) return null;
