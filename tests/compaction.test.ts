@@ -797,7 +797,8 @@ describe('full-context LLM compaction', () => {
       outputLimitTokens: 20_000,
     };
     // Literal on purpose: the gate must land on this number, not on whatever the helper returns.
-    const trigger = 78_421;
+    // 100_000 - (20_000 declared output + 1_579 prompt + 11_442 measured headroom), inside [50_000, 76_801].
+    const trigger = 66_979;
     expect(await compactConversation({ ...base, previousContextTokens: trigger - 1 })).toMatchObject({
       kind: 'skipped',
       reason: 'below-threshold',
@@ -808,16 +809,23 @@ describe('full-context LLM compaction', () => {
   });
 
   it('scales the trigger with the window and the declared output instead of a fixed share', () => {
-    // window - (declared output + estimateTokens(COMPACTION_PROMPT)), the prompt being 6_315 ASCII characters, 1_579 tokens.
-    expect(autoCompactionTriggerTokens(100_000, 20_000)).toBe(78_421);
-    expect(autoCompactionTriggerTokens(307_200, 32_768)).toBe(272_853);
-    expect(autoCompactionTriggerTokens(1_000_000, 20_000)).toBe(898_421);
+    // window - (declared output + prompt 1_579 + headroom 11_442), clamped to [0.5 * window, window - 23_199].
+    expect(autoCompactionTriggerTokens(100_000, 20_000)).toBe(66_979);
+    expect(autoCompactionTriggerTokens(307_200, 32_768)).toBe(261_411);
+    expect(autoCompactionTriggerTokens(1_000_000, 20_000)).toBe(966_979);
   });
 
-  it('bounds the reserve when no output limit is declared or the declared one exceeds a quarter of the window', () => {
-    expect(autoCompactionTriggerTokens(100_000)).toBe(88_421);
-    expect(autoCompactionTriggerTokens(100_000, null)).toBe(88_421);
-    expect(autoCompactionTriggerTokens(100_000, 40_000)).toBe(75_000);
+  it('bounds the trigger when no output limit is declared or the declared one pushes it to the floor or ceiling', () => {
+    // No declared output: the window minus prompt/headroom exceeds the ceiling, so the ceiling binds.
+    expect(autoCompactionTriggerTokens(100_000)).toBe(76_801);
+    expect(autoCompactionTriggerTokens(100_000, null)).toBe(76_801);
+    // Declared output 40_000 pushes the raw trigger below the 0.5 * window floor.
+    expect(autoCompactionTriggerTokens(100_000, 40_000)).toBe(50_000);
+  });
+
+  it('keeps the summarization request inside the window when the raw trigger would be too late', () => {
+    // 128_000 - 1_579 prompt - 20_596 measured summary ceiling - 1_024 margin = 104_801.
+    expect(autoCompactionTriggerTokens(128_000)).toBe(104_801);
   });
 
   it('accounts for a large tool result added after the last provider measurement', async () => {

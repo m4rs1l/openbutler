@@ -15,15 +15,21 @@ import {
 export { COMPACTION_SUMMARY_MARKER, TOOL_REFERENCE_MARKER, COMPACTION_CONTINUE_MESSAGE } from './conversation.js';
 
 /**
- * Bounds on the reserve the automatic trigger must leave free.
+ * Components of the automatic trigger reserve and its bounds.
  *
- * The two shares bound the reserve itself, never the trigger: at most a quarter
- * of the window, so a declared output cannot swallow it, and at least a tenth,
- * so the trigger never sits within a tenth of the ceiling while the request
- * estimator can under-count. `autoCompactionTriggerTokens` owns the rule.
+ * The reserve is additive, never a share of the window: the model's declared
+ * output (passed in), the compaction instruction, and one step of measured
+ * growth. Measured step growth p99 is 11_442 tokens (2026-11-13, `state.db`
+ * consecutive chat inputs, compaction-affected pairs excluded). The summary
+ * request's own output ceiling is the measured compaction-output p99, 20_596
+ * tokens (2026-11-13, 134 `compaction` rows); the 1_024 margin matches the
+ * existing summary-slack guard. The trigger share therefore rises naturally
+ * with the window instead of pinning at a fixed ratio.
+ * `autoCompactionTriggerTokens` owns the rule.
  */
-const COMPACTION_MIN_RESERVE_SHARE = 0.1;
-const COMPACTION_MAX_RESERVE_SHARE = 0.25;
+const COMPACTION_HEADROOM_TOKENS = 11_442;
+const COMPACTION_SUMMARY_MAX_TOKENS = 20_596;
+const COMPACTION_SUMMARY_MARGIN_TOKENS = 1_024;
 
 /**
  * Shares of the window for the sliced fallback (map-reduce compaction).
@@ -99,7 +105,9 @@ Write the continuation checkpoint in English regardless of the language of the c
  * model whose declared output is huge compacts earlier because its next request
  * could be huge. At the trigger the next request can still ask for its full
  * declared output; that boundary is exact, which is why it is a function rather
- * than an inline comparison.
+ * than an inline comparison. The result is clamped to `[0.5 * window, window -
+ * prompt - summary ceiling - margin]` so the summarization request itself
+ * always fits, and a post-compaction landing never retriggers immediately.
  *
  * Exported for the tests: the rule is arithmetic they must pin exactly, not a
  * side effect they can only observe through a provider fixture.
@@ -109,11 +117,10 @@ export function autoCompactionTriggerTokens(
   outputLimitTokens?: number | null,
   promptTokens: number = COMPACTION_PROMPT_TOKENS,
 ): number {
-  const reserve = Math.min(
-    Math.floor(contextWindowTokens * COMPACTION_MAX_RESERVE_SHARE),
-    Math.max(Math.ceil(contextWindowTokens * COMPACTION_MIN_RESERVE_SHARE), Math.max(0, outputLimitTokens ?? 0)) + promptTokens,
-  );
-  return contextWindowTokens - reserve;
+  const reserve = Math.max(0, outputLimitTokens ?? 0) + promptTokens + COMPACTION_HEADROOM_TOKENS;
+  const floor = Math.floor(contextWindowTokens * 0.5);
+  const upper = contextWindowTokens - promptTokens - COMPACTION_SUMMARY_MAX_TOKENS - COMPACTION_SUMMARY_MARGIN_TOKENS;
+  return Math.min(Math.max(contextWindowTokens - reserve, floor), upper);
 }
 
 export interface CompactionContext {
