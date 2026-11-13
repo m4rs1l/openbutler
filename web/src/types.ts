@@ -106,6 +106,8 @@ export interface SessionPayload {
   queuedMessages?: Array<{ id?: string; text: string; imageCount: number; editable?: boolean; steering?: boolean }>;
   pendingApproval: ApprovalRequest | null;
   pendingQuestion: PendingQuestion | null;
+  /** The last session auto-save failure, or null when the chat is saved. */
+  sessionSaveError?: string | null;
   contextTokens?: number | null;
   runtime?: RuntimeInfo;
   session: { id: string; title: string; hasUserMessage?: boolean; project?: SessionProject; projectLocked?: boolean };

@@ -31,6 +31,10 @@ export function materializeNewChat(
 
 /** A transient payload; it must never be sent to the daemon or session catalog. */
 export function newChatPayload(previous: SessionPayload, projectId: string | null): SessionPayload {
+  // The previous chat's runtime must never preview on a fresh draft: the selector
+  // would show a model the first send will not run with. The draft starts blank;
+  // the fresh defaults arrive from the server and fill it in.
+  const workspaceRoot = previous.runtime?.workspaceRoot ?? '';
   return {
     reset: true,
     entries: [],
@@ -42,7 +46,7 @@ export function newChatPayload(previous: SessionPayload, projectId: string | nul
     queuedMessageCount: 0,
     pendingApproval: null,
     pendingQuestion: null,
-    ...(previous.runtime ? { runtime: previous.runtime } : {}),
+    runtime: { supportsSessionAttachments: true, workspaceRoot },
     ...(previous.buildId ? { buildId: previous.buildId } : {}),
     session: {
       id: 'new-chat',

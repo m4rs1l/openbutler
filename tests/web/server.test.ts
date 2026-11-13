@@ -22,7 +22,7 @@ vi.mock('../../src/daemon-client.js', () => ({
   connectDaemonSession: vi.fn(),
   resumeChatAttach: vi.fn(() => ({ clientKind: 'web', chatSessionId: 'session-a' })),
 }));
-const settingsMocks = vi.hoisted(() => ({ saveSettings: vi.fn() }));
+const settingsMocks = vi.hoisted(() => ({ saveSettings: vi.fn(), overrides: {} as Partial<import('../../src/settings.js').SettingsStore> }));
 vi.mock('../../src/settings.js', () => ({
   getSettingsPath: () => join(process.env.OPENBUTLER_DATA_DIR!, 'settings.yaml'),
   getConfigPath: () => join(process.env.OPENBUTLER_DATA_DIR!, 'config.yaml'),
@@ -32,6 +32,7 @@ vi.mock('../../src/settings.js', () => ({
       disabled: { enabled: false, keys: [], models: ['hidden-model'] },
     },
     providerOrder: ['local', 'disabled'],
+    ...settingsMocks.overrides,
   }),
   saveSettings: settingsMocks.saveSettings,
 }));
@@ -162,6 +163,7 @@ beforeEach(async () => {
   dataDirectory = await mkdtemp(join(tmpdir(), 'openbutler-web-session-'));
   vi.stubEnv('OPENBUTLER_DATA_DIR', dataDirectory);
   vi.clearAllMocks();
+  settingsMocks.overrides = {};
   listeners.clear();
   actors.clear();
   snapshot = {
@@ -424,6 +426,20 @@ describe('browser session controls', () => {
     // was recovered from the window scan.
     expect(payload.session.projectLocked).toBe(true);
   });
+  it('exposes the session save error in the snapshot and clears it when the retry lands', async () => {
+    const read = async () => {
+      const response = await fetch(`${server.url}/api/snapshot`, { headers: { cookie } });
+      expect(response.status).toBe(200);
+      return (await response.json()) as { sessionSaveError: string | null };
+    };
+    // No failure yet: the field is present and null, not silently dropped.
+    await expect(read()).resolves.toMatchObject({ sessionSaveError: null });
+    snapshot = { ...snapshot, sessionSaveError: 'EACCES: permission denied' };
+    await expect(read()).resolves.toMatchObject({ sessionSaveError: 'EACCES: permission denied' });
+    // A later successful save clears the error in the next payload.
+    snapshot = { ...snapshot, sessionSaveError: null };
+    await expect(read()).resolves.toMatchObject({ sessionSaveError: null });
+  });
   it('routes messages and stop controls to the addressed chat, with no cross-chat fallback', async () => {
     snapshot.busy = true;
     await post('/api/session', { action: 'load', sessionId: 'session-b', currentSessionId: 'session-a' });
@@ -508,6 +524,66 @@ describe('browser session controls', () => {
     expect(response.status).toBe(502);
     expect(send).toHaveBeenCalledWith({ text: 'lost?', images: [] });
   });
+  it('publishes fresh chat defaults from settings, not the attached chat, without any writes or creation', async () => {
+    settingsMocks.overrides = {
+      defaultProvider: 'fresh',
+      defaultModel: 'default-model',
+      reasoning: 'low',
+      approvalMode: 'auto-review',
+      showReasoning: false,
+      providers: {
+        fresh: {
+          enabled: true,
+          keys: ['default-secret'],
+          npm: '@ai-sdk/openai-compatible',
+          url: 'http://fixture.invalid/v1',
+          models: ['default-model'],
+          modelSpecs: { 'default-model': { name: 'Fresh default', context: 32000, reasoning: { efforts: ['low', 'high'] } } },
+        },
+      },
+    };
+    snapshot.session.reasoning = 'high';
+    const attachedBefore = { ...client.runtime };
+    const connections = vi.mocked(connectDaemonSession).mock.calls.length;
+    const response = await fetch(`${server.url}/api/chat-defaults`, { headers: { cookie } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      runtime: {
+        providerId: string;
+        providerName: string;
+        modelId: string;
+        modelName: string;
+        contextWindowTokens: number;
+        reasoningDefault: string;
+        approvalMode: string;
+        showReasoningDefault: boolean;
+        reasoningTitles: boolean;
+        workspaceRoot: string;
+        reasoningVariants: Array<{ id: string; label: string }>;
+      };
+    };
+    expect(body.runtime).toMatchObject({
+      providerId: 'fresh',
+      providerName: 'fresh',
+      modelId: 'default-model',
+      modelName: 'Fresh default',
+      contextWindowTokens: 32000,
+      reasoningDefault: 'low',
+      approvalMode: 'auto-review',
+      showReasoningDefault: false,
+      reasoningTitles: false,
+      workspaceRoot: 'C:/workspace',
+    });
+    expect(body.runtime.reasoningVariants.map((level: { id: string }) => level.id)).toEqual(expect.arrayContaining(['low', 'high']));
+    expect(JSON.stringify(body)).not.toContain('default-secret');
+    expect(JSON.stringify(body)).not.toContain('private-key-never-exposed');
+    expect(client.runtime).toEqual(attachedBefore);
+    expect(connectDaemonSession).toHaveBeenCalledTimes(connections);
+    expect(newSession).not.toHaveBeenCalled();
+    expect(client.selectModel).not.toHaveBeenCalled();
+    expect(settingsMocks.saveSettings).not.toHaveBeenCalled();
+  });
+
   it('lists configured models without credentials and accepts only configured choices', async () => {
     const models = await (await fetch(`${server.url}/api/models`, { headers: { cookie } })).json();
     expect(models).toHaveLength(2);

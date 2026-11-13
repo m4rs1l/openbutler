@@ -17,13 +17,15 @@ import {
   saveSettings,
   type SettingsStore,
 } from '../settings.js';
-import { assignRoleModel, isModelRole, modelRoles, roleModelAssignment } from '../model-roles.js';
+import { assignRoleModel, isModelRole, modelRoles, resolveRoleModel, roleModelAssignment } from '../model-roles.js';
 import { resolveDefaultModel } from '../usage/default-model.js';
 import { setDefaultModel } from '../cli/config-edit.js';
 import { verifyModalCredentials } from '../modal.js';
 import { CATALOG_FILENAMES, getProvider, listProviderSummaries } from '../provider/catalog.js';
 import { modelPresentation, resolveModelName, resolveProviderName, type ModelCatalogRow } from '../provider/model-presentation.js';
 import { describeModelReasoning } from '../provider/model-view.js';
+import { findReasoningCatalogMatch, reasoningSummaryTitles, resolveProvider } from '../provider/registry.js';
+import { resolveContextBudget } from '../context-budget.js';
 import { watchSettingsFiles } from '../settings-watch.js';
 import { addProviderKeys } from '../provider/keys.js';
 import { verifyAttachmentPath } from '../attachments.js';
@@ -364,6 +366,7 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
       queuedMessages: snapshot.queuedMessages,
       pendingApproval: snapshot.pendingApproval ?? null,
       pendingQuestion: snapshot.pendingQuestion ?? null,
+      sessionSaveError: snapshot.sessionSaveError ?? null,
       contextTokens: (snapshot.session as { contextTokens?: number }).contextTokens ?? null,
       runtime: {
         supportsSessionAttachments: source.runtime.supportsSessionAttachments === true,
@@ -920,6 +923,41 @@ export async function startWebServer(options: WebServerOptions): Promise<WebServ
 
     if (url.pathname === '/api/models/catalog' && req.method === 'GET') {
       return sendJson(res, 200, modelCatalogRows());
+    }
+
+    // What a fresh chat actually starts on, projected from settings - never from the
+    // chat this tab happens to be showing. The host materializes a new chat on the
+    // `agent` role through the same resolvers, so the picker can show the default
+    // before the first send instead of the previous chat's model. Read-only: it
+    // creates nothing, writes nothing, and never exposes provider credentials.
+    if (url.pathname === '/api/chat-defaults' && req.method === 'GET') {
+      const settings = loadSettings();
+      const choice = resolveRoleModel(settings, 'agent');
+      if (!choice) return sendJson(res, 400, { error: 'No ready default provider and model. Run `openbutler setup` first.' });
+      const provider = settings.providers[choice.providerId];
+      if (!provider?.enabled) return sendJson(res, 400, { error: 'That provider is not configured.' });
+      const described = describeModelReasoning(choice.providerId, choice.modelId, provider, settings.reasoning);
+      if (!described) return sendJson(res, 400, { error: 'That provider is not configured.' });
+      const presentation = modelPresentation(choice.providerId, choice.modelId, settings);
+      const resolution = resolveProvider(choice.providerId, provider);
+      const catalog = resolution.ok ? findReasoningCatalogMatch(choice.providerId, choice.modelId, resolution.provider) : null;
+      const budget = resolveContextBudget(provider.modelSpecs?.[choice.modelId], catalog?.model?.limit ?? null);
+      return sendJson(res, 200, {
+        runtime: {
+          supportsSessionAttachments: true,
+          modelName: presentation.name,
+          providerName: presentation.providerName,
+          providerId: choice.providerId,
+          modelId: choice.modelId,
+          contextWindowTokens: budget.window,
+          approvalMode: settings.approvalMode ?? null,
+          showReasoningDefault: settings.showReasoning !== false,
+          reasoningTitles: resolution.ok ? reasoningSummaryTitles(resolution.provider) : false,
+          reasoningVariants: described.variants.map(({ id, label }) => ({ id, label })),
+          reasoningDefault: described.defaultVariantId,
+          workspaceRoot: options.workspaceRoot,
+        },
+      });
     }
 
     // Effort options belong to a model, not to the runtime that happens to be bound,

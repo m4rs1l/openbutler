@@ -39,6 +39,18 @@ function saveCachedSessions(sessions: SessionInfo[]): void {
 /** The client-side id of a chat that exists only as a placeholder while the host creates it. */
 export const PENDING_CHAT_ID = 'new-chat';
 
+/**
+ * A failed session save is not a one-shot notice: the host keeps the chat in
+ * memory, stays dirty and retries on its own, so the error is surfaced from
+ * every payload that still carries it and disappears on the first payload
+ * after the retry lands. The message names that contract instead of hiding
+ * the failure behind the transcript.
+ */
+export function saveErrorNotice(error: string | null | undefined): string | null {
+  if (!error) return null;
+  return `Session auto-save failed: ${error}. The chat is kept in memory and saving retries automatically.`;
+}
+
 export function useSession() {
   const [state, dispatch] = useReducer(sessionReducer, initialSessionState);
   const [selectedId, setSelectedId] = useState<string | undefined>(() => {
@@ -246,11 +258,28 @@ export function useSession() {
     // additional sessions on the host.
     if (id === undefined) {
       const origin = draftChat.current?.sourceSessionId ?? sessionId;
-      draftChat.current = newChatDraft(origin, projectId ?? null);
+      const draft = newChatDraft(origin, projectId ?? null);
+      draftChat.current = draft;
       selected.current = PENDING_CHAT_ID;
       setPendingNewChatId(PENDING_CHAT_ID);
       setNotice(null);
-      dispatch({ type: 'payload', payload: newChatPayload(state.payload!, projectId ?? null), receivedAt: performance.now() });
+      // The draft starts blank (never the previous chat's runtime); the fresh
+      // defaults fill it in before the first send, unless the owner picks a
+      // model in the meantime - then the pick wins.
+      const blank = newChatPayload(state.payload!, projectId ?? null);
+      dispatch({ type: 'payload', payload: blank, receivedAt: performance.now() });
+      void api
+        .fetchChatDefaults()
+        .then(({ runtime }) => {
+          if (draftChat.current !== draft || draft.model !== null || draft.reasoningVariantId !== null || draft.approvalMode !== null)
+            return;
+          dispatch({ type: 'payload', payload: { ...blank, runtime }, receivedAt: performance.now() });
+        })
+        .catch((error: unknown) => {
+          if (draftChat.current !== draft) return;
+          // Honest error: the picker stays blank, never the previous identity.
+          report(error);
+        });
       return true;
     }
     operation.current = true;
@@ -498,7 +527,7 @@ export function useSession() {
     models,
     modelsRevision,
 
-    notice,
+    notice: saveErrorNotice(state.payload?.sessionSaveError) ?? notice,
     clearNotice: () => setNotice(null),
     changing,
     pendingNewChatId,

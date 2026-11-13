@@ -12,6 +12,7 @@ import type {
   ModelCatalogRow,
   ModalInfo,
   ProviderCatalogRow,
+  RuntimeInfo,
   SessionInfo,
   SessionPayload,
   TelegramInfo,
@@ -88,6 +89,8 @@ export const fetchWorkspaceFiles = (sessionId: string, path: string) =>
 export const fetchWorkspaceFileTree = (sessionId: string) =>
   request<WorkspaceFileTree>(`/api/files/tree?${new URLSearchParams({ sessionId })}`);
 export const fetchModels = () => request<ModelChoice[]>('/api/models');
+/** The model and capabilities a fresh chat will actually run with, before any send. */
+export const fetchChatDefaults = () => request<{ runtime: RuntimeInfo }>('/api/chat-defaults');
 export const fetchModelCatalog = () => request<ModelCatalogRow[]>('/api/models/catalog');
 // Effort options for one model, resolved without binding it to the runtime.
 export const fetchModelReasoning = (providerId: string, modelId: string) =>

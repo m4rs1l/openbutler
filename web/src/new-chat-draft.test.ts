@@ -20,6 +20,24 @@ function snapshot(id: string): SessionPayload {
 }
 
 describe('new chat draft lifecycle', () => {
+  it('never presents the previous chat model or effort while fresh defaults are loading', () => {
+    const previous = snapshot('source');
+    previous.runtime = {
+      ...previous.runtime,
+      providerId: 'previous-provider',
+      modelId: 'previous-model',
+      reasoningDefault: 'high',
+      reasoningVariants: [{ id: 'high', label: 'High' }],
+      supportsSessionAttachments: true,
+    };
+    const view = newChatPayload(previous, 'selected-project');
+    expect(view.runtime?.providerId).toBeUndefined();
+    expect(view.runtime?.modelId).toBeUndefined();
+    expect(view.runtime?.reasoningVariants).toBeUndefined();
+    expect(view.runtime?.reasoningDefault).toBeUndefined();
+    expect(view.runtime?.supportsSessionAttachments).toBe(true);
+    expect(view.session.project?.id).toBe('selected-project');
+  });
   it('clicking New Chat repeatedly never invokes a daemon session creation', () => {
     const create = vi.fn(async () => snapshot('created'));
     let draft = newChatDraft('real-session', null);
