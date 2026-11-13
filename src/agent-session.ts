@@ -2852,9 +2852,13 @@ export class AgentSessionController implements AgentSessionClient {
       this.lastContextUsage = inputTokens;
       this.lastContextEstimate = contextEstimateTokens;
     }
+    // The chat reports the window of the model it runs with, the same state
+    // compaction reads. The shared runtime slot holds the workspace default
+    // and must not overwrite a chat that picked another model.
+    const contextWindowTokens = this.stateContextWindowTokens();
     this.session = {
       ...this.session,
-      ...(this.runtime.contextWindowTokens === null ? {} : { contextWindowTokens: this.runtime.contextWindowTokens }),
+      ...(contextWindowTokens === null ? {} : { contextWindowTokens }),
       ...(inputTokens === null ? {} : { contextTokens: inputTokens }),
       ...(inputTokens === null ? {} : { contextEstimateTokens }),
     };

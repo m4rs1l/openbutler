@@ -946,6 +946,43 @@ describe('model spec refresh without a restart', () => {
     // refreshed model state: a restart or a model re-pick must not be required.
     expect(session.getSnapshot().session.contextWindowTokens).toBe(200_000);
   });
+
+  it('keeps the chat model window after a step usage report', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { createSession } = await import('../src/session-store.js');
+    const model = new MockLanguageModelV3({ doStream: [fixtureText('Answer.')] });
+    const runtime = runtimeFor(model);
+    // The shared runtime slot holds the default model's window. The chat runs
+    // with its own model state and never rebinds the runtime, so a step usage
+    // report must still stamp the chat's window, not the default's.
+    runtime.providerId = 'default-provider';
+    runtime.modelId = 'default-model';
+    runtime.contextWindowTokens = 100_000;
+    runtime.modelFor = async (providerId, modelId) => ({
+      providerId,
+      modelId,
+      modelName: 'Local streaming fixture',
+      providerName: 'Fixture',
+      model,
+      contextWindowTokens: 200_000,
+      outputLimitTokens: null,
+      supportsVision: false,
+      supportsImageToolResult: true,
+      reasoningVariants: [],
+      reasoningTitles: false,
+      reasoningMetadataSource: null,
+      reasoningSupport: 'model-unsupported',
+      getReasoningProviderOptions: () => ({}),
+      registry: new ToolRegistry(),
+    });
+    session = new AgentSessionController(runtime);
+    await session.openSession(createSession('fixture', 'fixture'));
+    await session.restoreSessionModel();
+    expect(session.getSnapshot().session.contextWindowTokens).toBe(200_000);
+    // agent.ts reports usage after every model step through this handler.
+    (session as unknown as { onContextUsage: (a: number, b: number) => void }).onContextUsage(100, 120);
+    expect(session.getSnapshot().session.contextWindowTokens).toBe(200_000);
+  });
 });
 
 describe('provider retry reporting', () => {
