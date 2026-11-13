@@ -38,8 +38,8 @@ describe('LocalNoticeList', () => {
     const notices = new LocalNoticeList();
     const now = 1_000_000;
     notices.add(entry('notice'), 0, now);
-    expect(texts(notices.merge([entry('a')], now + LOCAL_NOTICE_TTL_MS - 1))).toEqual(['notice', 'a']);
-    expect(notices.merge([entry('a')], now + LOCAL_NOTICE_TTL_MS)).toEqual([entry('a')]);
+    expect(texts(notices.merge([entry('a')], 0, now + LOCAL_NOTICE_TTL_MS - 1))).toEqual(['notice', 'a']);
+    expect(notices.merge([entry('a')], 0, now + LOCAL_NOTICE_TTL_MS)).toEqual([entry('a')]);
     expect(notices.length).toBe(0);
   });
 
@@ -54,6 +54,27 @@ describe('LocalNoticeList', () => {
     const notices = new LocalNoticeList(3, LOCAL_NOTICE_TTL_MS);
     for (const text of ['one', 'two', 'three', 'four']) notices.add(entry(text), 0);
     expect(texts(notices.merge([]))).toEqual(['two', 'three', 'four']);
+  });
+
+  it('keeps a notice above later entries after the window trims its front', () => {
+    const notices = new LocalNoticeList();
+    // 180 server entries existed when the notice arrived.
+    const before = Array.from({ length: 180 }, (_, i) => entry(`e${i}`));
+    notices.add(entry('notice'), before.length);
+    // A compaction burst appends three entries; the windowed client now holds
+    // only the tail starting at absolute index 110.
+    const window = [...before.slice(110), entry('compaction-row'), entry('reasoning'), entry('summary')];
+    const merged = notices.merge(window, 110);
+    // Arrival position in the window: 180 - 110 = 70, after e179 and before
+    // the compaction entries that arrived afterwards.
+    expect(texts(merged).slice(68)).toEqual(['e178', 'e179', 'notice', 'compaction-row', 'reasoning', 'summary']);
+  });
+
+  it('clamps a notice whose anchor predates the loaded window to the window top', () => {
+    const notices = new LocalNoticeList();
+    notices.add(entry('notice'), 50);
+    const window = Array.from({ length: 20 }, (_, i) => entry(`e${110 + i}`));
+    expect(texts(notices.merge(window, 110))[0]).toBe('notice');
   });
 
   it('identifies its own entries so a merged view can be split back into server entries', () => {

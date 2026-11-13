@@ -55,15 +55,20 @@ export class LocalNoticeList {
 
   /**
    * Server entries with the live notices put back where they arrived. Anchors
-   * never decrease (the host only appends), so the insertion offset accumulates.
+   * are absolute server entry counts; `entriesFrom` is the absolute index of
+   * the first entry in the window the caller holds, so the anchor is
+   * translated into that window before inserting. An anchor before the window
+   * clamps to its top; one past its end clamps to its end. Anchors never
+   * decrease relative to each other (the host only appends), so the insertion
+   * offset accumulates.
    */
-  merge(serverEntries: SessionEntry[], now = Date.now()): SessionEntry[] {
+  merge(serverEntries: SessionEntry[], entriesFrom = 0, now = Date.now()): SessionEntry[] {
     this.prune(now);
     if (this.items.length === 0) return serverEntries;
     const merged = [...serverEntries];
     let inserted = 0;
     for (const item of this.items) {
-      const index = Math.min(item.anchor + inserted, merged.length);
+      const index = Math.min(Math.max(item.anchor - entriesFrom + inserted, 0), merged.length);
       merged.splice(index, 0, item.entry);
       inserted++;
     }

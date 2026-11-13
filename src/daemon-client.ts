@@ -590,10 +590,10 @@ class DaemonSessionClient implements DaemonSessionConnection {
     if (!this.snapshot || this.closed) return;
     const text = error instanceof Error ? error.message : String(error);
     const notice: SessionEntry = tone === 'info' ? { kind: 'notice', text } : { kind: 'notice', text, tone };
-    this.localNotices.add(notice, this.serverEntries.length);
+    this.localNotices.add(notice, this.totalEntries);
     this.scheduleLocalNoticeExpiry();
     const current = this.snapshot;
-    this.snapshot = { ...current, session: { ...current.session, entries: this.localNotices.merge(this.serverEntries) } };
+    this.snapshot = { ...current, session: { ...current.session, entries: this.localNotices.merge(this.serverEntries, this.entriesFrom) } };
     this.publish();
   }
 
@@ -606,7 +606,7 @@ class DaemonSessionClient implements DaemonSessionConnection {
       if (this.localNotices.prune()) {
         this.snapshot = {
           ...this.snapshot,
-          session: { ...this.snapshot.session, entries: this.localNotices.merge(this.serverEntries) },
+          session: { ...this.snapshot.session, entries: this.localNotices.merge(this.serverEntries, this.entriesFrom) },
         };
         this.publish();
       }
@@ -617,7 +617,7 @@ class DaemonSessionClient implements DaemonSessionConnection {
 
   /** Merged view: server entries with the live client-local notices in their place. */
   private withLocalNotices(entries: SessionEntry[]): SessionEntry[] {
-    return this.localNotices.merge(entries);
+    return this.localNotices.merge(entries, this.entriesFrom);
   }
 
   private publish(): void {
