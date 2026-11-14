@@ -105,6 +105,12 @@ function hostCannotListBeforeAttach(message: string): boolean {
  */
 export async function resolveResumeAttach(options: {
   clientKind: LocalClientKind;
+  /**
+   * Everything else the attach must carry - the window, project flags - that
+   * choosing a chat must not erase. The chat choice only decides WHICH chat;
+   * how to attach to it stays the caller's and is merged back in.
+   */
+  base?: AttachOptions;
   askHost: () => Promise<SessionSummary[]>;
   localList: () => SessionSummary[];
 }): Promise<ResumeResolution> {
@@ -119,11 +125,12 @@ export async function resolveResumeAttach(options: {
     notice =
       "This host is an older OpenButler without a pre-attach chat list, so the opening chat came from this computer's saved list instead.";
   }
+  const base = options.base ?? {};
   const resumed = sessions[0];
   const attach: AttachOptions =
     resumed === undefined
-      ? { clientKind: options.clientKind, newChatSession: true }
-      : { clientKind: options.clientKind, chatSessionId: resumed.id };
+      ? { ...base, clientKind: options.clientKind, newChatSession: true }
+      : { ...base, clientKind: options.clientKind, chatSessionId: resumed.id };
   return notice === undefined ? { attach } : { attach, notice };
 }
 
@@ -145,6 +152,7 @@ export async function connectDaemonSession(workspacePath: string, options: Attac
     const resolution: ResumeResolution =
       resume === true
         ? await resolveResumeAttach({
+            base: attachOptions,
             clientKind: attachOptions.clientKind ?? 'terminal',
             // The list runs on this connection, exactly like every later request,
             // so a remote backend answers from its own store.
@@ -775,8 +783,18 @@ class DaemonSessionClient implements DaemonSessionConnection {
         this.reconnecting = false;
         this.addLocalNotice('Reconnected to the OpenButler host.', 'info');
         return;
-      } catch {
+      } catch (error) {
         if (socket && !socket.destroyed) socket.destroy();
+        // A refused credential can never succeed on retry: stop here and tell
+        // the reader why, rather than dialing forever with a token the host
+        // no longer accepts.
+        if (error instanceof HostRefusedAuthError && !this.closed && !this.intentionalShutdown) {
+          this.addLocalNotice(
+            `Stopped reconnecting: ${error.message} Pair this client again with \`openbutler connect <host:port> --code <code>\`.`,
+            'error',
+          );
+          break;
+        }
         attempt++;
         if (this.closed || this.intentionalShutdown) break;
         await delay(Math.min(5_000, 250 * 2 ** Math.min(attempt, 5)));
@@ -802,6 +820,13 @@ function snapshotFromData(data: SessionSnapshotData): AgentSessionSnapshot {
     streamingAssistantEntry: index === null ? null : (data.session.entries[index] ?? null),
   };
 }
+
+/**
+ * The host explicitly refused this client's credential. Unlike a transport
+ * failure, retrying with the same saved token can only fail again, so the
+ * reconnect loop treats this as terminal and reports it to the reader.
+ */
+export class HostRefusedAuthError extends Error {}
 
 /**
  * The host's first-frame handshake on a remote socket: one `auth` frame out,
@@ -854,7 +879,7 @@ function performAuthHandshake(socket: Socket, token: string): Promise<void> {
           continue;
         }
         if (!message.ok) {
-          finish(new Error(typeof message.error === 'string' ? message.error : 'Authentication failed.'));
+          finish(new HostRefusedAuthError(typeof message.error === 'string' ? message.error : 'Authentication failed.'));
           return;
         }
         for (const rest of messages.slice(index + 1)) forwarded.push(rest, Buffer.from('\n'));

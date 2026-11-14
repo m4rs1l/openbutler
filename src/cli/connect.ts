@@ -5,7 +5,9 @@ import { isLoopback, isTailnetAddress } from '../tailnet.js';
 import type { Parsed } from './args.js';
 import * as ui from './ui.js';
 
-const USAGE = 'Usage: openbutler connect <host:port> --code <code> [--name <name>] | list | remove <name> | use <name>';
+const USAGE =
+  'Usage: openbutler connect <host:port> [--code <code>] [--name <name>] | list | remove <name> | use <name>' +
+  '  (the code comes from --code, OPENBUTLER_PAIR_CODE, or the prompt)';
 
 export interface ConnectTarget {
   host: string;
@@ -73,9 +75,13 @@ export async function runConnect(parsed: Parsed): Promise<void> {
   if (!sub) throw new Error(USAGE);
 
   const target = parseConnectTarget(sub);
-  let code = parsed.flags.get('code')?.trim();
+  // `--code` on argv is visible in the local process list for the code's five
+  // minutes, so scripted pairing reads OPENBUTLER_PAIR_CODE instead, and an
+  // interactive terminal is prompted without it ever touching argv.
+  let code = parsed.flags.get('code')?.trim() || process.env.OPENBUTLER_PAIR_CODE?.trim();
   if (!code) {
-    if (!process.stdin.isTTY) throw new Error(`Pairing needs the code shown by \`openbutler pair\` on the host: pass --code <code>.`);
+    if (!process.stdin.isTTY)
+      throw new Error(`Pairing needs the code shown by \`openbutler pair\` on the host: pass --code <code> or set OPENBUTLER_PAIR_CODE.`);
     code = (await input({ message: `Pairing code from ${target.host}:${target.port} (openbutler pair):` })).trim();
   }
   if (!code) throw new Error('The pairing code cannot be empty. Run `openbutler pair` on the backend and enter what it prints.');

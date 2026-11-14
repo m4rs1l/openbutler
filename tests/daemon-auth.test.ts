@@ -12,6 +12,8 @@ let root: string;
 let hosts: DaemonHost[] = [];
 let servers: Server[] = [];
 let clients: DaemonSessionConnection[] = [];
+/** Every socket the remote listener accepted, in order: reconnect attempts are counted here. */
+let remoteConnections: Socket[] = [];
 
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'openbutler-auth-'));
@@ -20,6 +22,7 @@ beforeEach(async () => {
   hosts = [];
   servers = [];
   clients = [];
+  remoteConnections = [];
   // A host start builds the custodian runtime, which needs a configured default
   // provider plus an offline catalog snapshot before any server can come up.
   const settings = await import('../src/settings.js');
@@ -58,7 +61,10 @@ async function makeHost(): Promise<DaemonHost> {
  * remote connection, so the auth gate applies to it.
  */
 async function listenRemoteFor(host: DaemonHost, authTimeoutMs?: number): Promise<number> {
-  const server = createServer((socket) => host.handleConnection(socket, { remote: true, authTimeoutMs }));
+  const server = createServer((socket) => {
+    remoteConnections.push(socket);
+    host.handleConnection(socket, { remote: true, authTimeoutMs });
+  });
   servers.push(server);
   await new Promise<void>((res, rej) => {
     server.once('error', rej);
@@ -320,4 +326,26 @@ describe('client handshake', () => {
     const { connectDaemonSession } = await import('../src/daemon-client.js');
     await expect(connectDaemonSession(root, { isolatedSession: true })).rejects.toThrow(/authenticat/i);
   });
+
+  it('stops reconnecting after the host refuses the token, and says why', async () => {
+    const { createAuthToken, revokeAuthToken } = await import('../src/auth-tokens.js');
+    const { id, token } = createAuthToken();
+    const port = await startRemoteBackend();
+    writeRegistry({ host: '127.0.0.1', port, token });
+    const client = await attachClient();
+    expect(client.getSnapshot().session.id).toBeTruthy();
+
+    // The credential is gone, so every later handshake must be refused.
+    expect(revokeAuthToken(id)).toBe(true);
+    const afterFirst = remoteConnections.length;
+    remoteConnections[afterFirst - 1]!.destroy();
+
+    // A refused handshake is terminal: a visible reason naming the token, and
+    // exactly one reconnect attempt instead of an endless retry loop.
+    await waitFor(() =>
+      expect(client.getSnapshot().session.entries.some((entry) => entry.kind === 'notice' && /token/i.test(entry.text))).toBe(true),
+    );
+    await new Promise((done) => setTimeout(done, 3_000));
+    expect(remoteConnections.length).toBe(afterFirst + 1);
+  }, 30_000);
 });

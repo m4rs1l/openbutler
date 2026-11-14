@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { getDataPath } from './paths.js';
 
@@ -71,7 +71,12 @@ function readStore(): AuthTokenFile {
 function writeStore(store: AuthTokenFile): void {
   const path = authTokensPath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+  // Write beside the store and rename into place: an interrupted write can
+  // only leave the previous store behind, never half of the new one - a
+  // corrupt store would refuse every remote token until repaired by hand.
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 function hashToken(salt: string, token: string): string {

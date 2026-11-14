@@ -115,7 +115,7 @@ function usage(): void {
     ['openbutler pair', 'Print a one-time code so a remote client can pair with this host (5 minutes).'],
     [
       'openbutler connect <host:port>',
-      'Pair this client with a remote backend (--code, --name); list | use <name> | remove <name> manage the saved ones.',
+      'Pair this client with a remote backend (interactive code prompt, or OPENBUTLER_PAIR_CODE/--code; --name); list | use <name> | remove <name> manage the saved ones.',
     ],
     ['openbutler team <subcommand>', 'Form a closed team of openbutlers over the tailnet (init, invite, join, …).'],
     ['openbutler events', 'Inspect the durable event ledger.'],

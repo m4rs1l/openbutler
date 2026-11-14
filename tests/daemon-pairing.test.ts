@@ -348,6 +348,25 @@ describe('connect CLI flow', () => {
     const { resolveActiveBackend } = await import('../src/backend-registry.js');
     expect(resolveActiveBackend()).toMatchObject({ host: '127.0.0.1', port });
   });
+
+  it('takes the pairing code from OPENBUTLER_PAIR_CODE so a script never puts it on the command line', async () => {
+    const host = await makeHost();
+    await listenPipeFor(host);
+    const port = await listenRemoteFor(host);
+    await host.start();
+    const code = await issueCode();
+    vi.stubEnv('OPENBUTLER_PAIR_CODE', code);
+    const { runConnect } = await import('../src/cli/connect.js');
+    const parsed = {
+      command: 'connect',
+      words: [`127.0.0.1:${String(port)}`],
+      flags: new Map<string, string>(),
+      booleans: new Set<string>(),
+    };
+    await runConnect(parsed as never);
+    const { resolveActiveBackend } = await import('../src/backend-registry.js');
+    expect(resolveActiveBackend()).toMatchObject({ host: '127.0.0.1', port });
+  });
 });
 
 describe('connect target parsing', () => {

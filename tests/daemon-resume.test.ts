@@ -251,6 +251,24 @@ describe('resume resolves over the wire, not from this machine', () => {
     expect(result.notice).toBeUndefined();
   });
 
+  it('carries the attach options (the window) through to whichever chat it picks', async () => {
+    const { resolveResumeAttach } = await import('../src/daemon-client.js');
+    const result = await resolveResumeAttach({
+      clientKind: 'web',
+      base: { entriesWindow: 400 },
+      askHost: async () => [idSummary('top')],
+      localList: () => [],
+    });
+    expect(result.attach).toEqual({ entriesWindow: 400, clientKind: 'web', chatSessionId: 'top' });
+    const fresh = await resolveResumeAttach({
+      clientKind: 'web',
+      base: { entriesWindow: 400 },
+      askHost: async () => [],
+      localList: () => [],
+    });
+    expect(fresh.attach).toEqual({ entriesWindow: 400, clientKind: 'web', newChatSession: true });
+  });
+
   it('opens a new chat when the host list is empty', async () => {
     const { resolveResumeAttach } = await import('../src/daemon-client.js');
     const result = await resolveResumeAttach({ clientKind: 'terminal', askHost: async () => [], localList: () => [idSummary('local')] });
@@ -304,6 +322,21 @@ describe('resume resolves over the wire, not from this machine', () => {
     const client = await connectDaemonSession(root, resumeChatAttach('web'));
     clients.push(client);
     expect(client.getSnapshot().session.id).toBe(chat.id);
+  });
+
+  it('windows a resumed chat exactly like a direct web attach, so a long chat cannot outgrow a frame', async () => {
+    const chat = await saveChat('Windowed resume');
+    const host = await makeHost();
+    await listenPipeFor(host);
+    await host.start();
+    const { connectDaemonSession, resumeChatAttach } = await import('../src/daemon-client.js');
+    // The web server's startup attach (`web/server.ts`) is a resume with a
+    // 400-entry window; the fixture holds two entries and a one-entry window
+    // must survive the resume choice down to the host's snapshot.
+    const client = await connectDaemonSession(root, { ...resumeChatAttach('web'), entriesWindow: 1 });
+    clients.push(client);
+    expect(client.getSnapshot().session.id).toBe(chat.id);
+    expect(client.getSnapshot().session.entries).toHaveLength(1);
   });
 });
 
