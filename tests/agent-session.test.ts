@@ -162,8 +162,9 @@ describe('owner replies and safe steering', () => {
     expect(seen).toContain('high');
   });
 
-  it('cancels title generation when changing sessions and ignores the stale result', async () => {
+  it('keeps generating the title across a session switch and applies it to the original session', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
+    const { loadSavedSession } = await import('../src/session-store.js');
     let complete!: (value: ReturnType<typeof titleResponse>) => void;
     const pending = new Promise<ReturnType<typeof titleResponse>>((resolve) => {
       complete = resolve;
@@ -176,13 +177,15 @@ describe('owner replies and safe steering', () => {
     await session.waitUntilIdle(1000);
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
     const signal = generate.mock.calls[0]![0]?.abortSignal;
+    const originalId = session.getSnapshot().session.id;
     await session.createNewSession();
     const next = session.getSnapshot().session;
-    expect(signal?.aborted).toBe(true);
+    // The generation belongs to the original session: a switch must not cancel it.
+    expect(signal?.aborted).toBe(false);
     complete(titleResponse());
-    await delay(20);
+    await vi.waitFor(() => expect(loadSavedSession(originalId)?.title).toBe('Fixture greeting'), { timeout: 5_000 });
     expect(session.getSnapshot().session.id).toBe(next.id);
-    expect(session.getSnapshot().session.title).toBe(next.title);
+    expect(session.getSnapshot().session.title).toBe('New session');
   });
 
   it('starts the custodian at its reserved id with an identity-bound budget and refuses to replace it', async () => {
@@ -217,17 +220,133 @@ describe('owner replies and safe steering', () => {
     expect(session.getSnapshot().session.id).toBe(CUSTODIAN_SESSION_ID);
   });
 
-  it('closes without waiting for a stalled title request', async () => {
+  it('closes without waiting for a stalled title request and still lands the title', async () => {
     const { AgentSessionController } = await import('../src/agent-session.js');
-    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(async () => new Promise<ReturnType<typeof titleResponse>>(() => {}));
+    const { loadSavedSession } = await import('../src/session-store.js');
+    let complete!: (value: ReturnType<typeof titleResponse>) => void;
+    const pending = new Promise<ReturnType<typeof titleResponse>>((resolve) => {
+      complete = resolve;
+    });
+    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(() => pending);
     session = new AgentSessionController(
       runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Done') })),
     );
     await session.sendMessage({ text: 'First message', images: [] });
     await session.waitUntilIdle(1000);
     await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+    const sessionId = session.getSnapshot().session.id;
     await session.close();
-    expect(generate.mock.calls[0]![0]?.abortSignal?.aborted).toBe(true);
+    // Closing must not wait for the stalled request, and must not cancel it either.
+    expect(generate.mock.calls[0]![0]?.abortSignal?.aborted).toBe(false);
+    complete(titleResponse());
+    await vi.waitFor(() => expect(loadSavedSession(sessionId)?.title).toBe('Fixture greeting'), { timeout: 5_000 });
+  });
+
+  it('keeps the session on New session until the title model answers', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { loadSavedSession } = await import('../src/session-store.js');
+    let complete!: (value: ReturnType<typeof titleResponse>) => void;
+    const pending = new Promise<ReturnType<typeof titleResponse>>((resolve) => {
+      complete = resolve;
+    });
+    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(() => pending);
+    session = new AgentSessionController(
+      runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Done') })),
+    );
+    // A one-word first message used to become "<word> chat" before any model answered.
+    await session.sendMessage({ text: 'hey', images: [] });
+    await session.waitUntilIdle(1000);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+    const sessionId = session.getSnapshot().session.id;
+    expect(session.getSnapshot().session.title).toBe('New session');
+    await vi.waitFor(() => expect(loadSavedSession(sessionId)?.title).toBe('New session'), { timeout: 5_000 });
+    complete(titleResponse());
+    await vi.waitFor(() => expect(session!.getSnapshot().session.title).toBe('Fixture greeting'));
+  });
+
+  it('titles the chat from the user messages and the first assistant reply', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(async () => titleResponse());
+    session = new AgentSessionController(
+      runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Completed answer') })),
+    );
+    await session.sendMessage({ text: 'First message', images: [] });
+    await session.waitUntilIdle(1000);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+    const prompt = JSON.stringify(generate.mock.calls[0]![0]?.prompt ?? null);
+    expect(prompt).toContain('First message');
+    expect(prompt).toContain('Completed answer');
+    await vi.waitFor(() => expect(session!.getSnapshot().session.title).toBe('Fixture greeting'));
+  });
+
+  it('starts the title from the first assistant reply even when the run is aborted', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    let complete!: (value: ReturnType<typeof titleResponse>) => void;
+    const pending = new Promise<ReturnType<typeof titleResponse>>((resolve) => {
+      complete = resolve;
+    });
+    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(() => pending);
+    session = new AgentSessionController(
+      runtimeFor(
+        new MockLanguageModelV3({
+          doGenerate: generate,
+          // A provider's HTTP stream dies with an AbortError when the request is
+          // aborted; the SDK only re-checks the signal after each read returns,
+          // so a stall that ignores the signal would hang the run forever.
+          doStream: async ({ abortSignal }) => ({
+            stream: new ReadableStream({
+              start(controller) {
+                controller.enqueue({ type: 'stream-start', warnings: [] });
+                controller.enqueue({ type: 'text-start', id: 'fixture' });
+                controller.enqueue({ type: 'text-delta', id: 'fixture', delta: 'Partial answer' });
+                controller.enqueue({ type: 'text-end', id: 'fixture' });
+                // No finish part: the run stays open until the test aborts it.
+                abortSignal?.addEventListener('abort', () => {
+                  controller.error(abortSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+                });
+              },
+            }),
+          }),
+        }),
+      ),
+    );
+    void session.sendMessage({ text: 'First message', images: [] }).catch(() => {});
+    await vi.waitFor(() =>
+      expect(session!.getSnapshot().streamingAssistantEntry).toMatchObject({ text: expect.stringContaining('Partial answer') }),
+    );
+    session.stop();
+    await session.waitUntilIdle(1000);
+    // The aborted run still produced the first assistant reply, so the generation starts.
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+    complete(titleResponse());
+    await vi.waitFor(() => expect(session!.getSnapshot().session.title).toBe('Fixture greeting'));
+  });
+
+  it('logs a failed title generation instead of swallowing it', async () => {
+    const { AgentSessionController } = await import('../src/agent-session.js');
+    const { existsSync, readFileSync } = await import('node:fs');
+    const generate = vi.fn<MockLanguageModelV3['doGenerate']>(async () => {
+      throw new Error('title model unavailable');
+    });
+    session = new AgentSessionController(
+      runtimeFor(new MockLanguageModelV3({ doGenerate: generate, doStream: async () => fixtureText('Done') })),
+    );
+    await session.sendMessage({ text: 'First message', images: [] });
+    await session.waitUntilIdle(1000);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+    const logPath = join(dataDir, 'logs', 'openbutler.log');
+    await vi.waitFor(() => {
+      expect(existsSync(logPath)).toBe(true);
+      const log = readFileSync(logPath, 'utf8');
+      expect(log).toContain('session.title.failed');
+      expect(log).toContain('title model unavailable');
+    });
+    expect(session.getSnapshot().session.title).toBe('New session');
+  });
+
+  it('pins the title generation timeout at 300 seconds', async () => {
+    const { TITLE_GENERATION_TIMEOUT_MS } = await import('../src/agent-session.js');
+    expect(TITLE_GENERATION_TIMEOUT_MS).toBe(300_000);
   });
 
   it('queues web messages by default and promotes only the selected message into the active turn', async () => {

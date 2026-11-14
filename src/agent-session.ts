@@ -14,7 +14,6 @@ import {
   loadSavedSessionAsync,
   saveSession,
   saveSessionAsync,
-  sessionTitle,
   type SavedSession,
   type SessionEntry,
   type SessionEntryMeta,
@@ -22,6 +21,7 @@ import {
   type SessionSummary,
   type NoticeTone,
 } from './session-store.js';
+import { createLogger, fileSink } from './logging.js';
 import { isToolRequestWhitelisted, rememberToolRequest } from './tool-permissions.js';
 import { daemonCommandAction } from './commands/registry.js';
 import { ensureHostOwnedRoots } from './host-owned-paths.js';
@@ -416,7 +416,10 @@ export class AgentSessionController implements AgentSessionClient {
   /** The turn a standalone compaction writes its row into; null outside one. */
   private compactionTurnId: string | null = null;
   private closed = false;
-  private titleAbort: AbortController | null = null;
+  /** One title generation per session open: the first assistant reply starts it. */
+  private titleGenerationStarted = false;
+  /** Title failures belong in the machine log, never in a silent catch. */
+  private readonly titleLogger = createLogger({ sink: fileSink(), context: { process: 'host' } });
   /**
    * A compaction requested while a run was in flight. The run serves it at its
    * next step boundary; the run's end is only the fallback for a request that
@@ -664,7 +667,6 @@ export class AgentSessionController implements AgentSessionClient {
   private persistableSession(): SavedSession {
     return {
       ...this.session,
-      title: this.session.title === 'New session' ? sessionTitle(this.session.entries) : this.session.title,
       updatedAt: new Date().toISOString(),
       // Saved sessions own their model selection. Runtime state may have been
       // initialized from the global default before this session was restored.
@@ -883,7 +885,7 @@ export class AgentSessionController implements AgentSessionClient {
     if (this.busy) return;
     await this.flushSave();
     if (this.busy) return;
-    if (session.id !== this.session.id) this.cancelTitleGeneration();
+    if (session.id !== this.session.id) this.titleGenerationStarted = false;
     this.sessionGeneration += 1;
     this.session = {
       ...session,
@@ -944,7 +946,7 @@ export class AgentSessionController implements AgentSessionClient {
     const project = projectId === undefined ? undefined : sessionProject(projectId, this.runtime.workspaceRoot);
     await this.flushSave();
     if (this.busy) return;
-    this.cancelTitleGeneration();
+    this.titleGenerationStarted = false;
     this.sessionGeneration += 1;
     this.lastPersistedContent = null;
     this.session = {
@@ -1301,7 +1303,6 @@ export class AgentSessionController implements AgentSessionClient {
 
   private async closeSession(): Promise<void> {
     this.closed = true;
-    this.cancelTitleGeneration();
     this.stop({ preserveWakePolicy: true });
     this.flushStreamedEntries();
     await this.flushSave();
@@ -1529,6 +1530,7 @@ export class AgentSessionController implements AgentSessionClient {
     const wasStreaming = this.streamedAssistantEntry !== null;
     this.streamedAssistantEntry = null;
     if (wasStreaming) this.publish();
+    this.maybeStartTitleGeneration();
   }
 
   private onToolStart(request: ToolCallRequest, toolCallId?: string): void {
@@ -2252,13 +2254,8 @@ export class AgentSessionController implements AgentSessionClient {
         // Provider retries and key rotations belong to this turn's transcript.
         this.retryNotice = null;
         this.runtime.reportRetry?.((event) => this.reportModelRetry(event));
-        let titleRequest: { sessionId: string; message: string } | null = null;
         if (!this.sessionHasUserMessage) {
           this.sessionHasUserMessage = true;
-          const imageOnly = messageImageCount(current) > 0 && current.text === 'User attached image';
-          const titleSeed = imageOnly ? 'Image chat' : current.text || (messageImageCount(current) > 0 ? 'Image chat' : 'New session');
-          this.session = { ...this.session, title: fallbackSessionTitle(titleSeed) };
-          if (current.text && !imageOnly) titleRequest = { sessionId: this.session.id, message: current.text };
           this.publish();
         }
         const userMessage = queuedUserMessageToModelMessage(current);
@@ -2559,7 +2556,6 @@ export class AgentSessionController implements AgentSessionClient {
           }
         }
 
-        if (titleRequest && !abortController.signal.aborted) this.generateTitleInBackground(titleRequest);
         if (abortController.signal.aborted) this.runError = 'Run cancelled.';
         if (current.eventId) {
           this.flushEventAssistantText();
@@ -2639,16 +2635,34 @@ export class AgentSessionController implements AgentSessionClient {
     }
   }
 
-  private cancelTitleGeneration(): void {
-    this.titleAbort?.abort();
-    this.titleAbort = null;
+  /**
+   * The first assistant reply is the title seed: the generation starts there,
+   * once per session open, and owns the session's title from then on. Its input
+   * is the exchange itself - every user message and the first reply - so a title
+   * never comes from a fragment or from a fallback.
+   */
+  private maybeStartTitleGeneration(): void {
+    if (this.titleGenerationStarted || this.session.title !== 'New session') return;
+    const assistant = this.session.entries.find((entry) => entry.kind === 'assistant' && entry.internal === undefined);
+    if (assistant === undefined || assistant.kind !== 'assistant' || !assistant.text.trim()) return;
+    const userTexts: string[] = [];
+    for (const entry of this.session.entries) {
+      if (entry.kind !== 'user') continue;
+      const text = entry.text.trim();
+      // An image-only message carries a placeholder, not words the owner wrote.
+      if (text.length > 0 && text !== 'User attached image') userTexts.push(text);
+    }
+    this.titleGenerationStarted = true;
+    this.generateTitleInBackground({ sessionId: this.session.id, userTexts, assistantText: assistant.text });
   }
 
-  private generateTitleInBackground(request: { sessionId: string; message: string }): void {
-    this.cancelTitleGeneration();
-    const controller = new AbortController();
-    this.titleAbort = controller;
-    const fallback = this.session.title;
+  /**
+   * The generation is independent of the run and the controller state that
+   * started it: only its own deadline can end it, so an abort, a session
+   * switch, or a close still lets the title land on the session it belongs to.
+   * A failure is logged, never swallowed.
+   */
+  private generateTitleInBackground(request: { sessionId: string; userTexts: string[]; assistantText: string }): void {
     void (async () => {
       try {
         const live = this.liveTurnPreferences();
@@ -2660,18 +2674,37 @@ export class AgentSessionController implements AgentSessionClient {
           : this.stateReasoningOptions(live.reasoningVariantId, live.showReasoning);
         // Metadata must not rotate the active conversation's keys or report retries into its next turn.
         const model = bindSessionKeyRotation(this.runtime.titleModel ?? this.stateModel(), { ...this.session.keyPositions }, () => {});
-        const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
-        const title = await generateSessionTitle(model, request.message, signal, providerOptions);
-        if (!this.closed && !signal.aborted && this.session.id === request.sessionId && this.session.title === fallback) {
-          this.session = { ...this.session, title };
-          this.publish();
-        }
-      } catch {
-        // The first-message fallback remains valid when metadata generation fails.
-      } finally {
-        if (this.titleAbort === controller) this.titleAbort = null;
+        const signal = AbortSignal.timeout(TITLE_GENERATION_TIMEOUT_MS);
+        const title = await generateSessionTitle(model, request, signal, providerOptions);
+        await this.applyGeneratedTitle(request.sessionId, title);
+      } catch (error) {
+        this.titleLogger.error('session.title.failed', {
+          sessionId: request.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     })();
+  }
+
+  /**
+   * Land the generated title on the session it belongs to, wherever that
+   * session is now: the active controller saves it through the normal path, a
+   * session this controller has left writes through to its own file. A close
+   * does not lose it either - the generation answered, so the title is a fact.
+   */
+  private async applyGeneratedTitle(sessionId: string, title: string): Promise<void> {
+    if (this.session.id === sessionId) {
+      if (!this.closed) {
+        this.session = { ...this.session, title };
+        this.publish();
+        return;
+      }
+      while (this.sessionSavePromise) await this.sessionSavePromise;
+      await saveSessionAsync({ ...this.persistableSession(), title });
+      return;
+    }
+    const stored = await loadSavedSessionAsync(sessionId);
+    if (stored) await saveSessionAsync({ ...stored, title });
   }
 
   /** Run the queued compaction, otherwise start the next queued turn. */
@@ -3353,20 +3386,24 @@ function appendUniqueQueuedMessages(target: ModelMessage[], messages: ModelMessa
   }
 }
 
+/** The title generation's own deadline: it must outlive any run that started it. */
+export const TITLE_GENERATION_TIMEOUT_MS = 300_000;
+
 async function generateSessionTitle(
   model: LanguageModel,
-  firstMessage: string,
+  request: { userTexts: string[]; assistantText: string },
   abortSignal?: AbortSignal,
   providerOptions?: ReasoningVariant['providerOptions'],
 ): Promise<string> {
   const { generateText, jsonSchema, Output } = await import('ai');
+  const users = request.userTexts.map((text) => `- ${truncateUtf8Bytes(text.replace(/\s+/g, ' ').trim(), 2 * 1024)}`).join('\n');
+  const assistant = truncateUtf8Bytes(request.assistantText.replace(/\s+/g, ' ').trim(), 4 * 1024);
   const result = await generateText({
     model,
-    maxRetries: 0,
+    maxRetries: 2,
     output: Output.object({
       name: 'chat_title',
-      description:
-        'A concise, specific 2–4 word chat title in the same language as the user’s first message. Do not include a label or explanation.',
+      description: 'A concise, specific 2–4 word chat title in the same language as the exchange. Do not include a label or explanation.',
       schema: jsonSchema<{ title: string }>({
         type: 'object',
         properties: {
@@ -3379,17 +3416,12 @@ async function generateSessionTitle(
     ...(abortSignal ? { abortSignal } : {}),
     ...(providerOptions && Object.keys(providerOptions).length > 0 ? { providerOptions } : {}),
     system:
-      'Read the user’s first message and create a concise, specific title for this chat. Use 2–4 words in the same language as the message. Put the title in the title field; do not make it a sentence.',
-    prompt: truncateUtf8Bytes(firstMessage, 4 * 1024),
+      'Read the conversation excerpt and create a concise, specific title for this chat. Use 2–4 words in the same language as the exchange. Put the title in the title field; do not make it a sentence.',
+    prompt: `User messages:\n${users}\n\nFirst assistant reply:\n${assistant}`,
   });
-  return result.output.title.trim() || fallbackSessionTitle(firstMessage);
-}
-
-function fallbackSessionTitle(message: string): string {
-  const words = message.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean).slice(0, 4);
-  if (words.length === 0) return 'New session';
-  if (words.length === 1) return `${words[0]} chat`;
-  return words.join(' ').slice(0, 64);
+  const title = result.output.title.trim();
+  if (!title) throw new Error('The title model returned an empty title.');
+  return title;
 }
 
 /**

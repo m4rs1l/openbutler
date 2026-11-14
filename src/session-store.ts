@@ -270,13 +270,6 @@ export function createSession(providerId: string, modelId: string, contextWindow
   };
 }
 
-export function sessionTitle(entries: readonly SessionEntry[]): string {
-  const firstUser = entries.find((entry) => entry.kind === 'user');
-  if (!firstUser || firstUser.kind !== 'user') return 'New session';
-  const title = firstUser.text.replace(/\s+/g, ' ').trim();
-  return title ? title.slice(0, 80) : firstUser.imageCount ? 'Image chat' : 'New session';
-}
-
 /** Session files on disk with their metadata, oldest first; used by explicit pruning only. */
 export function listSessionFiles(): SessionFileInfo[] {
   let names: string[];
@@ -1064,7 +1057,7 @@ function prepareSessionSave(session: SavedSession, options: { allowEmpty?: boole
     version: 1,
     id: session.id,
     ...(session.keyPositions === undefined ? {} : { keyPositions: session.keyPositions }),
-    title: session.title === 'New session' ? sessionTitle(session.entries) : session.title,
+    title: session.title,
     createdAt: session.createdAt,
     updatedAt: new Date().toISOString(),
     ...(session.lastActivityAt === undefined ? {} : { lastActivityAt: session.lastActivityAt }),
