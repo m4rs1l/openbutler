@@ -8,6 +8,7 @@ import { migrateMemoryLayout } from '../src/memory-layout.js';
 import { parseMemoryDocument, validateMemoryDocument, validateMemoryIndex } from '../src/memory-document.js';
 import { ensureMemoryIndexEntry } from '../src/file-write-core.js';
 import { createWriteTool } from '../src/tools/file-write.js';
+import { createMemoryWriteTool } from '../src/tools/memory-write.js';
 import { getAgentContext } from '../src/agent.js';
 
 let root: string;
@@ -230,6 +231,14 @@ it('keeps the global entrypoint to concise shared-user links and supplies curren
   expect(system).toContain('expected future utility');
   expect(system).not.toContain('Nobody will say "remember this"');
   expect(system).toContain('three months');
+  expect(system).toContain('first-class memory material');
+  expect(system).toContain('Categories that routinely qualify');
+  expect(system).toContain('Silence is never a fact');
+  expect(system).toContain('inferred: <basis>');
+  expect(system).toContain('are not memory');
+  expect(system).not.toContain('name, occupation, location');
+  expect(system).not.toContain('Do not promote an inference');
+  expect(createMemoryWriteTool(workspace).description).toContain('Save durable owner facts, decisions, stated preferences');
   expect(system).not.toContain('Loaded user context');
   expect(system).not.toContain('every H3 entry needs a non-empty #### Summary');
   expect(system).not.toContain('user/notes');
