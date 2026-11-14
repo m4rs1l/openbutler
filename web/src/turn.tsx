@@ -18,7 +18,9 @@ import {
   groupSignal,
   isShellTool,
   reasoningTitle,
+  stepGroupOpenState,
   stepLabel,
+  stretchAnswered,
   thoughtHeadline,
   thoughtLabel,
   turnDuration,
@@ -144,22 +146,30 @@ function StepRow({ entry, live }: { entry: Entry; live: boolean }) {
   );
 }
 
-function StepGroup({ entries, live, active, titles }: { entries: Entry[]; live: boolean; active: boolean; titles: boolean }) {
+function StepGroup({
+  entries,
+  live,
+  active,
+  answered,
+  titles,
+}: {
+  entries: Entry[];
+  live: boolean;
+  active: boolean;
+  answered: boolean;
+  titles: boolean;
+}) {
   const [open, setOpen] = useState(active);
   // Whether the current `open` came from being the active group rather than a
-  // click, so only an automatic opening is folded again when the next group
-  // starts. A group the reader opened stays open.
+  // click: only an automatic opening folds when activity moves on, and only
+  // once an answer follows the stretch. A group the reader opened stays open.
   const [automatic, setAutomatic] = useState(active);
   const [wasActive, setWasActive] = useState(active);
   if (wasActive !== active) {
-    setWasActive(active);
-    if (active) {
-      setAutomatic(true);
-      setOpen(true);
-    } else if (automatic) {
-      setAutomatic(false);
-      setOpen(false);
-    }
+    const next = stepGroupOpenState({ wasActive, active, automatic, open }, answered);
+    setWasActive(next.wasActive);
+    setAutomatic(next.automatic);
+    setOpen(next.open);
   }
   const toggle = () => {
     setAutomatic(false);
@@ -315,6 +325,7 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
                 entries={group.entries}
                 live={live}
                 active={group === activeGroup}
+                answered={stretchAnswered(groups, groups.indexOf(group))}
                 titles={runtime?.reasoningTitles === true}
               />
             );

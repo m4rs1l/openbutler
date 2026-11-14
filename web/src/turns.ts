@@ -207,6 +207,38 @@ export function activeGroupIndex(groups: readonly TurnGroup[], current: boolean)
   return last?.kind === 'steps' ? groups.length - 1 : -1;
 }
 
+/**
+ * Whether an assistant answer closes the stretch this group opened to show.
+ * The scan stops at the owner's next message: a group the owner follows with
+ * another ask, tools only in between, reports false so the work the
+ * conversation is still about does not fold away.
+ */
+export function stretchAnswered(groups: readonly TurnGroup[], index: number): boolean {
+  for (let cursor = index + 1; cursor < groups.length; cursor += 1) {
+    const group = groups[cursor]!;
+    if (group.kind !== 'message') continue;
+    if (group.entry.kind === 'user') return false;
+    // groupTimeline drops blank assistant text, so an answer group is visible.
+    if (group.entry.kind === 'assistant') return true;
+  }
+  return false;
+}
+
+/**
+ * How a step group's automatic open state moves with activity. Activity opens
+ * the group; leaving it folds the group only when an answer follows the
+ * stretch, and never undoes the reader's own click.
+ */
+export function stepGroupOpenState(
+  state: { wasActive: boolean; active: boolean; automatic: boolean; open: boolean },
+  answered: boolean,
+): { wasActive: boolean; automatic: boolean; open: boolean } {
+  if (state.wasActive === state.active) return state;
+  if (state.active) return { wasActive: true, automatic: true, open: true };
+  if (!state.automatic) return { wasActive: false, automatic: false, open: state.open };
+  return answered ? { wasActive: false, automatic: false, open: false } : { wasActive: false, automatic: true, open: true };
+}
+
 /** A boundary the reader must keep seeing: a divider or a compaction row. */
 function isTrailing(group: TurnGroup): group is Extract<TurnGroup, { kind: 'divider' | 'compaction' }> {
   return group.kind === 'divider' || group.kind === 'compaction';
