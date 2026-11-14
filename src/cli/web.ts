@@ -1,5 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import { BUILD_ID } from '../build-info.js';
+import { isLoopback } from '../tailnet.js';
 import * as ui from './ui.js';
 import type { Parsed } from './args.js';
 import {
@@ -29,7 +30,6 @@ const LOCAL_ONLY_HINT = 'Local only on this computer. For phone or LAN access, r
 // Login startup starts the host service and this client independently; the
 // detached entry waits briefly for the socket instead of exiting on the race.
 const SERVE_HOST_WAIT_MS = 30_000;
-const isLoopback = (host: string): boolean => host === '127.0.0.1' || host === '::1';
 
 /**
  * Serves the browser client from this machine. The server only reads static

@@ -2,30 +2,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { isTailnetAddress, findTailnetAddress, parseJoinTarget, TEAM_DEFAULT_PORT } from '../src/team/tailnet.js';
+import { parseJoinTarget, TEAM_DEFAULT_PORT } from '../src/team/tailnet.js';
 import { fingerprintOf, hashTicket, makeInviteCode, makeTicket, validateMemberName } from '../src/team/service.js';
 
 describe('tailnet address handling', () => {
-  it('accepts only the CGNAT range Tailscale uses', () => {
-    expect(isTailnetAddress('100.64.0.1')).toBe(true);
-    expect(isTailnetAddress('100.127.255.254')).toBe(true);
-    expect(isTailnetAddress('100.63.255.255')).toBe(false);
-    expect(isTailnetAddress('100.128.0.1')).toBe(false);
-    expect(isTailnetAddress('192.168.1.5')).toBe(false);
-    expect(isTailnetAddress('10.0.0.1')).toBe(false);
-    expect(isTailnetAddress('not-an-ip')).toBe(false);
-  });
-
-  it('finds the tailnet address among interfaces and ignores internal and non-tailnet ones', () => {
-    const found = findTailnetAddress(() => ({
-      lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true } as never],
-      eth0: [{ address: '192.168.1.20', family: 'IPv4', internal: false } as never],
-      tailscale0: [{ address: '100.101.102.103', family: 'IPv4', internal: false } as never],
-    }));
-    expect(found).toBe('100.101.102.103');
-    expect(findTailnetAddress(() => ({ eth0: [{ address: '192.168.1.20', family: 'IPv4', internal: false } as never] }))).toBeNull();
-  });
-
   it('parses a bare tailnet IP, an IP with port, and a MagicDNS name', () => {
     expect(parseJoinTarget('100.64.0.1')).toEqual({ host: '100.64.0.1', port: TEAM_DEFAULT_PORT });
     expect(parseJoinTarget('100.64.0.1:1234')).toEqual({ host: '100.64.0.1', port: 1234 });

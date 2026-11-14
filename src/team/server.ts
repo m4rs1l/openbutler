@@ -1,7 +1,7 @@
 import { TEAM_PRESENCE_WINDOW_MS, TEAM_PROTOCOL_VERSION } from './contracts.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { pipeline } from 'node:stream/promises';
-import { isTailnetAddress } from './tailnet.js';
+import { isLoopback, isTailnetAddress } from '../tailnet.js';
 import { fingerprintOf, hashTicket, makeFileId, validateMemberName } from './service.js';
 import { TeamOperations, TeamError } from './operations.js';
 import { TeamStore, type JoinRequest } from './store.js';
@@ -36,10 +36,6 @@ export interface TeamServerOptions {
 export interface StartedTeamServer {
   url: string;
   close(): Promise<void>;
-}
-
-function isLoopback(address: string): boolean {
-  return address === '127.0.0.1' || address === '::1' || address.toLowerCase() === 'localhost';
 }
 
 function sendJson(response: ServerResponse, status: number, body: Record<string, unknown>): void {

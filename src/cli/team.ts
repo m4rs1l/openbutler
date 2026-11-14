@@ -6,7 +6,8 @@ import { confirmJoin, fetchHubFingerprint, fetchHubStatus, pollJoin, postJoin, p
 import { validateMemberName } from '../team/service.js';
 import type { TeamMessage } from '../team/session.js';
 import { resolve } from 'node:path';
-import { TEAM_DEFAULT_PORT, findTailnetAddress, parseJoinTarget, type JoinTarget } from '../team/tailnet.js';
+import { findTailnetAddress } from '../tailnet.js';
+import { TEAM_DEFAULT_PORT, parseJoinTarget, type JoinTarget } from '../team/tailnet.js';
 import * as ui from './ui.js';
 
 const JOIN_POLL_INTERVAL_MS = 2000;
