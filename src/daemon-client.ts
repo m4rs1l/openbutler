@@ -12,6 +12,7 @@ import type {
   QueuedMessage,
 } from './agent-session.js';
 import { getDaemonEndpoint } from './daemon.js';
+import { resolveActiveBackend } from './backend-registry.js';
 import {
   DAEMON_PROTOCOL_VERSION,
   MAX_DAEMON_FRAME_BYTES,
@@ -721,8 +722,12 @@ function snapshotFromData(data: SessionSnapshotData): AgentSessionSnapshot {
 }
 
 function connectSocket(): Promise<Socket> {
+  // A saved backend moves this connection onto TCP; without one the endpoint
+  // is unchanged, so an install that never wrote a registry behaves exactly
+  // as before. Both the first connect and every reconnect go through here.
+  const backend = resolveActiveBackend();
   return new Promise((resolveSocket, rejectSocket) => {
-    const socket = createConnection(getDaemonEndpoint());
+    const socket = backend ? createConnection({ host: backend.host, port: backend.port }) : createConnection(getDaemonEndpoint());
     const timer = setTimeout(() => finish(new Error('Timed out connecting to the OpenButler host.')), CLIENT_CONNECT_TIMEOUT_MS);
     let settled = false;
     const finish = (error?: Error) => {

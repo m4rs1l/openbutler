@@ -24,6 +24,7 @@ import { createLogger, fileSink } from './logging.js';
 import { DAEMON_PROTOCOL_VERSION, MAX_DAEMON_FRAME_BYTES, type DaemonStatus } from './daemon-protocol.js';
 import { getDataDir, getDataPath } from './paths.js';
 import { withDeadline } from './shutdown.js';
+import { isLoopback, isTailnetAddress } from './tailnet.js';
 import { machineWorkspaceRoot } from './workspace-origin.js';
 
 const DAEMON_START_TIMEOUT_MS = 20_000;
@@ -564,20 +565,57 @@ export function untrackWebProcess(pid: number): void {
  * browser client: the host and web are independent processes, and only the CLI
  * may compose them (`daemon start --web`, or two separate login entries).
  */
-export async function runDaemonProcess(): Promise<void> {
+export interface DaemonProcessOptions {
+  /**
+   * `host:port` for a second, TCP listener that lets remote clients attach
+   * over the tailnet. Validated before anything starts: a tailnet literal or
+   * loopback only — never 0.0.0.0 and never a public address.
+   */
+  listen?: string;
+}
+
+export interface DaemonListenTarget {
+  host: string;
+  port: number;
+}
+
+/**
+ * Parse `--listen`: an IPv4 literal the daemon may bind (tailnet or loopback)
+ * plus a port in 1-65535. The same rule the team hub binds by, because a
+ * remote listener without a tailnet boundary would expose every session to
+ * whatever can route to the machine.
+ */
+export function parseListenTarget(spec: string): DaemonListenTarget {
+  const trimmed = spec.trim();
+  const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(trimmed);
+  if (!match) throw new Error(`--listen needs an IPv4 address and port, e.g. 100.64.0.5:45280 (got "${spec}").`);
+  const host = match[1]!;
+  const port = Number(match[2]);
+  if (port < 1 || port > 65535) throw new Error(`Listen port ${port} is out of range 1-65535.`);
+  if (!isLoopback(host) && !isTailnetAddress(host))
+    throw new Error(
+      `${host} is not a tailnet address. The daemon binds the tailnet or loopback only; 0.0.0.0 and public addresses are refused.`,
+    );
+  return { host, port };
+}
+
+export async function runDaemonProcess(options: DaemonProcessOptions = {}): Promise<void> {
+  // Validate before the start lock: a refused --listen must fail fast and
+  // leave no lock, no endpoint, and no pid file behind.
+  const listenTarget = options.listen === undefined ? null : parseListenTarget(options.listen);
   const startLock = await acquireDaemonStartLock();
   try {
     const active = await getDaemonStatus();
     if (active?.legacy)
       throw new Error('An older OpenButler host is still running. Stop it with `openbutler daemon stop`, then start OpenButler again.');
     if (active) throw new Error(`An OpenButler host is already running (pid ${active.pid}).`);
-    await runLockedDaemonProcess(startLock.startedAt);
+    await runLockedDaemonProcess(startLock.startedAt, listenTarget);
   } finally {
     releaseDaemonStartLock(startLock);
   }
 }
 
-async function runLockedDaemonProcess(startedAt: string): Promise<void> {
+async function runLockedDaemonProcess(startedAt: string, listenTarget: DaemonListenTarget | null): Promise<void> {
   let stopping = false;
   let shutdownReason: string | null = null;
   let resolveStop!: () => void;
@@ -599,6 +637,7 @@ async function runLockedDaemonProcess(startedAt: string): Promise<void> {
     log: (message) => logger.info('host.log', { message }),
   });
   const server = createServer((socket) => host.handleConnection(socket));
+  const remoteServer = listenTarget === null ? null : createServer((socket) => host.handleConnection(socket));
   const endpoint = getDaemonEndpoint();
   const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
     if (stopping) return;
@@ -614,6 +653,15 @@ async function runLockedDaemonProcess(startedAt: string): Promise<void> {
   try {
     await listenDaemonServer(server, endpoint);
     if (process.platform !== 'win32') chmodSync(endpoint, 0o600);
+    if (remoteServer && listenTarget) {
+      try {
+        await listenTcp(remoteServer, listenTarget.host, listenTarget.port);
+      } catch (error) {
+        throw new Error(
+          `The remote listener cannot bind ${listenTarget.host}:${listenTarget.port}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     await host.start();
     await writeDaemonPidFile(startedAt);
     console.log(`OpenButler host ready (${process.pid}); ${host.getStatus().workspaceCount} workspace loaded.`);
@@ -631,6 +679,13 @@ async function runLockedDaemonProcess(startedAt: string): Promise<void> {
         message: `[shutdown] IPC server close abandoned — ${error instanceof Error ? error.message : String(error)}`,
       });
     });
+    if (remoteServer) {
+      await withDeadline(() => closeServer(remoteServer), IPC_CLOSE_TIMEOUT_MS, 'remote listener close').catch((error: unknown) => {
+        logger.info('host.log', {
+          message: `[shutdown] remote listener close abandoned — ${error instanceof Error ? error.message : String(error)}`,
+        });
+      });
+    }
     if (process.platform !== 'win32') {
       try {
         unlinkSync(endpoint);
@@ -699,6 +754,22 @@ function listen(server: Server, endpoint: string): Promise<void> {
     server.once('error', onError);
     server.once('listening', onListening);
     server.listen(endpoint);
+  });
+}
+
+function listenTcp(server: Server, host: string, port: number): Promise<void> {
+  return new Promise((resolveListen, rejectListen) => {
+    const onError = (error: Error) => {
+      server.off('listening', onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolveListen();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
   });
 }
 

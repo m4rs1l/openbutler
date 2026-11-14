@@ -7,6 +7,7 @@ import { toolEntryDetails } from './tool-display.js';
  * interactive output stays animated.
  */
 import { parseArgs, questionFrom, type Parsed } from './cli/args.js';
+import { daemonRunOptions } from './cli/daemon-args.js';
 import { BUILD_ID } from './build-info.js';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -1621,7 +1622,7 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
         '`openbutler daemon run` starts the host only. Start the browser client separately with `openbutler web`, or use `openbutler daemon start --web` to start both processes.',
       );
     }
-    await runDaemonProcess();
+    await runDaemonProcess(daemonRunOptions(parsed));
     return;
   }
   if (action === 'install') {
