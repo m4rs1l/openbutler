@@ -109,6 +109,11 @@ function usage(): void {
     ['openbutler schedule', 'List, add, run, and open scheduled wakeups.'],
     ['openbutler telegram', 'Configure and pair the owner Telegram channel.'],
     ['openbutler web', 'Serve the browser client in the background; --pair pairs a new device (--port, --hostname, --dir).'],
+    ['openbutler pair', 'Print a one-time code so a remote client can pair with this host (5 minutes).'],
+    [
+      'openbutler connect <host:port>',
+      'Pair this client with a remote backend (--code, --name); list | use <name> | remove <name> manage the saved ones.',
+    ],
     ['openbutler team <subcommand>', 'Form a closed team of openbutlers over the tailnet (init, invite, join, …).'],
     ['openbutler events', 'Inspect the durable event ledger.'],
     ['openbutler actions', 'Inspect the durable tool action ledger.'],
@@ -1837,6 +1842,22 @@ async function main(): Promise<void> {
     }
     case 'daemon': {
       await runDaemonCommand(parsed.words[0] ?? 'status', parsed.words[1], parsed);
+      return;
+    }
+    case 'pair': {
+      // Pairing is a host-local act: the code is minted by the running daemon
+      // over the local pipe, so there is nothing to do without one.
+      if (parsed.words.length > 0) throw new Error('Usage: openbutler pair');
+      await requireBackgroundHost();
+      const issued = (await requestHost('pair.create')) as { code: string; expiresAt: number };
+      ui.success(`Pairing code: ${issued.code}`);
+      ui.kv('Expires', new Date(issued.expiresAt).toLocaleTimeString());
+      ui.info(`Redeem it on the client within 5 minutes: openbutler connect <host:port> --code ${issued.code}`);
+      return;
+    }
+    case 'connect': {
+      const { runConnect } = await import('./cli/connect.js');
+      await runConnect(parsed);
       return;
     }
     case 'stop': {

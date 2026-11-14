@@ -791,6 +791,73 @@ function performAuthHandshake(socket: Socket, token: string): Promise<void> {
   });
 }
 
+/**
+ * The client half of pairing: one `pair` frame to a running backend, one
+ * verdict back, and the minted token. The socket exists for the exchange
+ * alone — the saved backend entry carries the token from then on, and this
+ * rejects outright when nothing listens instead of waiting on a session.
+ */
+export function pairWithBackend(host: string, port: number, code: string): Promise<string> {
+  return new Promise((resolvePair, rejectPair) => {
+    const socket = createConnection({ host, port });
+    const decoder = new DaemonFrameDecoder(MAX_DAEMON_FRAME_BYTES);
+    const id = randomUUID();
+    let settled = false;
+    const finish = (error?: Error, token?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('close', onClose);
+      socket.off('error', onError);
+      socket.destroy();
+      if (error) rejectPair(error);
+      else resolvePair(token as string);
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`Timed out pairing with ${host}:${port}. The host may not be listening, or the backend version differs.`)),
+      AUTH_HANDSHAKE_TIMEOUT_MS,
+    );
+    const onData = (chunk: Buffer) => {
+      let messages: Buffer[];
+      try {
+        messages = decoder.append(chunk);
+      } catch {
+        finish(new Error(`The backend at ${host}:${port} sent an oversized frame while pairing.`));
+        return;
+      }
+      for (const frame of messages) {
+        let verdict: unknown;
+        try {
+          verdict = JSON.parse(frame.toString('utf8'));
+        } catch {
+          continue;
+        }
+        if (!isRecord(verdict) || verdict.id !== id || typeof verdict.ok !== 'boolean') continue;
+        if (!verdict.ok) {
+          finish(new Error(typeof verdict.error === 'string' ? verdict.error : 'Pairing failed.'));
+          return;
+        }
+        const result = verdict.result;
+        if (!isRecord(result) || typeof result.token !== 'string' || !result.token.startsWith('obt_')) {
+          finish(new Error(`The backend at ${host}:${port} did not return a usable pairing token.`));
+          return;
+        }
+        finish(undefined, result.token);
+        return;
+      }
+    };
+    const onClose = () => finish(new Error(`The backend at ${host}:${port} closed the connection before pairing finished.`));
+    const onError = (error: Error) => finish(error);
+    socket.on('data', onData);
+    socket.once('close', onClose);
+    socket.once('error', onError);
+    socket.once('connect', () => {
+      socket.write(`${JSON.stringify({ version: DAEMON_PROTOCOL_VERSION, id, action: 'pair', code })}\n`);
+    });
+  });
+}
+
 function connectSocket(): Promise<Socket> {
   // A saved backend moves this connection onto TCP; without one the endpoint
   // is unchanged, so an install that never wrote a registry behaves exactly

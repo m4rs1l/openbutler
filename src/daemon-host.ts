@@ -1,8 +1,8 @@
 import { storeAttachment, verifyAttachmentPath, type FileAttachment } from './attachments.js';
-import { verifyAuthToken } from './auth-tokens.js';
+import { createAuthToken, verifyAuthToken } from './auth-tokens.js';
 import { daemonCommandAction } from './commands/registry.js';
 import { TEAM_CAPABILITY_MAX_AGE_MS } from './team/contracts.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { BUILD_ID } from './build-info.js';
 import { DaemonFrameDecoder } from './daemon-frames.js';
 import { mkdirSync, realpathSync, statSync } from 'node:fs';
@@ -3179,6 +3179,14 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         writeResponse(socket, request.id, true, status());
         return;
       }
+      if (request.action === 'pair.create') {
+        // The code lives in owner memory only: nothing about it is written to
+        // disk, and each issue replaces the previous code so a stale one stops
+        // working the moment a new one is printed.
+        pendingPair = { code: randomBytes(6).toString('hex'), expiresAt: Date.now() + PAIRING_CODE_TTL_MS };
+        writeResponse(socket, request.id, true, { code: pendingPair.code, expiresAt: pendingPair.expiresAt });
+        return;
+      }
       if (request.action === 'stop') {
         if (request.restart !== undefined && typeof request.restart !== 'boolean') throw new Error('restart must be a boolean.');
         const restarting = request.restart === true;
@@ -3901,6 +3909,22 @@ export function toRuntimeView(
 /** How long a remote socket may stay silent before the host drops it. */
 const REMOTE_AUTH_TIMEOUT_MS = 10_000;
 
+/** How long a freshly printed pair code stays redeemable. */
+const PAIRING_CODE_TTL_MS = 5 * 60_000;
+
+/**
+ * The one pair a remote client may redeem right now. Module scope on purpose:
+ * the daemon process holds exactly one outstanding pair, the redemption path
+ * sits outside `createDaemonHost`, and a test process re-importing this module
+ * gets a fresh slot the same way a restarted host does.
+ */
+let pendingPair: { code: string; expiresAt: number } | null = null;
+
+/** Equal-length digests, so the comparison itself never leaks which prefix matched. */
+function pairCodeDigest(code: string): Buffer {
+  return createHash('sha256').update(code, 'utf8').digest();
+}
+
 /**
  * The only frame an unauthenticated remote socket may send. Everything else —
  * including a well-formed request — is refused before it reaches the
@@ -3916,6 +3940,41 @@ async function handleRemoteAuthFrame(socket: Socket, source: string): Promise<bo
     request = null;
   }
   const id = isRecord(request) && typeof request.id === 'string' ? request.id : '';
+  // Pairing is the other first frame a remote socket may offer: the code the
+  // owner printed is exchanged here for a real token. Every other frame, and
+  // every malformed pair, keeps the refusal below.
+  if (
+    isRecord(request) &&
+    request.version === DAEMON_PROTOCOL_VERSION &&
+    id !== '' &&
+    request.action === 'pair' &&
+    typeof request.code === 'string'
+  ) {
+    const submitted = request.code;
+    const issued = pendingPair;
+    const valid =
+      issued !== null && Date.now() <= issued.expiresAt && timingSafeEqual(pairCodeDigest(submitted), pairCodeDigest(issued.code));
+    // A wrong guess only fails that connection: the real code stays live for
+    // the client the owner is about to hand it to.
+    if (!valid) {
+      writeResponse(socket, id, false, undefined, 'Pairing failed: that code is wrong, expired, or already used.');
+      socket.end();
+      return false;
+    }
+    let minted: { id: string; token: string };
+    try {
+      minted = createAuthToken();
+    } catch (error) {
+      writeResponse(socket, id, false, undefined, error instanceof Error ? error.message : 'Pairing could not store a token on this host.');
+      socket.end();
+      return false;
+    }
+    // Consumed exactly once, and only on success: a failed redemption never
+    // burns the code.
+    pendingPair = null;
+    writeResponse(socket, id, true, { token: minted.token });
+    return true;
+  }
   if (
     !isRecord(request) ||
     request.version !== DAEMON_PROTOCOL_VERSION ||
