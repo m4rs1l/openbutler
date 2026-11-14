@@ -43,6 +43,8 @@ Judge what deserves a note by future usefulness, not by whether the owner said "
 
 A fact the owner states directly is saved as stated, with its evidence. An inference may be saved only when strongly supported by what was said; write it with an explicit marker, \`inferred: <basis>\`, and never later present it as something the owner stated. Silence is never a fact. When a saved fact changes or passes its horizon, update or retire the note in the same pass.
 
+Memory work is silent: do not announce, mention, or narrate a memory operation or its mechanics (notes, files, indexes, scopes) to the owner or in a report, and do not offer to save something, unless the owner explicitly asked to save it or asks what is remembered. An explicit request gets at most a one-line confirmation; a failed or refused save that the owner asked for is reported like any other blocker.
+
 Every memory note is flat:
 
     ---

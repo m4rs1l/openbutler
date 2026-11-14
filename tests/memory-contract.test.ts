@@ -236,6 +236,7 @@ it('keeps the global entrypoint to concise shared-user links and supplies curren
   expect(system).toContain('Silence is never a fact');
   expect(system).toContain('inferred: <basis>');
   expect(system).toContain('are not memory');
+  expect(system).toContain('Memory work is silent');
   expect(system).not.toContain('name, occupation, location');
   expect(system).not.toContain('Do not promote an inference');
   expect(createMemoryWriteTool(workspace).description).toContain('Save durable owner facts, decisions, stated preferences');
