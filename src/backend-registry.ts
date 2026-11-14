@@ -8,12 +8,14 @@ import { isLoopback, isTailnetAddress } from './tailnet.js';
  * install that never writes this file behaves exactly as before. An active
  * entry moves the connection onto TCP; a literal address obeys the same
  * tailnet rule the daemon binds by, while a name passes because only
- * Tailscale's MagicDNS resolves inside the tailnet. Token fields arrive with
- * pairing in a later phase.
+ * Tailscale's MagicDNS resolves inside the tailnet. `token` is the
+ * credential the host's remote listener demands as its first frame; it is
+ * absent on a local entry, and the handshake runs only when it is present.
  */
 export interface BackendEntry {
   host: string;
   port: number;
+  token?: string;
 }
 
 export interface BackendRegistry {
@@ -62,7 +64,10 @@ export function readBackendRegistry(): BackendRegistry {
       throw new Error(`Backend "${name}" in ${path} needs a port 1-65535.`);
     if (/^[0-9.]+$/.test(host) && !isTailnetAddress(host) && !isLoopback(host))
       throw new Error(`Backend "${name}" in ${path} points at ${host}, which is outside the tailnet range 100.64.0.0/10.`);
-    backends[name] = { host, port };
+    const token = entry.token;
+    if (token !== undefined && (typeof token !== 'string' || token.length === 0 || token.length > 512))
+      throw new Error(`Backend "${name}" in ${path} needs a token string of 1-512 characters.`);
+    backends[name] = token === undefined ? { host, port } : { host, port, token };
   }
   return { active, backends };
 }

@@ -99,7 +99,7 @@ function usage(): void {
     ],
     [
       'openbutler daemon',
-      'Start, inspect, stop, or toggle automatic startup of the background host; install --web also registers the separate browser client at login.',
+      'Start, inspect, stop, or toggle automatic startup of the background host; token mints credentials for remote clients; install --web also registers the separate browser client at login.',
     ],
     ['openbutler usage', 'Show recorded token use and cost: --days, --session, --model, --json.'],
     ['openbutler logs', 'Read the machine log: --lines, --level, --event, --json.'],
@@ -1671,6 +1671,37 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     if (isAutostartInstalled()) reportAutostartWeb();
     return;
   }
+  if (action === 'token') {
+    // Remote clients authenticate with a token this command mints; the host
+    // stores only its salted hash and never prints it again.
+    const tokens = await import('./auth-tokens.js');
+    const mode = sub ?? 'list';
+    if (mode === 'create') {
+      const created = tokens.createAuthToken();
+      ui.success('Remote auth token created. The host keeps only a salted hash.');
+      ui.kv('Token id', created.id);
+      ui.kv('Token', created.token);
+      ui.info('Carry this token to the client now; it is not shown again.');
+      return;
+    }
+    if (mode === 'list') {
+      const listed = tokens.listAuthTokens();
+      if (!listed.length) {
+        ui.info('No remote auth tokens. Create one with `openbutler daemon token create`.');
+        return;
+      }
+      for (const entry of listed) ui.kv(entry.id, entry.createdAt);
+      return;
+    }
+    if (mode === 'revoke') {
+      const id = parsed?.words[2];
+      if (!id) throw new Error('Usage: openbutler daemon token revoke <id>');
+      if (!tokens.revokeAuthToken(id)) throw new Error(`No token with id ${id}. List them with \`openbutler daemon token list\`.`);
+      ui.success(`Token ${id} revoked.`);
+      return;
+    }
+    throw new Error('Usage: openbutler daemon token [create|list|revoke <id>]');
+  }
   if (action === 'start') {
     if (!(await defaultModelReady())) throw new Error('Configure a default model first: openbutler setup');
     let status = await startDaemon();
@@ -1725,7 +1756,7 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     return;
   }
   throw new Error(
-    'Usage: openbutler daemon [start [--web [--port N] [--hostname H] [--dir PATH]]|restart|status|stop|install [--web [--no-web]]|uninstall|autostart [on|off|status]|autostart-status]',
+    'Usage: openbutler daemon [start [--web [--port N] [--hostname H] [--dir PATH]]|restart|status|stop|install [--web [--no-web]]|uninstall|autostart [on|off|status]|autostart-status|token [create|list|revoke <id>]]',
   );
 }
 

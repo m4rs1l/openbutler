@@ -56,9 +56,9 @@ async function makeHost(): Promise<DaemonHost> {
   return host;
 }
 
-/** A TCP listener speaking the daemon protocol, as a `--listen` backend would. Returns its port. */
+/** A TCP listener speaking the daemon protocol, as a `--listen` backend binds it: remote and gated. */
 async function listenTcpFor(host: DaemonHost): Promise<number> {
-  const server = createServer((socket) => host.handleConnection(socket));
+  const server = createServer((socket) => host.handleConnection(socket, { remote: true }));
   servers.push(server);
   await new Promise<void>((res, rej) => {
     server.once('error', rej);
@@ -171,10 +171,12 @@ describe('backend registry', () => {
 
 describe('transport selection', () => {
   it('attaches to the active backend over TCP instead of the local pipe', async () => {
+    const { createAuthToken } = await import('../src/auth-tokens.js');
+    const { token } = createAuthToken();
     const host = await makeHost();
     const port = await listenTcpFor(host);
     await host.start();
-    writeRegistry({ active: 'test', backends: { test: { host: '127.0.0.1', port } } });
+    writeRegistry({ active: 'test', backends: { test: { host: '127.0.0.1', port, token } } });
     const client = await attachClient();
     expect(client.getSnapshot().session.id).toBeTruthy();
   });
@@ -309,7 +311,9 @@ describe('remote listener wiring', () => {
         });
         probe.once('error', rej);
       });
-      writeRegistry({ active: 'e2e', backends: { e2e: { host: '127.0.0.1', port } } });
+      const { createAuthToken } = await import('../src/auth-tokens.js');
+      const { token } = createAuthToken();
+      writeRegistry({ active: 'e2e', backends: { e2e: { host: '127.0.0.1', port, token } } });
       const client = await attachClient();
       expect(client.getSnapshot().session.id).toBeTruthy();
       await client.close();

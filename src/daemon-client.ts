@@ -29,6 +29,8 @@ import type { ApprovalMode } from './settings.js';
 import { LOCAL_CLIENT_KINDS, type LocalClientKind } from './communication.js';
 
 const CLIENT_CONNECT_TIMEOUT_MS = 10_000;
+/** A remote backend expects `auth` as the first frame; this bounds the wait for its verdict. */
+const AUTH_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -721,6 +723,74 @@ function snapshotFromData(data: SessionSnapshotData): AgentSessionSnapshot {
   };
 }
 
+/**
+ * The host's first-frame handshake on a remote socket: one `auth` frame out,
+ * one verdict back, nothing else touched. A frame that is not the verdict is
+ * pushed back into the stream so the session client binding next loses
+ * nothing; the host sends nothing before the first request, so that path is a
+ * safety net rather than an expected one.
+ */
+function performAuthHandshake(socket: Socket, token: string): Promise<void> {
+  return new Promise((resolveHandshake, rejectHandshake) => {
+    const decoder = new DaemonFrameDecoder(MAX_DAEMON_FRAME_BYTES);
+    const id = randomUUID();
+    const forwarded: Buffer[] = [];
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('close', onClose);
+      socket.off('error', onError);
+      if (error) {
+        socket.destroy();
+        rejectHandshake(error);
+        return;
+      }
+      if (forwarded.length) socket.unshift(Buffer.concat(forwarded));
+      resolveHandshake();
+    };
+    const timer = setTimeout(() => finish(new Error('Timed out authenticating to the OpenButler host.')), AUTH_HANDSHAKE_TIMEOUT_MS);
+    const onData = (chunk: Buffer) => {
+      let messages: Buffer[];
+      try {
+        messages = decoder.append(chunk);
+      } catch {
+        finish(new Error('The host sent an oversized frame during authentication.'));
+        return;
+      }
+      for (let index = 0; index < messages.length; index++) {
+        const frame = messages[index]!;
+        let message: unknown;
+        try {
+          message = JSON.parse(frame.toString('utf8'));
+        } catch {
+          forwarded.push(frame, Buffer.from('\n'));
+          continue;
+        }
+        if (!isRecord(message) || message.id !== id || typeof message.ok !== 'boolean') {
+          forwarded.push(frame, Buffer.from('\n'));
+          continue;
+        }
+        if (!message.ok) {
+          finish(new Error(typeof message.error === 'string' ? message.error : 'Authentication failed.'));
+          return;
+        }
+        for (const rest of messages.slice(index + 1)) forwarded.push(rest, Buffer.from('\n'));
+        finish();
+        return;
+      }
+    };
+    const onClose = () => finish(new Error('The host closed the connection during authentication.'));
+    const onError = (error: Error) => finish(error);
+    socket.on('data', onData);
+    socket.once('close', onClose);
+    socket.once('error', onError);
+    socket.write(`${JSON.stringify({ version: DAEMON_PROTOCOL_VERSION, id, action: 'auth', token })}\n`);
+  });
+}
+
 function connectSocket(): Promise<Socket> {
   // A saved backend moves this connection onto TCP; without one the endpoint
   // is unchanged, so an install that never wrote a registry behaves exactly
@@ -741,7 +811,18 @@ function connectSocket(): Promise<Socket> {
         rejectSocket(error);
       } else resolveSocket(socket);
     };
-    const onConnect = () => finish();
+    const onConnect = () => {
+      // Only a backend entry with a token speaks the handshake; the local
+      // pipe authenticates through the OS and sends its first frame as ever.
+      if (backend?.token) {
+        performAuthHandshake(socket, backend.token).then(
+          () => finish(),
+          (error: Error) => finish(error),
+        );
+        return;
+      }
+      finish();
+    };
     const onError = (error: Error) => finish(error);
     socket.once('connect', onConnect);
     socket.once('error', onError);

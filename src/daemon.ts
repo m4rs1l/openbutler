@@ -637,7 +637,8 @@ async function runLockedDaemonProcess(startedAt: string, listenTarget: DaemonLis
     log: (message) => logger.info('host.log', { message }),
   });
   const server = createServer((socket) => host.handleConnection(socket));
-  const remoteServer = listenTarget === null ? null : createServer((socket) => host.handleConnection(socket));
+  // Every socket on this listener is remote, so the host gates it on auth.
+  const remoteServer = listenTarget === null ? null : createServer((socket) => host.handleConnection(socket, { remote: true }));
   const endpoint = getDaemonEndpoint();
   const onSignal = (signal: 'SIGINT' | 'SIGTERM') => {
     if (stopping) return;

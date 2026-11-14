@@ -1,4 +1,5 @@
 import { storeAttachment, verifyAttachmentPath, type FileAttachment } from './attachments.js';
+import { verifyAuthToken } from './auth-tokens.js';
 import { daemonCommandAction } from './commands/registry.js';
 import { TEAM_CAPABILITY_MAX_AGE_MS } from './team/contracts.js';
 import { randomUUID } from 'node:crypto';
@@ -212,7 +213,15 @@ interface DaemonHostOptions {
 
 export interface DaemonHost {
   start(): Promise<void>;
-  handleConnection(socket: Socket): void;
+  /**
+   * Takes one connection. `remote` marks a socket that arrived over the
+   * `--listen` TCP listener: it must authenticate as its first frame before
+   * any request reaches the dispatcher. The local pipe omits the option and
+   * stays ungated, because the OS already owns its access. `authTimeoutMs`
+   * overrides the deadline a remote socket has to authenticate; production
+   * callers leave it unset.
+   */
+  handleConnection(socket: Socket, options?: { remote?: boolean; authTimeoutMs?: number | undefined }): void;
   getStatus(): DaemonStatus;
   /** Entry point for the Telegram channel; exposed so tests and future adapters inject messages exactly like the adapter does. */
   receiveTelegramMessage(
@@ -229,6 +238,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
   const workspaceLoads = new Map<string, Promise<WorkspaceHost>>();
   const chatLoads = new Map<string, Promise<WorkspaceHost>>();
   const sockets = new Set<Socket>();
+  /** Sockets cleared to receive host events: local from accept, remote only after `auth`. */
+  const authenticatedSockets = new Set<Socket>();
   const attachments = new Map<Socket, ClientAttachment>();
   const custodianRoot = getDataPath('custodian');
   mkdirSync(custodianRoot, { recursive: true });
@@ -1068,13 +1079,32 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
       }, WORKSPACE_SWEEP_INTERVAL_MS);
       workspaceSweepTimer.unref?.();
     },
-    handleConnection(socket) {
+    handleConnection(socket, options) {
       if (closing) {
         socket.destroy();
         return;
       }
       sockets.add(socket);
       socket.setNoDelay(true);
+      const remote = options?.remote === true;
+      let authenticated = !remote;
+      let authTimer: ReturnType<typeof setTimeout> | null = null;
+      if (remote) {
+        // Fail closed: a remote socket that says nothing is destroyed, so an
+        // open port never holds an unauthenticated connection alive.
+        authTimer = setTimeout(() => socket.destroy(), options?.authTimeoutMs ?? REMOTE_AUTH_TIMEOUT_MS);
+        authTimer.unref?.();
+      } else {
+        authenticatedSockets.add(socket);
+      }
+      const admit = () => {
+        authenticated = true;
+        authenticatedSockets.add(socket);
+        if (authTimer) {
+          clearTimeout(authTimer);
+          authTimer = null;
+        }
+      };
       const frames = new DaemonFrameDecoder(MAX_DAEMON_FRAME_BYTES);
       // Frames from one socket are handled in order, even if a chunk holds multiple requests.
       let dispatchQueue = Promise.resolve();
@@ -1089,11 +1119,23 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           return;
         }
         for (const frame of messages) {
-          dispatchQueue = dispatchQueue.then(() => dispatchFrame(socket, frame.toString('utf8'))).catch(() => undefined);
+          dispatchQueue = dispatchQueue
+            .then(() => {
+              if (authenticated) return dispatchFrame(socket, frame.toString('utf8'));
+              return handleRemoteAuthFrame(socket, frame.toString('utf8')).then((admitted) => {
+                if (admitted) admit();
+              });
+            })
+            .catch(() => undefined);
         }
       });
       socket.on('close', () => {
+        if (authTimer) {
+          clearTimeout(authTimer);
+          authTimer = null;
+        }
         sockets.delete(socket);
+        authenticatedSockets.delete(socket);
         const attachment = attachments.get(socket);
         attachments.delete(socket);
         if (attachment) detachClient(attachment, socket);
@@ -3148,6 +3190,8 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         options.log(`OpenButler host ${restarting ? 'restart' : 'stop'} requested over IPC.`);
         for (const client of sockets) {
           if (client === socket) continue;
+          // An unauthenticated remote socket hears nothing: it is not a participant yet.
+          if (!authenticatedSockets.has(client)) continue;
           writeEvent(client, {
             version: DAEMON_PROTOCOL_VERSION,
             event: 'notification',
@@ -3852,6 +3896,56 @@ export function toRuntimeView(
     reasoningTitles: (session?.reasoningTitles ?? runtime.reasoningTitles) === true,
     approvalMode: runtime.approvalMode ?? 'workspace',
   };
+}
+
+/** How long a remote socket may stay silent before the host drops it. */
+const REMOTE_AUTH_TIMEOUT_MS = 10_000;
+
+/**
+ * The only frame an unauthenticated remote socket may send. Everything else —
+ * including a well-formed request — is refused before it reaches the
+ * dispatcher, and a refused connection is closed. A token the store does not
+ * accept gets the same close: the port stays open, the session never starts.
+ * Returns whether the socket is now admitted.
+ */
+async function handleRemoteAuthFrame(socket: Socket, source: string): Promise<boolean> {
+  let request: unknown;
+  try {
+    request = JSON.parse(source);
+  } catch {
+    request = null;
+  }
+  const id = isRecord(request) && typeof request.id === 'string' ? request.id : '';
+  if (
+    !isRecord(request) ||
+    request.version !== DAEMON_PROTOCOL_VERSION ||
+    id === '' ||
+    request.action !== 'auth' ||
+    typeof request.token !== 'string'
+  ) {
+    writeResponse(
+      socket,
+      id,
+      false,
+      undefined,
+      'This connection is remote and must authenticate first: send { version, id, action: "auth", token } as the first frame.',
+    );
+    socket.end();
+    return false;
+  }
+  let admitted = false;
+  try {
+    admitted = verifyAuthToken(request.token);
+  } catch {
+    admitted = false;
+  }
+  if (!admitted) {
+    writeResponse(socket, id, false, undefined, 'Authentication failed: this host does not accept that token.');
+    socket.end();
+    return false;
+  }
+  writeResponse(socket, id, true, { authenticated: true });
+  return true;
 }
 
 function writeEvent(socket: Socket, event: DaemonEvent): void {
