@@ -16,13 +16,16 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
-// The web server opens the chat the owner left off in, like the terminal, so the daemon client
-// is asked which chat that is before it connects.
+// The web server opens the chat the owner left off in, like the terminal: it asks the daemon
+// client to resume, and the real client resolves which chat over the wire during connect.
 vi.mock('../../src/daemon-client.js', () => ({
   connectDaemonSession: vi.fn(),
-  resumeChatAttach: vi.fn(() => ({ clientKind: 'web', chatSessionId: 'session-a' })),
+  resumeChatAttach: vi.fn(() => ({ clientKind: 'web', resume: true })),
 }));
-const settingsMocks = vi.hoisted(() => ({ saveSettings: vi.fn(), overrides: {} as Partial<import('../../src/settings.js').SettingsStore> }));
+const settingsMocks = vi.hoisted(() => ({
+  saveSettings: vi.fn(),
+  overrides: {} as Partial<import('../../src/settings.js').SettingsStore>,
+}));
 vi.mock('../../src/settings.js', () => ({
   getSettingsPath: () => join(process.env.OPENBUTLER_DATA_DIR!, 'settings.yaml'),
   getConfigPath: () => join(process.env.OPENBUTLER_DATA_DIR!, 'config.yaml'),
@@ -471,7 +474,7 @@ describe('browser session controls', () => {
   it('declares web identity on the connection and ignores identity in the HTTP message body', async () => {
     expect(connectDaemonSession).toHaveBeenCalledWith('C:/workspace', {
       clientKind: 'web',
-      chatSessionId: 'session-a',
+      resume: true,
       entriesWindow: WEB_ENTRIES_WINDOW,
     });
     const response = await post('/api/message', {

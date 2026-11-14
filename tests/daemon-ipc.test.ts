@@ -622,15 +622,13 @@ describe('shared host and session IPC', () => {
       releaseFlush = resolve;
     });
     const originalFlush = AgentSessionController.prototype.flushSave;
-    const flushSave = vi
-      .spyOn(AgentSessionController.prototype, 'flushSave')
-      .mockImplementation(async function (
-        this: InstanceType<typeof AgentSessionController>,
-        options: Parameters<typeof originalFlush>[0],
-      ) {
-        if (this.getSnapshot().session.id === chatId) await flushGate;
-        return originalFlush.apply(this, [options]);
-      });
+    const flushSave = vi.spyOn(AgentSessionController.prototype, 'flushSave').mockImplementation(async function (
+      this: InstanceType<typeof AgentSessionController>,
+      options: Parameters<typeof originalFlush>[0],
+    ) {
+      if (this.getSnapshot().session.id === chatId) await flushGate;
+      return originalFlush.apply(this, [options]);
+    });
     const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 30 * 60_000 + 1_000);
     let reopening: ReturnType<typeof openChat> | null = null;
     try {
@@ -1161,9 +1159,10 @@ describe('shared host and session IPC', () => {
     attached.close();
     await requestHost('stop', { restart: true });
     await replaceFixtureHost();
-    // A surface starts by resuming the chat the owner left off in.
+    // A surface starts by resuming the chat the owner left off in. The direction
+    // travels as an instruction; the host's list decides the chat over the wire.
     const { resumeChatAttach } = await import('../src/daemon-client.js');
-    expect(resumeChatAttach('terminal')).toEqual({ clientKind: 'terminal', chatSessionId: id });
+    expect(resumeChatAttach('terminal')).toEqual({ clientKind: 'terminal', resume: true });
     const restored = await openChat(id);
     expect(restored.getSnapshot().session.id).toBe(id);
     expect(restored.getSnapshot().session.entries).toContainEqual(

@@ -57,19 +57,74 @@ export type AttachOptions = {
    * returns everything, which the client then windows itself.
    */
   entriesWindow?: number;
+  /**
+   * Open the chat the owner left off in, decided by the HOST's own list: the
+   * client asks `session.list` over the opened connection first and attaches to
+   * what the host answers, so a remote backend resumes its own chats while a
+   * local pipe behaves exactly as before. Resolved inside `connectDaemonSession`
+   * and never sent on the wire.
+   */
+  resume?: boolean;
 };
 
 /**
  * What a surface opens when it starts: the chat the owner left off in, or a
- * new one when this workspace has no chat yet. The custodian is the host's own
+ * new one when this machine has no chat yet. The custodian is the host's own
  * conversation, reached through the channels that drive it, so no surface
  * attaches to it.
+ *
+ * The answer comes from the host over the connection (see `resume`), never
+ * from this machine's disk: the chats live wherever the backend runs.
  */
 export function resumeChatAttach(clientKind: LocalClientKind): AttachOptions {
-  // Chats belong to the machine, not to one folder: every surface resumes the same list,
-  // and a chat's own project decides where it runs. The custodian is never in this list.
-  const resumed = listSavedSessions(null)[0];
-  return resumed ? { clientKind, chatSessionId: resumed.id } : { clientKind, newChatSession: true };
+  return { clientKind, resume: true };
+}
+
+export interface ResumeResolution {
+  /** The attach instruction to send, with the resume direction already resolved. */
+  attach: AttachOptions;
+  /** Set only when the host could not answer pre-attach; carried into the transcript. */
+  notice?: string;
+}
+
+/**
+ * Refusals that mean one thing: this host predates the pre-attach chat list and
+ * will only answer `session.list` after an attach. Both strings are produced by
+ * the host's own gate for this frame and a current host never emits them for it,
+ * so the fallback cannot swallow a genuine failure - any other error propagates.
+ */
+function hostCannotListBeforeAttach(message: string): boolean {
+  return message === 'This IPC client is not attached to that workspace.' || message.startsWith('workspaceKey must be a non-empty string');
+}
+
+/**
+ * Decides which chat a resumed surface opens. The host's list is the source of
+ * truth; an older host refusing the pre-attach list falls back to exactly the
+ * read this client did before the list existed, reported to the reader rather
+ * than silently.
+ */
+export async function resolveResumeAttach(options: {
+  clientKind: LocalClientKind;
+  askHost: () => Promise<SessionSummary[]>;
+  localList: () => SessionSummary[];
+}): Promise<ResumeResolution> {
+  let sessions: SessionSummary[];
+  let notice: string | undefined;
+  try {
+    sessions = await options.askHost();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!hostCannotListBeforeAttach(message)) throw error;
+    sessions = options.localList();
+    notice =
+      "This host is an older OpenButler without a pre-attach chat list, so the opening chat came from this computer's saved list instead.";
+  }
+  const resumed = sessions[0];
+  const attach: AttachOptions =
+    resumed === undefined
+      ? { clientKind: options.clientKind, newChatSession: true }
+      : { clientKind: options.clientKind, chatSessionId: resumed.id };
+  return notice === undefined ? { attach } : { attach, notice };
 }
 
 export interface DaemonSessionConnection extends AgentSessionClient {
@@ -79,10 +134,26 @@ export interface DaemonSessionConnection extends AgentSessionClient {
 
 export async function connectDaemonSession(workspacePath: string, options: AttachOptions): Promise<DaemonSessionConnection> {
   const workspaceRoot = canonicalScopeRoot(workspacePath);
+  const { resume, ...attachOptions } = options;
+  // Resume delegates the choice to the host's list; naming a chat too would
+  // make one of the two silently win, so the mixture is a mistake, not a mode.
+  if (resume === true && (attachOptions.chatSessionId !== undefined || attachOptions.newChatSession === true))
+    throw new Error('A resume attach must not also name a chat.');
   const socket = await connectSocket();
-  const client = new DaemonSessionClient(socket, workspaceRoot, options);
+  const client = new DaemonSessionClient(socket, workspaceRoot, attachOptions);
   try {
-    await client.attach(options);
+    const resolution: ResumeResolution =
+      resume === true
+        ? await resolveResumeAttach({
+            clientKind: attachOptions.clientKind ?? 'terminal',
+            // The list runs on this connection, exactly like every later request,
+            // so a remote backend answers from its own store.
+            askHost: () => client.listSessions(),
+            localList: () => listSavedSessions(null),
+          })
+        : { attach: attachOptions };
+    await client.attach(resolution.attach);
+    if (resolution.notice !== undefined) client.reportLocalNotice(resolution.notice, 'info');
     return client;
   } catch (error) {
     client.close();
@@ -587,6 +658,15 @@ class DaemonSessionClient implements DaemonSessionConnection {
       ...data,
       ...(data.approvalMode === 'ask' ? { approvalMode: 'workspace' } : {}),
     });
+  }
+
+  /**
+   * Surfaces a client-side note in the transcript after an attach - used for
+   * disclosures the host itself cannot make, such as resuming with an older
+   * build. The reader sees why this chat opened, not just which one did.
+   */
+  reportLocalNotice(text: string, tone: NoticeTone = 'info'): void {
+    this.addLocalNotice(text, tone);
   }
 
   private addLocalNotice(error: unknown, tone: NoticeTone = 'error'): void {

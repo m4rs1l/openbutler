@@ -3292,6 +3292,22 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
         writeResponse(socket, request.id, true, { queued });
         return;
       }
+      // A chat list does not need an attachment: a client asks what this machine
+      // holds first and attaches to the chat it picks, exactly like a browser's
+      // list-then-open - and attaching already requires naming the chat, so the
+      // list has to be answerable before one exists. Chat controllers list with
+      // the same `listSavedSessions(null)` scope here, which keeps the pre-attach
+      // answer and the switched attached answer identical. An attached socket
+      // keeps the switch case below, so nothing already running changes shape.
+      if (request.action === 'session.list' && attachments.get(socket) === undefined) {
+        writeResponse(
+          socket,
+          request.id,
+          true,
+          listSavedSessions(null).map((session) => ({ ...session, running: findLiveSessionById(session.id)?.controller.isBusy ?? false })),
+        );
+        return;
+      }
       if (request.action === 'attach') {
         if (request.clientKind !== undefined && !LOCAL_CLIENT_KINDS.some((kind) => kind === request.clientKind))
           throw new Error('clientKind must be terminal or web.');

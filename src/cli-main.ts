@@ -108,7 +108,10 @@ function usage(): void {
     ['openbutler mcp', 'Manage global MCP servers.'],
     ['openbutler schedule', 'List, add, run, and open scheduled wakeups.'],
     ['openbutler telegram', 'Configure and pair the owner Telegram channel.'],
-    ['openbutler web', 'Serve the browser client in the background; --pair pairs a new device (--port, --hostname, --dir).'],
+    [
+      'openbutler web',
+      'Serve the browser client in the background; --pair pairs a new device (--port, --hostname, --dir, --backend <name>).',
+    ],
     ['openbutler pair', 'Print a one-time code so a remote client can pair with this host (5 minutes).'],
     [
       'openbutler connect <host:port>',

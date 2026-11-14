@@ -13,6 +13,7 @@ import {
   webProcessStatus,
 } from '../daemon.js';
 import { resolveServerScope } from '../workspace-origin.js';
+import { resolveActiveBackend, setActiveBackend } from '../backend-registry.js';
 import { browserWebAddress, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, startWebServer, type WebServer } from '../web/server.js';
 
 export function readPort(parsed: Parsed): number {
@@ -23,6 +24,29 @@ export function readPort(parsed: Parsed): number {
     throw new Error(`Invalid --port value "${raw}". Use a number between 1 and 65535.`);
   }
   return port;
+}
+
+/**
+ * `--backend <name>` switches the saved backend this client dials before
+ * anything starts - the same persistent selection `openbutler connect use`
+ * makes, so the detached web child inherits it. Returns the endpoint for the
+ * screen; the token is never part of the label. A bare `--backend` is a typo
+ * that would otherwise silently do nothing, so it says what it needs.
+ */
+export function selectBackendFromFlag(parsed: Parsed): string | null {
+  const named = parsed.flags.get('backend');
+  if (named === undefined) {
+    if (parsed.booleans.has('backend'))
+      throw new Error('--backend needs a saved name, e.g. --backend zeus. `openbutler connect list` shows the saved ones.');
+    return null;
+  }
+  setActiveBackend(named);
+  const entry = resolveActiveBackend();
+  if (entry === null)
+    // setActiveBackend just activated this name, so only a racing writer could
+    // empty the registry between the two reads.
+    throw new Error(`Backend ${named} vanished while it was being selected.`);
+  return `${named.trim()} (${entry.host}:${entry.port})`;
 }
 
 const PAIR_HINT = 'Pair another device with `openbutler web --pair`; paired browsers reconnect on their own.';
@@ -45,6 +69,7 @@ const SERVE_HOST_WAIT_MS = 30_000;
  */
 export async function runWebCommand(parsed: Parsed): Promise<void> {
   const port = readPort(parsed);
+  const backend = selectBackendFromFlag(parsed);
   const host = parsed.flags.get('hostname') ?? DEFAULT_WEB_HOST;
   const scope = resolveServerScope({ explicitDir: parsed.flags.get('dir') });
   const workspaceRoot = scope.root;
@@ -55,12 +80,14 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
     const running = webProcessStatus();
     if (running) {
       ui.success(`Web server already running (pid ${running.pid}) at ${browserWebAddress(running.host, running.port)}.`);
+      if (backend !== null) ui.warn(`--backend selected ${backend} for the next start; the running server keeps its current connection.`);
       if (isLoopback(running.host)) ui.info(LOCAL_ONLY_HINT);
       ui.info(PAIR_HINT);
       return;
     }
     ui.section('OpenButler web');
     ui.kv('Workspace', `${workspaceRoot} (from ${scope.source})`);
+    ui.kv('Backend', backend ?? 'local (this machine)');
     try {
       // The browser server attaches to a running host; only daemon verbs start one.
       // Verifying here keeps the friendly message and the vintage warning on this
@@ -93,6 +120,7 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
 
   ui.section('OpenButler web');
   ui.kv('Workspace', `${workspaceRoot} (from ${scope.source})`);
+  ui.kv('Backend', backend ?? 'local (this machine)');
   if (host !== DEFAULT_WEB_HOST) {
     ui.warn('This server is reachable from the network. Keep the pairing link private.');
   }
