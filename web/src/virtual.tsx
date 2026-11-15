@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { bindReaderGestures, createScrollFollower, type ScrollFollower } from './scroll-follow.js';
+import { updateScrollFade } from './components/scroll-area.js';
 import { shouldLoadOlderFitted } from './load-older.js';
 import { buildLayoutWindow } from './layout.js';
 
@@ -88,6 +89,7 @@ export function VirtualList<T>({
     if (!element) return;
     const created = createScrollFollower(element);
     follower.current = created;
+    updateScrollFade(element);
     const unbind = bindReaderGestures(element, created);
     return () => {
       unbind();
@@ -159,7 +161,10 @@ export function VirtualList<T>({
   useLayoutEffect(() => {
     const element = scroller.current;
     if (!element) return;
-    const observer = new ResizeObserver(() => setViewport(element.clientHeight));
+    const observer = new ResizeObserver(() => {
+      setViewport(element.clientHeight);
+      updateScrollFade(element);
+    });
     observer.observe(element);
     setViewport(element.clientHeight);
     return () => observer.disconnect();
@@ -236,6 +241,7 @@ export function VirtualList<T>({
       }
     }
     layout.current = { keys, offsets, footer };
+    updateScrollFade(element);
     anchor.current = null;
   }, [total, viewport, firstKey, items.length, followRequest, revision, footer]);
 
@@ -253,12 +259,20 @@ export function VirtualList<T>({
     // Reader gestures release the follow; returning to the bottom resumes it.
     // Layout-driven scroll events must not cancel automatic tracking.
     follower.current?.track();
+    updateScrollFade(element);
     anchor.current = null;
     if (element.scrollTop < 240 && hasOlder && onLoadOlder && !loadingOlder) onLoadOlder();
   };
 
   return (
-    <div className="scroller" data-scroll-viewport tabIndex={0} aria-label="Conversation" ref={scroller} onScroll={handleScroll}>
+    <div
+      className="scroller scroll-fade"
+      data-scroll-viewport
+      tabIndex={0}
+      aria-label="Conversation"
+      ref={scroller}
+      onScroll={handleScroll}
+    >
       {header}
       <div className="rows" style={{ height: total }}>
         {items.slice(start, end).map((item, offset) => {

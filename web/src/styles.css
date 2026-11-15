@@ -455,10 +455,14 @@ select:focus-visible,
 .turn {
   padding: 14px 0 16px;
 }
+/* The wrapper stays transparent and sizes to content so the copy row can sit
+   outside the bubble; the surface itself lives on `.ask-bubble`. */
 .ask {
   width: fit-content;
   max-width: 86%;
   margin: 0 0 16px auto;
+}
+.ask-bubble {
   padding: 9px 15px;
   background: #e8f3ff;
   border-radius: 18px;
@@ -585,9 +589,14 @@ select:focus-visible,
   inherits: false;
   initial-value: 0px;
 }
+/* The scroll surface: gesture/follow anchor and the rounded clip. */
 .scroll-area {
   overflow-anchor: none;
   border-radius: 14px;
+}
+/* The soft edge shadow: an edge fades while content continues beyond it and
+   clears the moment the viewport rests at that edge (steps, transcript). */
+.scroll-fade {
   mask-image: linear-gradient(
     to bottom,
     transparent,
@@ -599,10 +608,10 @@ select:focus-visible,
     --scroll-fade-top 160ms ease,
     --scroll-fade-bottom 160ms ease;
 }
-.scroll-area[data-fade-top='true'] {
+.scroll-fade[data-fade-top='true'] {
   --scroll-fade-top: 12px;
 }
-.scroll-area[data-fade-bottom='true'] {
+.scroll-fade[data-fade-bottom='true'] {
   --scroll-fade-bottom: 12px;
 }
 .scroll-area-content {
@@ -785,7 +794,7 @@ button.tool-output-command.expandable {
 .action-dock {
   flex: none;
   width: min(100%, 760px);
-  padding: 8px 24px 12px;
+  padding: 0 24px 12px;
   margin: 0 auto;
 }
 .composer-dock {
@@ -1197,7 +1206,7 @@ button.tool-output-command.expandable {
     font-size: 10px;
   }
   .action-dock {
-    padding: 12px 12px max(8px, env(safe-area-inset-bottom));
+    padding: 0 12px max(8px, env(safe-area-inset-bottom));
   }
   .rows {
     padding: 0 20px;

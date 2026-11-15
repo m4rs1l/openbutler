@@ -1,0 +1,66 @@
+/* The copy row under a bubble: no box, no border, no shadow at rest —
+   only a small muted glyph that darkens on hover. */
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.message-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #999ca4;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    transform 140ms var(--ease);
+}
+.message-actions button:hover {
+  background: #eceef2;
+  color: #5f636a;
+}
+.message-actions button:active {
+  transform: scale(0.94);
+}
+/* The confirmation outranks hover so the check stays blue while the pointer
+   is over it. */
+.message-actions button.copied {
+  color: #3b7ef5;
+  background: transparent;
+}
+/* The owner's bubble reveals its row on hover. The row box already touches
+   the bubble, so the pointer crossing into it never blanks the bubble, and
+   the layout space is reserved so nothing shifts. */
+.ask .message-actions {
+  justify-content: flex-end;
+  padding-top: 4px;
+  padding-right: 4px;
+  opacity: 0;
+  transition: opacity 140ms ease;
+  pointer-events: none;
+}
+.ask:hover .message-actions,
+.ask:focus-within .message-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* Touch has no hover: the row stays visible. */
+@media (hover: none) {
+  .ask .message-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+/* The assistant's answer keeps its row visible at all times, like the
+   reference design. */
+.answer .message-actions {
+  margin-top: 7px;
+}

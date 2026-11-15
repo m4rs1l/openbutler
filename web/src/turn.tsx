@@ -8,7 +8,7 @@ import { ScrollArea } from './components/scroll-area.js';
 import { Collapsible } from './components/collapsible.js';
 import { Icon } from './components/ui.js';
 import { Feedback } from './components/feedback.js';
-import { MessageAttachments } from './components/message-attachments.js';
+import { AssistantBubble, UserBubble } from './components/message-bubble.js';
 import { ChatDivider } from './components/chat-divider.js';
 import {
   activeGroupIndex,
@@ -279,24 +279,10 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
   const activeGroup = activeGroupIndexValue >= 0 ? groups[activeGroupIndexValue] : undefined;
   return (
     <section className={`turn${live ? ' live' : ''}`}>
-      {turn.user ? (
-        <div className="ask">
-          <div className="prose">
-            <MessageAttachments entry={turn.user} sessionId={sessionId} />
-            {(turn.user.text ?? '').trimEnd()}
-          </div>
-        </div>
-      ) : null}
+      {turn.user ? <UserBubble entry={turn.user} sessionId={sessionId} /> : null}
       {leadingUsers.map((group, index) => {
         const entry = group.kind === 'message' ? group.entry : null;
-        return entry ? (
-          <div className="ask" key={entry.eventId || index}>
-            <div className="prose">
-              <MessageAttachments entry={entry} sessionId={sessionId} />
-              {(entry.text ?? '').trimEnd()}
-            </div>
-          </div>
-        ) : null;
+        return entry ? <UserBubble key={entry.eventId || index} entry={entry} sessionId={sessionId} /> : null;
       })}
       {leadingDividers.map((group, index) => (
         <ChatDivider key={`leading-divider-${index}`} entry={group.entry} />
@@ -343,33 +329,15 @@ export function TurnView({ turn, live, sessionId, runtime }: { turn: Turn; live:
           const entry = group.entry;
           // A message the owner sent into a running turn is still their words, not
           // a notice: it renders like the opening ask, in its place in the timeline.
-          if (entry.kind === 'user')
-            return (
-              <div className="ask" key={entry.eventId || index}>
-                <div className="prose">
-                  <MessageAttachments entry={entry} sessionId={sessionId} />
-                  {(entry.text ?? '').trimEnd()}
-                </div>
-              </div>
-            );
+          if (entry.kind === 'user') return <UserBubble key={entry.eventId || index} entry={entry} sessionId={sessionId} />;
           if (entry.kind === 'assistant')
             return entry.text?.trim() ? (
-              <div className="answer" key={entry.eventId || index}>
-                <div className="body">
-                  <Markdown text={entry.text.trimEnd()} reveal={entry.streamReveal} />
-                </div>
-              </div>
+              <AssistantBubble key={entry.eventId || index} text={entry.text.trimEnd()} reveal={entry.streamReveal} />
             ) : null;
           return <EntryNotice key={entry.eventId || index} entry={entry} />;
         })}
       </Collapsible>
-      {answer ? (
-        <div className="answer">
-          <div className="body">
-            <Markdown text={answer.text!.trimEnd()} reveal={answer.streamReveal} />
-          </div>
-        </div>
-      ) : null}
+      {answer ? <AssistantBubble text={answer.text!.trimEnd()} reveal={answer.streamReveal} showActions={!live} /> : null}
       {afterword.map((group, index) =>
         group.kind === 'compaction' ? (
           <CompactionRow

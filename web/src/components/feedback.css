@@ -123,6 +123,7 @@
   margin-top: 10px;
 }
 .action-dock > .feedback,
+.action-dock .step-collapse > .step-collapse-content > .feedback,
 .composer-dock > .feedback {
   margin-bottom: 10px;
 }

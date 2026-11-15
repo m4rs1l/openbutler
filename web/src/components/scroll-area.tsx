@@ -10,6 +10,14 @@ interface ScrollAreaProps extends HTMLAttributes<HTMLDivElement> {
   follow?: boolean;
 }
 
+/** Fade only edges that have more content beyond them. Shared with any
+ * scroll viewport (the transcript) so the soft edge shadow is one definition. */
+export function updateScrollFade(element: HTMLElement | null): void {
+  if (!element) return;
+  element.dataset.fadeTop = String(element.scrollTop > 1);
+  element.dataset.fadeBottom = String(element.scrollTop + element.clientHeight < element.scrollHeight - 1);
+}
+
 /** Fade only edges that have more content beyond them. */
 export function ScrollArea({ className = '', children, follow = false, ...props }: ScrollAreaProps) {
   const root = useRef<HTMLDivElement>(null);
@@ -23,10 +31,7 @@ export function ScrollArea({ className = '', children, follow = false, ...props 
     if (!node || !inner) return;
     const follower = createScrollFollower(node);
     const unbind = bindReaderGestures(node, follower);
-    const fade = () => {
-      node.dataset.fadeTop = String(node.scrollTop > 1);
-      node.dataset.fadeBottom = String(node.scrollTop + node.clientHeight < node.scrollHeight - 1);
-    };
+    const fade = () => updateScrollFade(node);
     // Growth is the only signal that matters: text arrives without a scroll.
     const observer = new ResizeObserver(() => {
       if (following.current) follower.follow();
@@ -49,7 +54,7 @@ export function ScrollArea({ className = '', children, follow = false, ...props 
   }, []);
 
   return (
-    <div {...props} ref={root} data-scroll-viewport className={`scroll-area ${className}`}>
+    <div {...props} ref={root} data-scroll-viewport className={`scroll-area scroll-fade ${className}`}>
       <div ref={content} className="scroll-area-content">
         {children}
       </div>

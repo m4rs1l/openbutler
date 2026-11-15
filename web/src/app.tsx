@@ -18,6 +18,7 @@ import { Composer } from './components/composer.js';
 import { ConversationWelcome } from './components/conversation-welcome.js';
 import { PendingActions } from './components/pending-actions.js';
 import { SessionDetails } from './components/session-details.js';
+import { Collapsible } from './components/collapsible.js';
 import { IconButton } from './components/ui.js';
 import { readDrafts, saveDraft } from './composer-state.js';
 import { WorkspacePanels } from './components/workspace-panels.js';
@@ -94,6 +95,9 @@ export function App() {
   const busy = payload?.busy ?? false;
   const queued = payload?.queuedMessageCount ?? 0;
   const connected = session.status === 'open' && !!payload;
+  // The dock's transient region soft-transitions instead of popping: notices,
+  // connection state and a pending approval/question expand from collapsed.
+  const dockOpen = Boolean(session.notice) || !connected || Boolean(payload?.pendingApproval || payload?.pendingQuestion);
   const turns = useMemo(() => buildTurns(session.entries, session.base), [session.entries, session.base]);
   const messageHistory = useMemo(
     () => [
@@ -360,23 +364,25 @@ export function App() {
                 ) : null}
                 {turns.length === 0 && connected ? <ConversationWelcome projectName={projects.selected?.name ?? undefined} /> : null}
                 <div className="action-dock">
-                  {session.notice ? (
-                    <Feedback tone="error" onDismiss={session.clearNotice}>
-                      {session.notice}
-                    </Feedback>
-                  ) : null}
-                  {!connected ? (
-                    <Feedback tone={session.status === 'error' ? 'warning' : 'loading'}>
-                      {session.status === 'error' ? 'Connection lost. Reconnecting to your workspace…' : 'Connecting to your workspace…'}
-                    </Feedback>
-                  ) : null}
-                  <PendingActions
-                    key={payload?.pendingApproval?.id || payload?.pendingQuestion?.id || id}
-                    approval={payload?.pendingApproval}
-                    question={payload?.pendingQuestion}
-                    onApprove={session.approve}
-                    onAnswer={session.answer}
-                  />
+                  <Collapsible open={dockOpen}>
+                    {session.notice ? (
+                      <Feedback tone="error" onDismiss={session.clearNotice}>
+                        {session.notice}
+                      </Feedback>
+                    ) : null}
+                    {!connected ? (
+                      <Feedback tone={session.status === 'error' ? 'warning' : 'loading'}>
+                        {session.status === 'error' ? 'Connection lost. Reconnecting to your workspace…' : 'Connecting to your workspace…'}
+                      </Feedback>
+                    ) : null}
+                    <PendingActions
+                      key={payload?.pendingApproval?.id || payload?.pendingQuestion?.id || id}
+                      approval={payload?.pendingApproval}
+                      question={payload?.pendingQuestion}
+                      onApprove={session.approve}
+                      onAnswer={session.answer}
+                    />
+                  </Collapsible>
                   <Composer
                     key={id}
                     ref={composer}
@@ -496,7 +502,9 @@ export function App() {
           onClose={closeSearch}
         />
       ) : null}
-      {detailsOpen ? <SessionDetails payload={payload} onClose={() => setDetailsOpen(false)} /> : null}
+      <Collapsible open={detailsOpen}>
+        <SessionDetails payload={payload} onClose={() => setDetailsOpen(false)} />
+      </Collapsible>
     </div>
   );
 }
