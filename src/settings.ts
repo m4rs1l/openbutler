@@ -1,8 +1,9 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { load as parseYaml, dump as dumpYaml } from 'js-yaml';
 import { getDataPath } from './paths.js';
+import { parseListenTarget } from './listen-target.js';
 import { commitSecrets, commitSettingsPair, withSettingsLock } from './settings-transaction.js';
 import { isShellSettingValue, SHELL_PRESETS } from './tools/shell.js';
 
@@ -186,6 +187,12 @@ export interface SettingsStore {
   schedules: ScheduleState[];
   /** Workspace used by bare OpenButler launches; it does not define the machine custodian identity. */
   defaultWorkspaceRoot?: string;
+  /**
+   * The remote client listener this backend install keeps: `daemon start
+   * --listen` records it and `daemon run` binds it with or without a flag.
+   * Unset means the host serves the local pipe only.
+   */
+  daemon?: { listen?: string };
   telegram?: TelegramSettings;
   /** Team membership; absent means this machine is not in a team. */
   team?: TeamSettings;
@@ -256,6 +263,7 @@ const KNOWN_KEYS = new Set([
   'schedules',
   'backgroundTasks',
   'defaultWorkspaceRoot',
+  'daemon',
   'telegram',
   'team',
   'custodian',
@@ -673,6 +681,19 @@ function loadSettingsUnlocked(): SettingsStore {
     }
     settings.commandShell = shell;
   }
+  if (parsed.daemon !== undefined) {
+    if (!isRecord(parsed.daemon)) throw new Error('daemon must be a mapping');
+    for (const key of Object.keys(parsed.daemon)) {
+      if (key !== 'listen') throw new Error(`${key} is not a daemon setting openbutler knows (known: listen)`);
+    }
+    if (parsed.daemon.listen !== undefined) {
+      if (typeof parsed.daemon.listen !== 'string') throw new Error('daemon.listen must be a string');
+      // The same rule the host binds by: a saved value the daemon could not
+      // bind fails at load instead of surfacing as a startup crash.
+      parseListenTarget(parsed.daemon.listen);
+      settings.daemon = { listen: parsed.daemon.listen };
+    }
+  }
   if (parsed.approvalMode !== undefined) {
     if (parsed.approvalMode === 'ask') {
       // Migrate the original v1 approval mode to the folder-scoped default.
@@ -1012,6 +1033,15 @@ export function saveSettings(settings: SettingsStore): void {
     if (expected !== undefined && expected !== diskSettingsRevision()) {
       throw new Error('Settings changed after this copy was loaded. Reload settings before saving to avoid overwriting another writer.');
     }
+    if (expected === undefined && (existsSync(SETTINGS_FILE) || existsSync(CONFIG_FILE))) {
+      // Write authority comes from reading the file first. A store that was
+      // never loaded has nothing to reconcile against, so it may create an
+      // empty machine but must never replace existing configuration — that is
+      // how a defaults object wiped settings.yaml and every provider key.
+      throw new Error(
+        `Refusing to overwrite existing configuration: this store was never loaded from ${SETTINGS_FILE}. Load the settings first, change the loaded store, and save that; a store that was not loaded may only create the files, never replace them.`,
+      );
+    }
     saveSettingsUnlocked(settings);
     loadedRevisions.set(settings, diskSettingsRevision());
   });
@@ -1047,6 +1077,7 @@ function saveSettingsUnlocked(settings: SettingsStore): void {
     ...(settings.commandShell === undefined ? {} : { commandShell: settings.commandShell }),
     schedules: settings.schedules,
     ...(settings.defaultWorkspaceRoot ? { defaultWorkspaceRoot: settings.defaultWorkspaceRoot } : {}),
+    ...(settings.daemon ? { daemon: settings.daemon } : {}),
     ...(settings.telegram ? { telegram: settings.telegram } : {}),
     ...(settings.team ? { team: settings.team } : {}),
     ...(settings.custodian ? { custodian: settings.custodian } : {}),

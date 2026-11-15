@@ -118,14 +118,13 @@ describe('login startup Telegram wiring (cross-platform builders)', () => {
     const settings = await import('../src/settings.js');
     const service = await import('../src/daemon-autostart.js');
     expect(service.currentTelegramEnv()).toBeNull();
-    const store = settings.defaultSettings();
+    const store = settings.loadSettings();
     store.telegram = { enabled: true, tokenEnv: 'OPENBUTLER_TEST_TG_TOKEN', workspaceRoot: root };
     settings.saveSettings(store);
     vi.stubEnv('OPENBUTLER_TEST_TG_TOKEN', '123456:valid-token-value-here-ok');
     expect(service.currentTelegramEnv()).toEqual({ name: 'OPENBUTLER_TEST_TG_TOKEN', value: '123456:valid-token-value-here-ok' });
-    const disabled = settings.defaultSettings();
-    disabled.telegram = { enabled: false, tokenEnv: 'OPENBUTLER_TEST_TG_TOKEN', workspaceRoot: root };
-    settings.saveSettings(disabled);
+    store.telegram = { enabled: false, tokenEnv: 'OPENBUTLER_TEST_TG_TOKEN', workspaceRoot: root };
+    settings.saveSettings(store);
     expect(service.currentTelegramEnv()).toBeNull();
   });
 });

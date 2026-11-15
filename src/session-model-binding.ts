@@ -165,7 +165,10 @@ export async function bindRoleModelView(role: ModelRole, base: AgentEnvironment)
     },
     sessionAffinityProviderOptions: (sessionId: string) => sessionAffinityProviderOptions(built.resolved, sessionId),
     saveReasoningPreference: (variantId: string) => {
-      saveSettings({ ...loadSettings(), reasoning: normalizeReasoningVariantId(variantId) });
+      // Load first: write authority belongs to the store that read the file.
+      const settings = loadSettings();
+      settings.reasoning = normalizeReasoningVariantId(variantId);
+      saveSettings(settings);
       local.reasoningPreference = normalizeReasoningVariantId(variantId);
       local.reasoningDefault = resolveReasoningVariant(variants, local.reasoningPreference).id;
     },

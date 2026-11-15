@@ -8,8 +8,11 @@ let workspaceOrigin: typeof import('../src/workspace-origin.js');
 let settings: typeof import('../src/settings.js');
 
 async function saveDefaultWorkspace(path: string | undefined): Promise<void> {
-  const store = settings.defaultSettings();
+  // Load first: an earlier call in the same test already created the file,
+  // and only the store that read it may write it back.
+  const store = settings.loadSettings();
   if (path !== undefined) store.defaultWorkspaceRoot = path;
+  else delete store.defaultWorkspaceRoot;
   settings.saveSettings(store);
 }
 
