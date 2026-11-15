@@ -7,7 +7,9 @@ import { toolEntryDetails } from './tool-display.js';
  * interactive output stays animated.
  */
 import { parseArgs, questionFrom, type Parsed } from './cli/args.js';
-import { daemonRunOptions } from './cli/daemon-args.js';
+import { daemonRunOptions, listenPreference } from './cli/daemon-args.js';
+import { statusExtras } from './cli/status-extras.js';
+import { readBackendRegistry } from './backend-registry.js';
 import { BUILD_ID } from './build-info.js';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -17,6 +19,7 @@ import {
   getDaemonStatus,
   hostVintage,
   hostVintageMismatchWarning,
+  parseListenTarget,
   requestHost,
   requireBackgroundHost,
   restartDaemon,
@@ -133,7 +136,7 @@ function usage(): void {
   ui.line('Options:');
   printHelpRows([
     ['--workspace <path>', 'Set the workspace scope this client works in.', '[string]'],
-    ['--c "<request>"', 'Ask the agent; it can select available tools.', '[string]'],
+    ['--ask "<request>"', 'One-shot request: run it, print the answer, exit.', '[string]'],
     ['--list-models', 'List models that can call tools. --filter, --limit, --provider.', '[boolean]'],
     ['--version', 'Print the installed version.', '[boolean]'],
     ['-h, --help', 'Show all commands.', '[boolean]'],
@@ -350,6 +353,28 @@ function runWorkspaceCommand(parsed: Parsed): void {
 
 async function resolveSessionWorkspace(path: string | undefined): Promise<string> {
   return resolveInteractiveScope({ explicitPath: path, cwd: process.cwd() }).root;
+}
+
+/**
+ * The paired backend this client talks to, labeled for display: `name
+ * (host:port)` — or null when sessions stay on this machine's own host.
+ */
+function activeBackendLabel(): string | null {
+  const registry = readBackendRegistry();
+  if (registry.active === null) return null;
+  const entry = registry.backends[registry.active];
+  return entry === undefined ? null : `${registry.active} (${entry.host}:${entry.port})`;
+}
+
+/**
+ * The workspace this run names. A paired backend owns the session, so the raw
+ * `--workspace` (or nothing at all) goes to the host for it to resolve against
+ * its own filesystem; without one, local scope resolution applies as before.
+ */
+async function sessionWorkspaceFor(parsed: Parsed): Promise<string | null> {
+  const explicit = parsed.flags.get('workspace');
+  if (activeBackendLabel() !== null) return explicit ?? null;
+  return await resolveSessionWorkspace(explicit);
 }
 
 function showMcpServers(settings: ReturnType<typeof loadSettings>): void {
@@ -641,12 +666,19 @@ async function defaultModelReady(): Promise<boolean> {
   return defaultModelIsUsable(settings);
 }
 
-async function runQuestion(question: string, workspaceRoot: string): Promise<void> {
-  if (!(await defaultModelReady())) throw new Error('Configure a default model first: openbutler setup');
+async function runQuestion(question: string, workspaceRoot: string | null): Promise<void> {
+  const backend = activeBackendLabel();
+  if (backend) {
+    // The paired host owns the model and the workspace question; this machine's
+    // settings and daemon state are not this run's business.
+    ui.kv('Backend', backend);
+  } else {
+    if (!(await defaultModelReady())) throw new Error('Configure a default model first: openbutler setup');
 
-  const hostStatus = await requireBackgroundHost();
-  const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
-  if (vintageWarning) ui.warn(vintageWarning);
+    const hostStatus = await requireBackgroundHost();
+    const vintageWarning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
+    if (vintageWarning) ui.warn(vintageWarning);
+  }
   const controller = await connectDaemonSession(workspaceRoot, { isolatedSession: true });
   const runtime = controller.runtime;
   const destination = runtime.providerName ?? runtime.providerId;
@@ -784,28 +816,34 @@ async function runQuestion(question: string, workspaceRoot: string): Promise<voi
   }
 }
 
-async function runSession(workspaceRoot: string): Promise<void> {
-  if (!(await defaultModelReady())) {
-    const { runSetup } = await import('./cli/setup.js');
-    if (!(await runSetup())) return;
-    if (!(await defaultModelReady())) return;
-  }
+async function runSession(workspaceRoot: string | null): Promise<void> {
+  const backend = activeBackendLabel();
+  if (backend) {
+    ui.kv('Backend', backend);
+    ui.kv('Workspace', 'chosen by the paired host (pass --workspace <path on the host> to override)');
+  } else {
+    if (!(await defaultModelReady())) {
+      const { runSetup } = await import('./cli/setup.js');
+      if (!(await runSetup())) return;
+      if (!(await defaultModelReady())) return;
+    }
 
-  const { isMemoryEmbeddingModelPrepared } = await import('./memory-index.js');
-  if (!(await isMemoryEmbeddingModelPrepared())) {
-    const { prepareLocalMemoryModel } = await import('./cli/setup.js');
-    if (!(await prepareLocalMemoryModel())) return;
-  }
+    const { isMemoryEmbeddingModelPrepared } = await import('./memory-index.js');
+    if (!(await isMemoryEmbeddingModelPrepared())) {
+      const { prepareLocalMemoryModel } = await import('./cli/setup.js');
+      if (!(await prepareLocalMemoryModel())) return;
+    }
 
-  ui.kv('Workspace', workspaceRoot);
-  const hostStatus = await requireBackgroundHost();
-  ui.info(`Background host running (pid ${hostStatus.pid}).`);
-  const warning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
-  if (warning) ui.warn(warning);
-  ui.kv(
-    'Automatic startup',
-    isAutostartInstalled() ? `installed (${autostartDescription()})` : 'not installed (enable with `openbutler daemon autostart on`)',
-  );
+    ui.kv('Workspace', workspaceRoot ?? '(default)');
+    const hostStatus = await requireBackgroundHost();
+    ui.info(`Background host running (pid ${hostStatus.pid}).`);
+    const warning = hostVintageMismatchWarning(process.argv[1], hostStatus.entry, BUILD_ID, hostStatus.buildId);
+    if (warning) ui.warn(warning);
+    ui.kv(
+      'Automatic startup',
+      isAutostartInstalled() ? `installed (${autostartDescription()})` : 'not installed (enable with `openbutler daemon autostart on`)',
+    );
+  }
   let controller;
   const connecting = ui.spinner({ text: 'Connecting to host…', discardStdin: false }).start();
   try {
@@ -829,11 +867,15 @@ async function runSession(workspaceRoot: string): Promise<void> {
     }
     await controller.close();
   }
-  const after = await getDaemonStatus();
-  if (after && !after.legacy && !after.unresponsive) {
-    ui.info(`Detached. Background host keeps running (pid ${after.pid}). Stop it with \`openbutler daemon stop\`.`);
+  if (backend) {
+    ui.info(`Detached. The paired backend ${backend} keeps running where it is.`);
   } else {
-    ui.info('Detached. Background host is not running.');
+    const after = await getDaemonStatus();
+    if (after && !after.legacy && !after.unresponsive) {
+      ui.info(`Detached. Background host keeps running (pid ${after.pid}). Stop it with \`openbutler daemon stop\`.`);
+    } else {
+      ui.info('Detached. Background host is not running.');
+    }
   }
 }
 
@@ -1599,6 +1641,31 @@ async function readWebOptions(parsed: Parsed, fallback: { host: string; port: nu
   return { port, host, dir };
 }
 
+/** The `openbutler daemon --help` surface: subcommands, then the flags that configure a backend install. */
+function printDaemonHelp(): void {
+  ui.line('Usage: openbutler daemon [start|status|stop|restart|run|pair|token|autostart]');
+  ui.line('');
+  ui.line('Commands:');
+  printHelpRows([
+    ['start', 'Start the background host; --web also starts the browser client, --listen records the listener of this install.'],
+    ['status', 'Show the running host and its saved listener; --json prints the ownership report installers parse.'],
+    ['stop', 'Stop the background host.'],
+    ['restart', 'Recycle the host and the browser server together.'],
+    ['run', 'Run the host in the foreground (entry points use this).'],
+    ['pair', 'Mint a one-time code a remote client redeems with openbutler connect.'],
+    ['token', 'create | list | revoke <id> — credentials for remote clients.'],
+    ['autostart', 'on | off | status — login startup; --web includes the browser client.'],
+  ]);
+  ui.line('');
+  ui.line('Options:');
+  printHelpRows([
+    ['--listen <host:port>', 'Tailnet or loopback listener remote clients attach to; start saves it for this install.'],
+    ['--no-listen', 'Clear the saved listener.'],
+    ['--web [--hostname <addr>] [--port <n>]', 'Compose the browser client (start, autostart).'],
+    ['--json', 'status: machine-readable ownership report.'],
+  ]);
+}
+
 /**
  * The one restart flow, shared by `openbutler restart` and `openbutler daemon
  * restart`: both recycle the host and the tracked browser server together so the
@@ -1713,15 +1780,41 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
   }
   if (action === 'start') {
     if (!(await defaultModelReady())) throw new Error('Configure a default model first: openbutler setup');
+    const preference = listenPreference(parsed);
+    let savedListen: string | null = null;
+    let clearedListen = false;
+    if (preference.kind === 'save') {
+      // Refuse an unbindable target before anything is written or spawned.
+      parseListenTarget(preference.value);
+      const store = loadSettings();
+      store.daemon = { listen: preference.value };
+      saveSettings(store);
+      savedListen = preference.value;
+    } else if (preference.kind === 'clear') {
+      const store = loadSettings();
+      if (store.daemon) delete store.daemon.listen;
+      saveSettings(store);
+      clearedListen = true;
+    }
+    const wasRunning = Boolean(await getDaemonStatus());
     let status = await startDaemon();
     ui.info('The machine custodian and its workspace runtime initialize when a TUI or Telegram turn arrives.');
     status = (await getDaemonStatus()) ?? status;
     ui.success(`Background host running (pid ${status.pid}).`);
     ui.kv('Workspaces', String(status.workspaceCount));
     if (status.entry) ui.kv('Host entry', `${status.entry} (${hostVintage(status.entry)})`);
+    if (savedListen) {
+      ui.kv('Listener', `${savedListen} (remote clients attach here)`);
+      if (wasRunning) ui.info('The saved listener applies on the next `openbutler restart`.');
+    }
+    if (clearedListen) ui.info('Remote listener cleared; this host binds no listener.');
     ui.info('It stays alive after this terminal closes. Stop it with `openbutler daemon stop`.');
     if (webFlag(parsed) === 'on' && parsed) {
       const options = await readWebOptions(parsed, null);
+      const running = webProcessStatus();
+      const { webBindMismatch } = await import('./cli/web.js');
+      if (running && webBindMismatch(running, options, { hostname: parsed.flags.has('hostname'), port: parsed.flags.has('port') }))
+        ui.warn(`--hostname/--port apply on the next start; the running web server keeps ${running.host}:${running.port}. Stop it first to rebind.`);
       const web = await startWebProcess(process.argv[1], options.port, options.host, options.dir);
       ui.success(`Web server running (pid ${web.pid}) at http://${web.host}:${web.port}`);
     }
@@ -1752,6 +1845,7 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
     ui.kv('Workspaces', String(status.workspaceCount));
     if (status.entry) ui.kv('Host entry', `${status.entry} (${hostVintage(status.entry)})`);
     ui.kv('Connected clients', String(status.connectedClients));
+    for (const [key, value] of statusExtras()) ui.kv(key, value);
     const webStatus = webProcessStatus();
     if (webStatus) ui.kv('Web server', `pid ${webStatus.pid} (port ${webStatus.port})`);
     ui.kv('Schedules', String(status.schedules ?? 0));
@@ -1803,12 +1897,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (parsed.flags.has('c') || parsed.command === '--c') {
+  if (parsed.flags.has('ask') || parsed.command === '--ask') {
     const question = questionFrom(parsed);
-    if (!question) throw new Error('Write a request after --c.');
+    if (!question) throw new Error('Write a request after --ask.');
     ui.line(`  ${ui.color.dim('Request:')} ${question}`);
     ui.line();
-    await runQuestion(question, await resolveSessionWorkspace(parsed.flags.get('workspace')));
+    await runQuestion(question, await sessionWorkspaceFor(parsed));
     return;
   }
 
@@ -1818,7 +1912,7 @@ async function main(): Promise<void> {
         usage();
         return;
       }
-      await runSession(await resolveSessionWorkspace(parsed.flags.get('workspace')));
+      await runSession(await sessionWorkspaceFor(parsed));
       return;
     }
     case 'setup': {
@@ -1852,7 +1946,18 @@ async function main(): Promise<void> {
       return;
     }
     case 'daemon': {
-      await runDaemonCommand(parsed.words[0] ?? 'status', parsed.words[1], parsed);
+      const subcommand = parsed.words[0];
+      const wantsHelp =
+        subcommand === 'help' ||
+        subcommand === '--help' ||
+        subcommand === '-h' ||
+        parsed.booleans.has('help') ||
+        parsed.flags.has('help');
+      if (wantsHelp) {
+        printDaemonHelp();
+        return;
+      }
+      await runDaemonCommand(subcommand ?? 'status', parsed.words[1], parsed);
       return;
     }
     case 'pair': {

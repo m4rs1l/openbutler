@@ -54,11 +54,11 @@ export function requireFlag(parsed: Parsed, name: string): string {
 }
 
 /**
- * Joins positional words and a flag into one value, so `--c "is docker up"`
- * and `is docker up` are the same request.
+ * Joins positional words and a flag into one value, so `--ask "is docker up"`
+ * and a bare `is docker up` are the same request.
  */
 export function questionFrom(parsed: Parsed): string | undefined {
-  const flag = parsed.flags.get('c');
+  const flag = parsed.flags.get('ask');
   if (flag) return flag;
   const joined = parsed.words.join(' ').trim();
   return joined.length > 0 ? joined : undefined;

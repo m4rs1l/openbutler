@@ -113,7 +113,7 @@ export function readiness(settings: SettingsStore): ReadinessReport {
 
   const defaultChoice = resolveDefaultModel(settings);
   if (!defaultChoice) {
-    hints.push('No default model is selected, so openbutler --c will not run.');
+    hints.push('No default model is selected, so openbutler --ask will not run.');
   } else if (defaultChoice.source === 'usage') {
     hints.push(`Default model comes from usage: ${defaultChoice.providerId} / ${defaultChoice.modelId}.`);
   }

@@ -49,6 +49,22 @@ export function selectBackendFromFlag(parsed: Parsed): string | null {
   return `${named.trim()} (${entry.host}:${entry.port})`;
 }
 
+/**
+ * An explicit --hostname/--port while a server is already bound elsewhere is
+ * a bind the user asked for and did not get. The running server keeps serving
+ * (browsers stay connected), so the difference is reported instead of being
+ * silently swallowed. No explicit bind flags means nothing was asked: a plain
+ * start keeps whatever is running.
+ */
+export function webBindMismatch(
+  running: { host: string; port: number },
+  requested: { host: string; port: number },
+  explicit: { hostname: boolean; port: boolean },
+): boolean {
+  if (!explicit.hostname && !explicit.port) return false;
+  return (explicit.hostname && running.host !== requested.host) || (explicit.port && running.port !== requested.port);
+}
+
 const PAIR_HINT = 'Pair another device with `openbutler web --pair`; paired browsers reconnect on their own.';
 const LOCAL_ONLY_HINT = 'Local only on this computer. For phone or LAN access, run `openbutler web --hostname 0.0.0.0`.';
 // Login startup starts the host service and this client independently; the
@@ -81,6 +97,8 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
     if (running) {
       ui.success(`Web server already running (pid ${running.pid}) at ${browserWebAddress(running.host, running.port)}.`);
       if (backend !== null) ui.warn(`--backend selected ${backend} for the next start; the running server keeps its current connection.`);
+      if (webBindMismatch(running, { host, port }, { hostname: parsed.flags.has('hostname'), port: parsed.flags.has('port') }))
+        ui.warn(`--hostname/--port apply on the next start; the running server keeps ${running.host}:${running.port}. Stop it first to rebind.`);
       if (isLoopback(running.host)) ui.info(LOCAL_ONLY_HINT);
       ui.info(PAIR_HINT);
       return;

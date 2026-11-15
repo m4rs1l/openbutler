@@ -20,11 +20,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { cliNodeArgs } from './cli-entry.js';
 import { createDaemonHost } from './daemon-host.js';
+import { parseListenTarget, type DaemonListenTarget } from './listen-target.js';
 import { createLogger, fileSink } from './logging.js';
 import { DAEMON_PROTOCOL_VERSION, MAX_DAEMON_FRAME_BYTES, type DaemonStatus } from './daemon-protocol.js';
 import { findInstallDir, getDataDir, getDataPath } from './paths.js';
 import { withDeadline } from './shutdown.js';
-import { isLoopback, isTailnetAddress } from './tailnet.js';
 import { machineWorkspaceRoot } from './workspace-origin.js';
 
 const DAEMON_START_TIMEOUT_MS = 20_000;
@@ -81,10 +81,13 @@ export function diagnoseStartupFailure(kind: 'host' | 'web server', exit: ChildE
   }
   // A configuration or code fault reproduces on every spawn; retrying only delays the answer.
   const deterministic =
-    /EADDRINUSE|address already in use|already running|SyntaxError|Cannot find module|ERR_MODULE_NOT_FOUND|ERR_UNSUPPORTED_RESOLVE|Unknown command|Usage:/i.test(
+    /EADDRINUSE|address already in use|already running|SyntaxError|Cannot find module|ERR_MODULE_NOT_FOUND|ERR_UNSUPPORTED_RESOLVE|Unknown command|Usage:|browser client bundle|Re-run the installer|npm run build:web/i.test(
       logTail,
     );
-  return new StartupError(`The ${kind} exited before becoming ready (${exitLabel}).${tail}`, !deterministic);
+  // An empty tail means the child died without a readable message; the owner
+  // still needs the next step instead of a bare sentence.
+  const hint = logTail ? '' : `\nRead the machine log for the child's own message: openbutler logs --lines 40.`;
+  return new StartupError(`The ${kind} exited before becoming ready (${exitLabel}).${tail}${hint}`, !deterministic);
 }
 
 export async function withStartupRetry<T>(attempt: () => Promise<T>): Promise<T> {
@@ -597,30 +600,9 @@ export interface DaemonProcessOptions {
   listen?: string;
 }
 
-export interface DaemonListenTarget {
-  host: string;
-  port: number;
-}
-
-/**
- * Parse `--listen`: an IPv4 literal the daemon may bind (tailnet or loopback)
- * plus a port in 1-65535. The same rule the team hub binds by, because a
- * remote listener without a tailnet boundary would expose every session to
- * whatever can route to the machine.
- */
-export function parseListenTarget(spec: string): DaemonListenTarget {
-  const trimmed = spec.trim();
-  const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(trimmed);
-  if (!match) throw new Error(`--listen needs an IPv4 address and port, e.g. 100.64.0.5:45280 (got "${spec}").`);
-  const host = match[1]!;
-  const port = Number(match[2]);
-  if (port < 1 || port > 65535) throw new Error(`Listen port ${port} is out of range 1-65535.`);
-  if (!isLoopback(host) && !isTailnetAddress(host))
-    throw new Error(
-      `${host} is not a tailnet address. The daemon binds the tailnet or loopback only; 0.0.0.0 and public addresses are refused.`,
-    );
-  return { host, port };
-}
+// The bind rule itself lives with the shared tailnet policy module; re-exported
+// here so the daemon's public surface keeps the name callers already import.
+export { parseListenTarget, type DaemonListenTarget };
 
 export async function runDaemonProcess(options: DaemonProcessOptions = {}): Promise<void> {
   // Validate before the start lock: a refused --listen must fail fast and

@@ -386,6 +386,6 @@ export async function runSetup(): Promise<boolean> {
     ui.info('Fix it: openbutler setup');
     return false;
   }
-  ui.info('Try: openbutler --c "is docker installed?"');
+  ui.info('Try: openbutler --ask "is docker installed?"');
   return true;
 }

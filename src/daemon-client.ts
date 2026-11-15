@@ -139,8 +139,12 @@ export interface DaemonSessionConnection extends AgentSessionClient {
   readonly hostBuildId?: string | null;
 }
 
-export async function connectDaemonSession(workspacePath: string, options: AttachOptions): Promise<DaemonSessionConnection> {
-  const workspaceRoot = canonicalScopeRoot(workspacePath);
+export async function connectDaemonSession(workspacePath: string | null, options: AttachOptions): Promise<DaemonSessionConnection> {
+  // A paired host resolves an explicit workspace against ITS filesystem, so
+  // the raw value passes through untouched; locally the path is canonicalized
+  // here as it always has been.
+  const backend = resolveActiveBackend();
+  const workspaceRoot = backend === null && workspacePath !== null ? canonicalScopeRoot(workspacePath) : workspacePath;
   const { resume, ...attachOptions } = options;
   // Resume delegates the choice to the host's list; naming a chat too would
   // make one of the two silently win, so the mixture is a mistake, not a mode.
@@ -211,12 +215,16 @@ class DaemonSessionClient implements DaemonSessionConnection {
 
   constructor(
     private socket: Socket,
-    private readonly workspaceRoot: string,
+    private readonly workspaceRoot: string | null,
     private attachOptions: AttachOptions = {},
   ) {
-    this.workspaceKey = process.platform === 'win32' ? workspaceRoot.toLocaleLowerCase('en-US') : workspaceRoot;
+    // Until the attach answer replaces it with the host's own key, a paired
+    // session needs any non-empty marker: the attach frame itself carries no key.
+    if (workspaceRoot === null) this.workspaceKey = '@backend';
+    else this.workspaceKey = process.platform === 'win32' ? workspaceRoot.toLocaleLowerCase('en-US') : workspaceRoot;
     this.runtime = {
-      workspaceRoot,
+      // Interim value until the attach replaces this view with the host's.
+      workspaceRoot: workspaceRoot ?? '',
       modelName: 'Connecting…',
       providerName: 'Connecting…',
       providerId: '',
@@ -294,7 +302,7 @@ class DaemonSessionClient implements DaemonSessionConnection {
     this.attachOptions = options;
     this.entriesWindow = options.entriesWindow ?? null;
     const result = await this.request<AttachResult>('attach', {
-      workspaceRoot: this.workspaceRoot,
+      ...(this.workspaceRoot !== null ? { workspaceRoot: this.workspaceRoot } : {}),
       clientKind: options.clientKind ?? 'terminal',
       ...(options.chatSessionId ? { chatSessionId: options.chatSessionId } : {}),
       ...(options.newChatSession ? { newChatSession: true } : {}),

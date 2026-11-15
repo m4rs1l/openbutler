@@ -1222,7 +1222,7 @@ describe('shared host and session IPC', () => {
     ).toBe(true);
   }, 10_000);
 
-  it('runs the real --c CLI entry through an isolated host session without contacting a model provider', async () => {
+  it('runs the real --ask CLI entry through an isolated host session without contacting a model provider', async () => {
     const settings = await import('../src/settings.js');
     const store = settings.defaultSettings();
     store.providers.fixture = { enabled: true, keys: ['fixture-only-key'], npm: '@ai-sdk/openai-compatible', url: 'http://127.0.0.1:1/v1' };
@@ -1240,7 +1240,7 @@ describe('shared host and session IPC', () => {
     const sharedId = shared.getSnapshot().session.id;
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveChild, rejectChild) => {
       const loader = pathToFileURL(resolve('node_modules/tsx/dist/loader.mjs')).href;
-      const child = spawn(process.execPath, ['--import', loader, resolve('src/cli.ts'), '--workspace', root, '--c', 'A fixture request'], {
+      const child = spawn(process.execPath, ['--import', loader, resolve('src/cli.ts'), '--workspace', root, '--ask', 'A fixture request'], {
         cwd: root,
         env: { ...process.env, OPENBUTLER_DATA_DIR: root },
         windowsHide: true,
@@ -2081,7 +2081,7 @@ describe('shared host and session IPC', () => {
 
   it('delivers the setup test message to the paired owner chat and refuses it before pairing', async () => {
     const settings = await import('../src/settings.js');
-    const store = settings.defaultSettings();
+    const store = settings.loadSettings();
     store.telegram = { enabled: true, tokenEnv: 'FTG_SETUP_TOKEN', workspaceRoot: root, chatId: '42', userId: '7' };
     settings.saveSettings(store);
     vi.stubEnv('FTG_SETUP_TOKEN', '123456:fixture-setup-token-value-ok');
@@ -2113,7 +2113,7 @@ describe('shared host and session IPC', () => {
       await expect(requestHost('telegram.test', {})).resolves.toEqual({ delivered: true });
       expect(sent.at(-1)).toMatchObject({ chat_id: '42' });
 
-      const unpaired = settings.defaultSettings();
+      const unpaired = settings.loadSettings();
       unpaired.telegram = { enabled: true, tokenEnv: 'FTG_SETUP_TOKEN', workspaceRoot: root };
       settings.saveSettings(unpaired);
       await requestHost('settings.reload', {});
@@ -2224,7 +2224,7 @@ describe('shared host and session IPC', () => {
 
   it('removes the reply keyboard when the owner chat is unpaired', async () => {
     const settings = await import('../src/settings.js');
-    const store = settings.defaultSettings();
+    const store = settings.loadSettings();
     store.telegram = { enabled: true, tokenEnv: 'FTG_FAREWELL_TOKEN', workspaceRoot: root, chatId: '42', userId: '7' };
     settings.saveSettings(store);
     vi.stubEnv('FTG_FAREWELL_TOKEN', '123456:fixture-farewell-token-ok');
@@ -2249,7 +2249,7 @@ describe('shared host and session IPC', () => {
     vi.stubGlobal('fetch', fetchStub);
     try {
       await requestHost('settings.reload', {});
-      const unpaired = settings.defaultSettings();
+      const unpaired = settings.loadSettings();
       unpaired.telegram = { enabled: true, tokenEnv: 'FTG_FAREWELL_TOKEN', workspaceRoot: root };
       settings.saveSettings(unpaired);
       await requestHost('settings.reload', {});
@@ -2641,7 +2641,7 @@ describe('shared host and session IPC', () => {
   it('switches the report line off without touching delivery', async () => {
     const settings = await import('../src/settings.js');
     const { CUSTODIAN_SESSION_ID } = await import('../src/session-paths.js');
-    const store = settings.defaultSettings();
+    const store = settings.loadSettings();
     store.telegram = { enabled: true, tokenEnv: 'FTG_LINE_TOKEN', workspaceRoot: root, chatId: '1', userId: '2' };
     // No gap: this test is about the line, not about how often a turn may start.
     store.custodian = { reportLine: false, reportTurnGapSeconds: 0 };
@@ -2714,7 +2714,9 @@ describe('shared host and session IPC', () => {
     };
     expect(listed.items).toHaveLength(1);
 
-    settings.saveSettings({ ...settings.loadSettings(), custodian: { reportLine: true, reportTurnGapSeconds: 0 } });
+    const latest = settings.loadSettings();
+    latest.custodian = { ...(latest.custodian ?? {}), reportLine: true, reportTurnGapSeconds: 0 };
+    settings.saveSettings(latest);
     await reporter.sendMessage({ text: 'LINE-TWO', images: [] });
     await vi.waitFor(() => expect(headPrompts().some((prompt) => prompt.includes('waiting from below'))).toBe(true), { timeout: 8000 });
   }, 20_000);

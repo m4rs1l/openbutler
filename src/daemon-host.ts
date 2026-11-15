@@ -24,6 +24,7 @@ import {
   canonicalScopeRoot as canonicalWorkspaceRoot,
   machineWorkspaceRoot,
   resolveBackgroundScope,
+  resolveInteractiveScope,
   scopeMapKey as normalizeWorkspaceKey,
 } from './workspace-origin.js';
 import { createMcpConnectionManager } from './tools/mcp.js';
@@ -3319,11 +3320,10 @@ export function createDaemonHost(options: DaemonHostOptions): DaemonHost {
           clientKind === 'web' && request.entriesWindow !== undefined
             ? requireInteger(request.entriesWindow, 'entriesWindow', 1, MAX_ENTRIES_WINDOW)
             : null;
-        const path = requireString(request.workspaceRoot, 'workspaceRoot', MAX_WORKSPACE_PATH_BYTES);
-        if (!isAbsolute(path)) throw new Error('workspaceRoot must be an absolute path.');
+        const requestedRoot = validateAttachWorkspaceRoot(request.workspaceRoot);
         if (request.isolatedSession !== undefined && typeof request.isolatedSession !== 'boolean')
           throw new Error('isolatedSession must be a boolean.');
-        const scopeRoot = canonicalWorkspaceRoot(path);
+        const scopeRoot = requestedRoot === undefined ? resolveInteractiveScope({ cwd: process.cwd() }).root : canonicalWorkspaceRoot(requestedRoot);
         if (request.chatSessionId !== undefined || request.newChatSession !== undefined) {
           if (request.newChatSession !== undefined && request.newChatSession !== true) throw new Error('newChatSession must be true.');
           if (request.chatSessionId !== undefined && request.newChatSession === true)
@@ -4189,6 +4189,22 @@ function canonicalFileWithin(path: string, root: string, label: string): string 
   if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
     throw new Error(`The ${label} path is outside its storage directory.`);
   return canonicalPath;
+}
+
+/**
+ * `workspaceRoot` on an attach: optional, and when present it must be a path
+ * THIS host can use. An absent value means the host picks its own default
+ * workspace — what a paired remote client sends when the user named no path,
+ * so a client filesystem never decides where a host session runs.
+ */
+export function validateAttachWorkspaceRoot(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  const path = requireString(raw, 'workspaceRoot', MAX_WORKSPACE_PATH_BYTES);
+  if (!isAbsolute(path))
+    throw new Error(
+      `workspaceRoot must be an absolute path on this host (got ${JSON.stringify(path)}). Omit workspaceRoot to use this host's default workspace.`,
+    );
+  return path;
 }
 
 function requireString(value: unknown, name: string, maxBytes: number): string {
