@@ -317,6 +317,25 @@ read_host_status() {
   return 0
 }
 
+# Every release download is verified before a running host is touched: a
+# missing asset or an unreachable GitHub must fail with a message, never stop
+# the host and then die inside curl.
+verify_release_asset() {
+  va_url="$1"
+  va_name="$2"
+  va_status="$(curl -fsSL -o /dev/null -w "%{http_code}" "$va_url" || true)"
+  if [ "$va_status" = "404" ]; then
+    echo "Error: release v${specific_version} does not carry $va_name." >&2
+    echo "Available releases: https://github.com/$REPO/releases" >&2
+    exit 1
+  fi
+  if [ "$va_status" != "200" ]; then
+    echo "Error: could not reach GitHub to download $va_name (status $va_status)." >&2
+    echo "Check the connection and retry once GitHub answers." >&2
+    exit 1
+  fi
+}
+
 # The running host holds its node binary open, so it must stop before the files
 # under the install directory are replaced; restarting only after the copy is
 # too late. 0 = stopped our host, 1 = nothing to stop (or a foreign host left
@@ -407,14 +426,14 @@ else
       exit 1
     fi
     filename="$APP-daemon-$specific_version-$target$archive_ext"
-    filename_web="$APP-web-$specific_version-$target$archive_ext"
+    filename_web="$APP-web-$specific_version.tar.gz"
     url="https://github.com/$REPO/releases/latest/download/$filename"
     url_web="https://github.com/$REPO/releases/latest/download/$filename_web"
   else
     requested_version="${requested_version#v}"
     specific_version="$requested_version"
     filename="$APP-daemon-$specific_version-$target$archive_ext"
-    filename_web="$APP-web-$specific_version-$target$archive_ext"
+    filename_web="$APP-web-$specific_version.tar.gz"
     url="https://github.com/$REPO/releases/download/v${specific_version}/$filename"
     url_web="https://github.com/$REPO/releases/download/v${specific_version}/$filename_web"
     status="$(curl -fsSL -o /dev/null -w "%{http_code}" "https://github.com/$REPO/releases/tag/v${specific_version}" || true)"
@@ -422,14 +441,6 @@ else
       echo "Error: release v${specific_version} not found." >&2
       echo "Available releases: https://github.com/$REPO/releases" >&2
       exit 1
-    fi
-    if [ "$web" = "true" ]; then
-      web_status="$(curl -fsSL -o /dev/null -w "%{http_code}" "$url_web" || true)"
-      if [ "$web_status" = "404" ]; then
-        echo "Error: release v${specific_version} does not carry $filename_web." >&2
-        echo "Available releases: https://github.com/$REPO/releases" >&2
-        exit 1
-      fi
     fi
   fi
 fi
@@ -450,6 +461,15 @@ if [ "$web" = "true" ] && [ -n "$current" ] && [ "$current" = "$specific_version
   skip_base="true"
 fi
 
+# Pre-flight before the host is touched: a missing asset or an unreachable
+# GitHub fails with a message while the running host is still running. Both
+# version branches share this one check; skip_base skips the base fetch, not
+# the overlay it is about to download.
+if [ -z "$binary_path" ]; then
+  if [ "$skip_base" != "true" ]; then verify_release_asset "$url" "$filename"; fi
+  if [ "$web" = "true" ]; then verify_release_asset "$url_web" "$filename_web"; fi
+fi
+
 is_update=0
 if [ -z "$binary_path" ] && [ -n "$current" ] && [ "$current" != "$specific_version" ]; then
   is_update=1
@@ -457,9 +477,13 @@ fi
 
 tmp_dir="${TMPDIR:-/tmp}/openbutler_install_$$"
 mkdir -p "$tmp_dir"
-trap 'show_cursor; rm -rf "$tmp_dir"' EXIT INT TERM
 
 host_was_running=0
+host_restored=0
+# A failure after the host was stopped must not leave it dead: the EXIT path
+# brings it back before reporting the failure. Normal completion marks the
+# restart done, so the trap never starts a second copy.
+trap 'rc=$?; show_cursor; rm -rf "$tmp_dir"; if [ "$rc" -ne 0 ] && [ "$host_was_running" = "1" ] && [ "$host_restored" = "0" ]; then echo "The install failed after the host was stopped; starting it again." >&2; start_running_host || true; host_restored=1; fi; exit $rc' EXIT INT TERM
 if stop_running_host; then host_was_running=1; fi
 
 DO_COPY=1
@@ -614,14 +638,14 @@ if [ "$is_update" = "1" ]; then
 else
   say "Installed openbutler $installed to $INSTALL_DIR."
 fi
-if [ "$host_was_running" = "1" ]; then start_running_host; fi
+if [ "$host_was_running" = "1" ]; then start_running_host; host_restored=1; fi
 
 case "$config" in
   daemon)
-    say "Next: start the host with  openbutler daemon start  (add --listen <addr:port> for remote clients) and pair them with  openbutler pair"
+    say "Next: choose a model with  openbutler setup  then start the host with  openbutler daemon start  (add --listen <addr:port> for remote clients) and pair them with  openbutler pair"
     ;;
   daemon+web)
-    say "Next: start host and UI together with  openbutler daemon start --web  (add  --listen <addr:port>  for CLI clients and  --hostname <address>  for phones and browsers)"
+    say "Next: choose a model with  openbutler setup  then start host and UI together with  openbutler daemon start --web  (add  --listen <addr:port>  for CLI clients and  --hostname <address>  for phones and browsers)"
     say "Pair a CLI or desktop against this host with  openbutler pair"
     ;;
   client)

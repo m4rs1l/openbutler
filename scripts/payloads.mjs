@@ -6,8 +6,10 @@
  *
  *   openbutler-daemon-<version>-<target>.<ext>   base payload: compiled app
  *                                                 minus the browser bundle
- *   openbutler-web-<version>-<target>.<ext>      overlay: only the browser
- *                                                 bundle (app/dist/client)
+ *   openbutler-web-<version>.tar.gz              overlay: only the browser
+ *                                                 bundle (app/dist/client),
+ *                                                 one generic archive per
+ *                                                 version for every platform
  *
  * Nothing is duplicated between the archives: the base carries the host, the
  * CLI and every runtime dependency, while the overlay is a thin layer the
@@ -35,10 +37,13 @@ export function assertFlavor(flavor) {
 
 /**
  * The archive file name install.sh and install.ps1 must construct identically:
- * openbutler-<flavor>-<version>-<target>.<ext>
+ * openbutler-<flavor>-<version>-<target>.<ext> for the platform-bound base,
+ * openbutler-web-<version>.tar.gz for the platform-independent overlay - its
+ * bytes are static files, so one file per version serves every install.
  */
 export function archiveName(flavor, version, target, ext) {
   assertFlavor(flavor);
+  if (flavor === 'web') return `openbutler-web-${version}.tar.gz`;
   return `openbutler-${flavor}-${version}-${target}.${ext}`;
 }
 

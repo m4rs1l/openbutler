@@ -21,7 +21,8 @@
  * tests/web-bundle-guard.test.ts.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -41,14 +42,16 @@ const MARKER = '.openbutler-flavor';
 
 // The four install outcomes, pinned at their exact wording. The shell quotes
 // commands with double spaces; install.ps1 uses single spaces (Write-Host).
+// Server roles begin with model setup: the host cannot start without one, so
+// the hint names the step the first run actually hits.
 const HINT_DAEMON =
-  'Next: start the host with  openbutler daemon start  (add --listen <addr:port> for remote clients) and pair them with  openbutler pair';
+  'Next: choose a model with  openbutler setup  then start the host with  openbutler daemon start  (add --listen <addr:port> for remote clients) and pair them with  openbutler pair';
 const HINT_CLIENT = 'Next: pair a backend with  openbutler connect <host:port> --code <code>';
 const HINT_CLIENT_WEB = `${HINT_CLIENT}  then open the UI with  openbutler web --backend <name>`;
-const HINT_DAEMON_WEB = 'Next: start host and UI together with  openbutler daemon start --web';
+const HINT_DAEMON_WEB = 'Next: choose a model with  openbutler setup  then start host and UI together with  openbutler daemon start --web';
 const HINT_DAEMON_PS1 =
-  'Next: start the host with openbutler daemon start (add --listen <addr:port> for remote clients) and pair them with openbutler pair';
-const HINT_DAEMON_WEB_PS1 = 'Next: start host and UI together with openbutler daemon start --web';
+  'Next: choose a model with openbutler setup then start the host with openbutler daemon start (add --listen <addr:port> for remote clients) and pair them with openbutler pair';
+const HINT_DAEMON_WEB_PS1 = 'Next: choose a model with openbutler setup then start host and UI together with openbutler daemon start --web';
 const HINT_CLIENT_PS1 = 'Next: pair a backend with openbutler connect <host:port> --code <code>';
 const HINT_CLIENT_WEB_PS1 = `${HINT_CLIENT_PS1} then open the UI with openbutler web --backend <name>`;
 
@@ -66,11 +69,14 @@ describe('tracked payload rules (scripts/payloads.mjs)', () => {
     expect(() => payload.assertFlavor('web')).not.toThrow();
   });
 
-  it('names archives openbutler-<flavor>-<version>-<target>.<ext>', async () => {
+  it('names the daemon archive per target and the web archive as one generic tar.gz', async () => {
     const payload = await import(pathToFileURL(join(repo, 'scripts', 'payloads.mjs')).href);
     expect(payload.archiveName('daemon', '0.8.0', 'linux-x64', 'tar.gz')).toBe('openbutler-daemon-0.8.0-linux-x64.tar.gz');
-    expect(payload.archiveName('web', '0.8.0', 'windows-x64', 'zip')).toBe('openbutler-web-0.8.0-windows-x64.zip');
-    expect(payload.archiveName('web', '0.8.0', 'linux-arm64', 'tar.gz')).toBe('openbutler-web-0.8.0-linux-arm64.tar.gz');
+    expect(payload.archiveName('daemon', '0.8.0', 'windows-x64', 'zip')).toBe('openbutler-daemon-0.8.0-windows-x64.zip');
+    // The overlay is static files only: target and format are fixed, so every
+    // platform fetches the same bytes and the name carries neither.
+    expect(payload.archiveName('web', '0.8.0', 'windows-x64', 'zip')).toBe('openbutler-web-0.8.0.tar.gz');
+    expect(payload.archiveName('web', '0.8.0', 'linux-arm64', 'tar.gz')).toBe('openbutler-web-0.8.0.tar.gz');
   });
 
   it('rejects a missing flavor with the required-flag message', async () => {
@@ -120,7 +126,7 @@ describe('install.sh contract (flags, archives, marker, hints)', () => {
     // base bytes; only hints differ.
     const baseLine = 'filename="$APP-daemon-$specific_version-$target$archive_ext"';
     expect(count(installSh, baseLine)).toBe(2);
-    const webLine = 'filename_web="$APP-web-$specific_version-$target$archive_ext"';
+    const webLine = 'filename_web="$APP-web-$specific_version.tar.gz"';
     expect(count(installSh, webLine)).toBe(2);
   });
 
@@ -144,6 +150,23 @@ describe('install.sh contract (flags, archives, marker, hints)', () => {
 
   it('explains a release that does not carry the overlay archive', () => {
     expect(installSh).toContain('does not carry');
+  });
+
+  it('pre-flights every release download before the running host is touched', () => {
+    // One shared check serves both version branches and both archives; the
+    // branch-local copy is gone, and the check sits before any host stop.
+    expect(count(installSh, 'verify_release_asset "$url" "$filename"')).toBe(1);
+    expect(count(installSh, 'verify_release_asset "$url_web" "$filename_web"')).toBe(1);
+    const preflightAt = installSh.indexOf('verify_release_asset "$url" "$filename"');
+    expect(preflightAt).toBeGreaterThan(0);
+    expect(preflightAt).toBeLessThan(installSh.indexOf('if stop_running_host; then'));
+    expect(count(installSh, 'does not carry')).toBe(1);
+    expect(installSh).toContain('could not reach GitHub to download');
+  });
+
+  it('brings a stopped host back when a later install step fails', () => {
+    expect(installSh).toContain('starting it again');
+    expect(installSh).toMatch(/start_running_host;\s*host_restored=1/);
   });
 });
 
@@ -171,7 +194,12 @@ describe('install.ps1 contract', () => {
 
   it('builds both archive names, base always from the daemon payload', () => {
     expect(installPs1).toContain('$fileName = "$App-daemon-$specific-$target.zip"');
-    expect(installPs1).toContain('$webFileName = "$App-web-$specific-$target.zip"');
+    expect(installPs1).toContain('$webFileName = "$App-web-$specific.tar.gz"');
+  });
+
+  it('extracts the generic overlay with tar, because it ships as tar.gz on every platform', () => {
+    expect(installPs1).toContain('if ($Archive -like "*.tar.gz")');
+    expect(installPs1).toContain('tar -xzf $Archive -C $Destination');
   });
 
   it('points at the config-specific next command', () => {
@@ -179,6 +207,13 @@ describe('install.ps1 contract', () => {
     expect(installPs1).toContain(HINT_DAEMON_WEB_PS1);
     expect(installPs1).toContain(HINT_CLIENT_PS1);
     expect(installPs1).toContain(HINT_CLIENT_WEB_PS1);
+  });
+
+  it('brings a stopped host back when a later install step fails', () => {
+    // Downloads run before the stop on Windows, but a copy-stage failure must
+    // still not leave a stopped host dead - and a clean run restarts once.
+    expect(installPs1).toContain('starting it again');
+    expect(installPs1).toMatch(/Start-RunningHost;\s*\$hostRestored = \$true/);
   });
 });
 
@@ -220,11 +255,12 @@ describeLive('install.sh live flag behavior (no network)', () => {
   // Safety: even on a future script a flagless run might head for a download,
   // so every invocation points the installer at an unreachable repo and an
   // empty install dir. No network, no writes, wherever it exits.
-  const run = (args: string[]) => {
+  const run = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) => {
     const env = {
       ...process.env,
       OPENBUTLER_GITHUB_REPO: '127.0.0.1:1/unreachable',
       OPENBUTLER_INSTALL_DIR: join(repo, 'node_modules', '.release-payloads-empty'),
+      ...extraEnv,
     };
     try {
       const stdout = execFileSync(bash!, [...args], { timeout: 20_000, encoding: 'utf8', env });
@@ -272,6 +308,44 @@ describeLive('install.sh live flag behavior (no network)', () => {
     expect(result.stderr).toContain(BINARY_WEB_SH);
     expect(result.stderr).not.toContain('binary archive not found');
   });
+
+  it('names the missing overlay on the default (latest) path instead of falling into curl', () => {
+    // BASH_ENV defines curl as a function (functions beat PATH, and the MSYS
+    // bash always injects its own curl binary ahead of any PATH entry), so the
+    // default path runs for real, offline, into a throwaway install dir: a
+    // missing web archive must fail with the friendly 404 message, never a
+    // raw download error after the host was touched.
+    const stubDir = mkdtempSync(join(tmpdir(), 'ob-curl-stub-'));
+    const installDir = mkdtempSync(join(tmpdir(), 'ob-payload-install-'));
+    const envFile = join(stubDir, 'curl-stub.sh');
+    writeFileSync(
+      envFile,
+      [
+        'curl() { case "$*" in',
+        '  *api.github.com*) echo \'{"tag_name":"v9.9.9"}\'; return 0;;',
+        '  *openbutler-web-*) printf 404; return 22;;',
+        '  *openbutler-daemon-*) printf 200; return 0;;',
+        '  *) printf 000; return 7;;',
+        'esac; }',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    try {
+      const result = run([scriptArg, '--daemon', '--web'], {
+        OPENBUTLER_GITHUB_REPO: 'zxsmind/openbutler',
+        OPENBUTLER_INSTALL_DIR: installDir,
+        BASH_ENV: envFile,
+      });
+      expect(result.code).not.toBe(0);
+      const output = result.stdout + result.stderr;
+      expect(output).toContain('does not carry');
+      expect(output).toContain('openbutler-web-9.9.9.tar.gz');
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+      rmSync(installDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('local package-release.mjs (untracked; asserted only while present)', () => {
@@ -287,6 +361,12 @@ describe('local package-release.mjs (untracked; asserted only while present)', (
     it('applies the tracked payload spec while assembling the archive', () => {
       expect(source).toContain('payloadSpec(');
       expect(source).toContain('app/dist/client');
+    });
+    it('picks the archive format from the file name, not from the build host', () => {
+      // The generic web overlay is tar.gz even when built on Windows, so the
+      // writer may not branch on process.platform for the format.
+      expect(source).toContain("archive.endsWith('.zip')");
+      expect(source).not.toContain("os === 'windows') run('tar'");
     });
   });
 });

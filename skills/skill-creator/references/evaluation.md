@@ -64,7 +64,7 @@ browser/office/MCP capabilities cannot silently be evaluated with an incapable
 worker. Foreground waits obey host tool deadlines. Respect owner holds/stops and
 available worker caps; evaluation is not permission for unlimited delegation.
 
-`openbutler --c` is another available isolated request shape, but it still has its own
+`openbutler --ask` is another available isolated request shape, but it still has its own
 normal discovery, permissions, provider costs and tool execution. A baseline
 instruction saying "do not load the target skill" is weaker than an environment
 that actually excludes it. Record whether the target body was accessible/read.

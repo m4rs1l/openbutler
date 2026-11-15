@@ -10,7 +10,7 @@ installed `--help` and tool schemas when the running version differs.
 ```text
 openbutler
 openbutler --workspace <directory>
-openbutler --c "<request>" [--workspace <directory>]
+openbutler --ask "<request>" [--workspace <directory>]
 openbutler --list-models [--provider <id>] [--filter <text>] [--limit <n>]
 openbutler --version
 openbutler --help
@@ -21,7 +21,7 @@ openbutler setup
 openbutler workspace default [directory]
 ```
 
-`--workspace` requires a directory value. `--c` is the one-shot request flag;
+`--workspace` requires a directory value. `--ask` is the one-shot request flag;
 arbitrary unsupported flags do not configure model settings. `workspace default`
 without a path prints the existing choice. [Environment](environment.md) and
 [providers](providers.md) describe these entry points.
@@ -51,6 +51,8 @@ command. [Configuration](configuration.md) and [providers](providers.md).
 ```text
 openbutler daemon
 openbutler daemon start
+openbutler daemon start --listen <host:port>
+openbutler daemon start --no-listen
 openbutler daemon start --web [--port <1-65535>] [--hostname <address>] [--dir <directory>]
 openbutler daemon status
 openbutler daemon stop
@@ -63,7 +65,11 @@ openbutler restart
 openbutler web [--port <1-65535>] [--hostname <address>] [--dir <directory>] [--pair]
 ```
 
-`daemon` defaults to status. `daemon run` is the internal child-process entry,
+`daemon` defaults to status (`daemon --help` prints this surface instead).
+`--listen <host:port>` records this install's remote listener — tailnet or
+loopback only — and `--no-listen` clears it; the saved listener binds on every
+start, restart, and login boot, so remote clients attach without a flag.
+`daemon run` is the internal child-process entry,
 not the normal user launch. Install/uninstall here manage startup registration;
 `install --web` also registers the separate browser client at login with the
 saved port, hostname and workspace, and plain `install` keeps an existing web

@@ -33,7 +33,7 @@ ships what it does not run:
 `--web` on its own and `--binary --web` are refused; every run ends with the
 next command for the composition it installed.
 
-Linux (x64/arm64) and macOS (bash, zsh, fish; Windows users in Git Bash too):
+Linux (x64/arm64) and Windows users in Git Bash:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --daemon
@@ -46,8 +46,8 @@ irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 -OutFi
 & $env:TEMP\openbutler-install.ps1 -Daemon
 ```
 
-A specific release: `bash -s -- --daemon --version 0.6.1` for the shell
-installer, or run the downloaded script as `.\install.ps1 -Daemon -Version 0.6.1`.
+A specific release: `bash -s -- --daemon --version 0.8.0` for the shell
+installer, or run the downloaded script as `.\install.ps1 -Daemon -Version 0.8.0`.
 `--no-modify-path` (shell) and `-NoModifyPath` (PowerShell) skip PATH changes.
 Both installers verify the result with `openbutler --version`; restart the
 terminal afterwards so the updated PATH takes effect. The installed
@@ -56,10 +56,11 @@ installed" and stops, while a changed one acts — switching roles reinstalls,
 and adding `--web` over a same-version base install downloads only the web
 overlay instead of the base archive again.
 
-Published builds: Windows x64, Linux x64 and Linux arm64 in the same release,
-each carrying two flat archives — `openbutler-daemon-<version>-<target>` for
-the base payload and `openbutler-web-<version>-<target>` for the browser
-bundle; macOS follows in a later release.
+Published builds: Windows x64, Linux x64 and Linux arm64 in the same release —
+`openbutler-daemon-<version>-<target>` carries the base payload without the
+browser bundle, one per platform, and the single platform-independent
+`openbutler-web-<version>` overlay carries the bundle; macOS follows in a
+later release.
 
 Configure a provider and model once:
 
@@ -471,7 +472,7 @@ both exist, openbutler uses the new one and leaves the old directory untouched.
 ```text
 openbutler                    Open an interactive terminal session
 openbutler --workspace <path> Attach the shared custodian with this workspace scope
-openbutler --c "<request>"    Run a one-shot request
+openbutler --ask "<request>"   Run a one-shot request
 openbutler setup              First-run wizard: provider, key, model, memory model
 openbutler config             Show the current settings and readiness
 openbutler keys add|list|remove <provider>   Manage provider API keys
@@ -492,7 +493,7 @@ openbutler team <subcommand>  init, invite, invites, invite-revoke, join, join-s
                           files, get
 openbutler telegram setup|pair|status|disable|unpair|reset
 openbutler web                Serve the browser client (--port, --hostname, --dir; --pair)
-openbutler daemon start|status|stop|install|uninstall|autostart on|off|status
+openbutler daemon start [--listen <host:port>] [--no-listen]|status|stop|install|uninstall|autostart on|off|status
 openbutler stop               Stop the background host
 openbutler restart            Restart the host and browser server, reconnect open sessions
 openbutler sessions index [--rebuild]        Build the session search index

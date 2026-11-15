@@ -70,14 +70,14 @@ Setup can contact the network and download packages/model assets.
 ```text
 openbutler
 openbutler --workspace <directory>
-openbutler --c "Inspect service status"
+openbutler --ask "Inspect service status"
 openbutler workspace default <directory>
 openbutler daemon start
 ```
 
 Bare launches use configured `defaultWorkspaceRoot`, otherwise the invoking
 directory. `--workspace` selects another existing directory; relative paths resolve
-from the invoking shell. `--c` executes an isolated one-shot request through the
+from the invoking shell. `--ask` executes an isolated one-shot request through the
 host. A path mentioned in a message does not itself rebind workspace scope.
 
 Runtime initialization is lazy. A responsive daemon may have no model/MCP runtime

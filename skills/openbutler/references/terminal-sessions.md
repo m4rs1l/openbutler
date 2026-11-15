@@ -6,7 +6,7 @@ Related: [commands](commands.md), [web](web.md), [memory/context](memory-context
 ## Terminal entry and controls
 
 `openbutler` opens the TUI and starts/attaches the background host. `--workspace`
-selects scope and `--c` is a one-shot isolated request. Closing a TUI detaches it.
+selects scope and `--ask` is a one-shot isolated request. Closing a TUI detaches it.
 Read `/help` and the current footer for terminal-emulator-specific controls; web
 keyboard behavior is not a promise about every terminal's input protocol.
 
