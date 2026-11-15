@@ -487,8 +487,8 @@ export function Dropdown({
 
   useLayoutEffect(() => {
     if (!open || !isSurfaceMounted) return;
-    // Commit the target size and anchor together before Motion projects the
-    // layout change. Waiting for the resize observer leaves a displaced frame.
+    // Commit the target size and anchor together before the first painted
+    // frame. Waiting for the resize observer leaves a displaced frame.
     updatePosition();
     if (reducedMotion) contentAnimation.set({ opacity: 1 });
     else if (previousContentKeyRef.current !== contentKey) {
@@ -730,9 +730,6 @@ export function Dropdown({
             <div className="dropdown-surface__stack">
               <motion.div
                 ref={panelRef}
-                layout={!reducedMotion}
-                layoutDependency={contentKey ?? activeItemId}
-                transition={{ layout: layoutTransition }}
                 className={cn(
                   'dropdown__panel',
                   `dropdown__panel--${size}`,
