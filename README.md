@@ -46,8 +46,8 @@ irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 -OutFi
 & $env:TEMP\openbutler-install.ps1 -Daemon
 ```
 
-A specific release: `bash -s -- --daemon --version 0.8.0` for the shell
-installer, or run the downloaded script as `.\install.ps1 -Daemon -Version 0.8.0`.
+A specific release: `bash -s -- --daemon --version 0.8.1` for the shell
+installer, or run the downloaded script as `.\install.ps1 -Daemon -Version 0.8.1`.
 `--no-modify-path` (shell) and `-NoModifyPath` (PowerShell) skip PATH changes.
 Both installers verify the result with `openbutler --version`; restart the
 terminal afterwards so the updated PATH takes effect. The installed
