@@ -84,9 +84,9 @@ const SERVE_HOST_WAIT_MS = 30_000;
  * it waits briefly for the host instead of failing on a cold-boot race.
  */
 export async function runWebCommand(parsed: Parsed): Promise<void> {
-  const port = readPort(parsed);
+  let port = readPort(parsed);
   const backend = selectBackendFromFlag(parsed);
-  const host = parsed.flags.get('hostname') ?? DEFAULT_WEB_HOST;
+  let host = parsed.flags.get('hostname') ?? DEFAULT_WEB_HOST;
   const scope = resolveServerScope({ explicitDir: parsed.flags.get('dir') });
   const workspaceRoot = scope.root;
   const wantsPair = parsed.booleans.has('pair') || parsed.flags.get('pair') === 'true';
@@ -131,6 +131,13 @@ export async function runWebCommand(parsed: Parsed): Promise<void> {
   if (wantsPair) {
     const running = webProcessStatus();
     if (running) {
+      // The pair session owns the port its one-time link points at, so it takes the
+      // tracked server's place — and with it, the bind the user already opened. Each
+      // axis is inherited only when no explicit flag overrides it, so the link is
+      // minted on the address the target browser actually reaches instead of the
+      // loopback default (a tailnet-bound server paired from another device).
+      if (!parsed.flags.has('hostname')) host = running.host;
+      if (!parsed.flags.has('port')) port = running.port;
       ui.info(`Stopping the tracked web server (pid ${running.pid}) for a pairing session…`);
       await stopWebProcess();
     }

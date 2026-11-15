@@ -210,4 +210,36 @@ describe('openbutler web pairing gate', () => {
     expect(exited.stdout).toContain('Stopping the tracked web server');
     await waitFor(() => webProcessStatus() === null, 15_000, 'the pairing record to clear');
   }, 120_000);
+
+  it('takes over the tracked bind so the pairing link stays on the address the browser can reach', async () => {
+    const { webProcessStatus } = await import('../src/daemon.js');
+    const booted = await runCli(['restart']);
+    expect(booted.code, booted.stderr).toBe(0);
+    const port = await freePort();
+    // A non-default loopback host stands in for the tailnet/LAN address a server is
+    // actually bound to; the defect is binding a server the user never asked for.
+    const started = await runCli(['web', '--hostname', '127.0.0.2', '--port', String(port)]);
+    expect(started.code, started.stderr).toBe(0);
+    expect(webProcessStatus()?.host).toBe('127.0.0.2');
+    expect(webProcessStatus()?.port).toBe(port);
+
+    // Neither axis passed: the pair session must inherit the tracked bind, so the
+    // one-time link is minted on the address the target browser opens it from.
+    const pairFile = join(root, 'pair.url');
+    const child = spawnCli(['web', '--pair'], { OPENBUTLER_WEB_PAIR_FILE: pairFile });
+    const session = collect(child);
+    await waitFor(() => existsSync(pairFile), 60_000, 'the pairing link file');
+    const link = readFileSync(pairFile, 'utf8').trim();
+    expect(link).toBe(`http://127.0.0.2:${port}/auth/pair?t=${link.split('/auth/pair?t=')[1]}`);
+    expect(webProcessStatus()?.host).toBe('127.0.0.2');
+    expect(webProcessStatus()?.port).toBe(port);
+    const probe = await fetch(link, { redirect: 'manual', signal: AbortSignal.timeout(5_000) });
+    expect(probe.status).toBeGreaterThanOrEqual(200);
+    expect(probe.status).toBeLessThan(400);
+
+    child.kill();
+    const exited = await session.done;
+    expect(exited.stdout).toContain('Stopping the tracked web server');
+    await waitFor(() => webProcessStatus() === null, 15_000, 'the pairing record to clear');
+  }, 120_000);
 });
