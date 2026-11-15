@@ -141,12 +141,41 @@ function Installed-Version {
   } catch { return '' } finally { $ErrorActionPreference = $previous }
 }
 
+$LeaveAlone = 'Leaving the running host alone: it was started by another installation.'
+
+# The daemon endpoint is keyed by the data directory, so `daemon status` from
+# ANY install on this machine resolves the same process: an install into
+# another directory used to stop the running host and then restart only its own
+# tree, replacing files under a different install (2026-11-15 incident). The
+# JSON verdict answers whether that host runs from THIS install directory;
+# only then may this script stop it. An answer outside the JSON contract is a
+# CLI older than --json and keeps the textual probe, which may stop only the
+# historical default directory.
 function Test-RunningHost {
   $previous = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $status = (& $Launcher daemon status 2>$null | Out-String)
-    return $status -match 'Background host running'
+    if (-not (Test-Path -LiteralPath $Launcher)) { return $false }
+    $raw = (& $Launcher daemon status --json 2>$null | Out-String)
+    $report = $null
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+      try { $report = $raw | ConvertFrom-Json } catch { $report = $null }
+    }
+    if ($null -ne $report -and $report.PSObject.Properties.Name -contains 'running') {
+      if (-not $report.running) { return $false }
+      if (-not $report.ours) {
+        Write-Host $LeaveAlone
+        return $false
+      }
+      return $true
+    }
+    $legacy = (& $Launcher daemon status 2>$null | Out-String)
+    if ($legacy -notmatch 'Background host running') { return $false }
+    if ($InstallDir -ne (Join-Path $HOME '.openbutler')) {
+      Write-Host $LeaveAlone
+      return $false
+    }
+    return $true
   } catch { return $false } finally { $ErrorActionPreference = $previous }
 }
 

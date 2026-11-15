@@ -13,6 +13,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import {
+  daemonStatusReport,
   getDaemonStatus,
   hostVintage,
   hostVintageMismatchWarning,
@@ -52,7 +53,7 @@ import {
   resolveReasoningVariant,
 } from './provider/registry.js';
 import { getConfigPath, getSettingsPath, loadSettings, parseTelegramSettings, saveSettings } from './settings.js';
-import { getDataPath } from './paths.js';
+import { findInstallDir, getDataPath } from './paths.js';
 import { CUSTODIAN_SESSION_ID } from './session-paths.js';
 import { canonicalScopeRoot, resolveInteractiveScope, resolveServerScope } from './workspace-origin.js';
 import type { TelegramStatus } from './telegram.js';
@@ -1728,6 +1729,13 @@ async function runDaemonCommand(action: string, sub?: string, parsed?: Parsed): 
   }
   if (action === 'status') {
     const status = await getDaemonStatus();
+    if (parsed?.booleans.has('json')) {
+      // Ownership verdict for installers: plain stdout only, no ui chrome, so
+      // either installer can parse it before deciding whether to stop a host.
+      const selfDir = process.argv[1] ? findInstallDir(process.argv[1]) : null;
+      process.stdout.write(`${daemonStatusReport(status, selfDir)}\n`);
+      return;
+    }
     if (!status) {
       ui.info('Background host is not running. Start it with `openbutler daemon start`.');
       return;

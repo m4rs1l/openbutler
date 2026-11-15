@@ -282,18 +282,72 @@ installed_version() {
   fi
 }
 
-host_running() {
-  "$BIN_DIR/$APP" daemon status 2>/dev/null | grep -q "Background host running"
+LEAVE_ALONE="Leaving the running host alone: it was started by another installation."
+
+# The daemon endpoint is keyed by the data directory, so `daemon status` from
+# ANY install on this machine resolves the same process: an install into
+# another directory used to stop the running host and then restart only its own
+# tree, replacing files under a different install (2026-11-15 incident). The
+# JSON verdict answers whether that host runs from THIS install directory;
+# only then may this script stop it. An answer outside the JSON contract is a
+# CLI older than --json, handled below with the textual probe.
+read_host_status() {
+  HOST_RUNNING="false"
+  HOST_OURS="false"
+  if [ ! -x "$BIN_DIR/$APP" ]; then
+    return 1
+  fi
+  hr_json=""
+  hr_json="$("$BIN_DIR/$APP" daemon status --json 2>/dev/null || true)"
+  case "$hr_json" in
+    *'"running":true'*'"ours":true'*)
+      HOST_RUNNING="true"
+      HOST_OURS="true"
+      ;;
+    *'"running":true'*)
+      HOST_RUNNING="true"
+      ;;
+    *'"running":'*)
+      return 0
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+  return 0
 }
 
 # The running host holds its node binary open, so it must stop before the files
 # under the install directory are replaced; restarting only after the copy is
-# too late.
+# too late. 0 = stopped our host, 1 = nothing to stop (or a foreign host left
+# alone with a message), 2 = no JSON verdict, the legacy probe takes over.
 stop_running_host() {
-  if ! host_running; then return 1; fi
-  say "Stopping the background host so its files can be replaced."
-  "$BIN_DIR/$APP" daemon stop >/dev/null 2>&1 || true
-  return 0
+  lh_rc=0
+  read_host_status || lh_rc=$?
+  if [ "$lh_rc" -eq 0 ]; then
+    if [ "$HOST_RUNNING" != "true" ]; then return 1; fi
+    if [ "$HOST_OURS" != "true" ]; then
+      say "$LEAVE_ALONE"
+      return 1
+    fi
+    say "Stopping the background host so its files can be replaced."
+    "$BIN_DIR/$APP" daemon stop >/dev/null 2>&1 || true
+    return 0
+  fi
+  if [ "$lh_rc" -eq 1 ]; then return 1; fi
+  # A CLI too old for --json cannot name its install directory; the historical
+  # one-install contract only ever covered the default directory, so no other
+  # directory may stop a host this script cannot identify.
+  if "$BIN_DIR/$APP" daemon status 2>/dev/null | grep -q "Background host running"; then
+    if [ "$INSTALL_DIR" != "$HOME/.openbutler" ]; then
+      say "$LEAVE_ALONE"
+      return 1
+    fi
+    say "Stopping the background host so its files can be replaced."
+    "$BIN_DIR/$APP" daemon stop >/dev/null 2>&1 || true
+    return 0
+  fi
+  return 1
 }
 
 start_running_host() {

@@ -1,6 +1,24 @@
 import { existsSync, mkdirSync, renameSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+
+/**
+ * Walks up from a running CLI entry point to the directory the installer
+ * created, which holds `app/`, `bin/`, and `node/`. Returns null when OpenButler
+ * runs from a source checkout instead of an installer layout — an unlocated
+ * entry must never be treated as evidence of ownership anywhere.
+ */
+export function findInstallDir(entry: string): string | null {
+  let directory = dirname(resolve(entry));
+  for (;;) {
+    if (existsSync(join(directory, 'app', 'dist', 'cli.js')) && existsSync(join(directory, 'node')) && existsSync(join(directory, 'bin'))) {
+      return directory;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
+}
 
 /**
  * Where openbutler keeps state.

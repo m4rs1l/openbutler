@@ -1,12 +1,15 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Parsed } from './cli/args.js';
 import * as ui from './cli/ui.js';
 import { getDaemonStatus, stopDaemon } from './daemon.js';
 import { isAutostartInstalled, uninstallAutostart } from './daemon-autostart.js';
-import { getDataDir } from './paths.js';
+import { findInstallDir, getDataDir } from './paths.js';
+
+/** Re-export keeps the historical import path (`src/uninstall.js`) stable. */
+export { findInstallDir };
 
 const INSTALLER_MARKER = '# Added by the openbutler installer.';
 
@@ -25,22 +28,7 @@ export interface UninstallTargets {
   windowsPath: { value: string; type: string } | null;
 }
 
-/**
- * Walks up from the running CLI entry point to the directory the installer
- * created, which holds `app/`, `bin/`, and `node/`. Returns null when OpenButler
- * runs from a source checkout instead of an installer layout.
- */
-export function findInstallDir(entry: string): string | null {
-  let directory = dirname(resolve(entry));
-  for (;;) {
-    if (existsSync(join(directory, 'app', 'dist', 'cli.js')) && existsSync(join(directory, 'node')) && existsSync(join(directory, 'bin'))) {
-      return directory;
-    }
-    const parent = dirname(directory);
-    if (parent === directory) return null;
-    directory = parent;
-  }
-}
+/* findInstallDir moved to paths.ts and is re-exported above. */
 
 /** Removes the installer's marker line and its `export PATH` line for `binDir`. */
 export function stripInstallerPathBlock(content: string, binDir: string): string {

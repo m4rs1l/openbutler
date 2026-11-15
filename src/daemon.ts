@@ -22,7 +22,7 @@ import { cliNodeArgs } from './cli-entry.js';
 import { createDaemonHost } from './daemon-host.js';
 import { createLogger, fileSink } from './logging.js';
 import { DAEMON_PROTOCOL_VERSION, MAX_DAEMON_FRAME_BYTES, type DaemonStatus } from './daemon-protocol.js';
-import { getDataDir, getDataPath } from './paths.js';
+import { findInstallDir, getDataDir, getDataPath } from './paths.js';
 import { withDeadline } from './shutdown.js';
 import { isLoopback, isTailnetAddress } from './tailnet.js';
 import { machineWorkspaceRoot } from './workspace-origin.js';
@@ -205,6 +205,29 @@ export async function getDaemonStatus(): Promise<DaemonStatus | null> {
     return { pid: record.pid, startedAt: record.startedAt, workspaceCount: 0, connectedClients: 0, unresponsive: true };
   }
   return null;
+}
+
+/**
+ * The ownership answer installers act on before they stop anything: whether the
+ * machine's running host belongs to *this* install directory. The daemon
+ * endpoint is keyed by the data directory, so every install on one machine
+ * resolves the same process — an installer that stopped on "running" alone
+ * replaced one tree while killing another install's host (2026-11-15
+ * incident). Both entries are resolved to install roots where they exist and
+ * compared case-insensitively on Windows, matching the endpoint's own casing
+ * rule; anything unverifiable answers `ours: false`, the safe direction for a
+ * stop decision.
+ */
+export function daemonStatusReport(status: DaemonStatus | null, selfInstallDir: string | null): string {
+  if (!status) return '{"running":false}';
+  const hostDir = typeof status.entry === 'string' ? findInstallDir(status.entry) : null;
+  const ours = hostDir !== null && selfInstallDir !== null && sameInstallDir(hostDir, selfInstallDir);
+  return JSON.stringify({ running: true, pid: status.pid, ours });
+}
+
+function sameInstallDir(hostDir: string, selfDir: string): boolean {
+  const normalize = (value: string) => (process.platform === 'win32' ? value.toLocaleLowerCase('en-US') : value);
+  return normalize(hostDir) === normalize(selfDir);
 }
 
 /** The host entry decides its code vintage: a `.ts`/`.tsx` entry runs the source tree, anything else runs compiled code. */
