@@ -368,7 +368,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
           />
           <IconButton
             icon="mic"
-            label={dictation.listening ? 'Dikteyi durdur' : 'Sesle yaz'}
+            label={dictation.listening ? 'Stop dictation' : 'Dictate'}
             className={dictation.listening ? 'mic-button listening' : 'mic-button'}
             disabled={props.disabled || pending || !dictation.supported}
             title={dictation.supported ? 'Dictate' : 'This browser does not support dictation'}

@@ -3279,7 +3279,7 @@ function formatQueuedPreview(message: { text: string; imageCount: number }): str
 function formatContextIndicator(tokens?: number, contextLimit?: number): string {
   if (tokens === undefined) return 'Context —';
   const amount =
-    tokens >= 1_000 ? `${(tokens / 1_000).toLocaleString('tr-TR', { maximumFractionDigits: 1 })}k` : tokens.toLocaleString('tr-TR');
+    tokens >= 1_000 ? `${(tokens / 1_000).toLocaleString(undefined, { maximumFractionDigits: 1 })}k` : tokens.toLocaleString();
   return contextLimit && contextLimit > 0 ? `%${Math.round((tokens / contextLimit) * 100)} (${amount})` : `Context ${amount}`;
 }
 

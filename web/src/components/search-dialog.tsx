@@ -45,7 +45,7 @@ export function SearchDialog({
     };
   }, [onClose]);
   const results = sessions.filter((session) =>
-    `${session.title} ${session.preview || ''}`.toLocaleLowerCase('tr').includes(search.toLocaleLowerCase('tr')),
+    `${session.title} ${session.preview || ''}`.toLowerCase().includes(search.toLowerCase()),
   );
   return (
     <div
@@ -54,13 +54,13 @@ export function SearchDialog({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div ref={root} className="search-dialog" role="dialog" aria-modal="true" aria-label="Sohbetlerde ara">
+      <div ref={root} className="search-dialog" role="dialog" aria-modal="true" aria-label="Search chats">
         <div className="search-field">
           <Icon name="search" />
           <input
             ref={input}
-            aria-label="Sohbetlerde ara"
-            placeholder="Sohbetlerde ara"
+            aria-label="Search chats"
+            placeholder="Search chats"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
           />

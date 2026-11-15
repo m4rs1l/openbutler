@@ -38,7 +38,7 @@ export function MessageQueue({
   };
   if (!messages.length && !failure) return null;
   return (
-    <ComposerRail aria-label="Kuyruktaki mesajlar" aria-busy={pending}>
+    <ComposerRail aria-label="Queued messages" aria-busy={pending}>
       {failure && failure.id === null ? (
         <Feedback tone="error" layout="compact" onDismiss={() => setFailure(null)}>
           {failure.text}

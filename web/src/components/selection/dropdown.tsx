@@ -685,7 +685,7 @@ export function Dropdown({
     return (
       <>
         <div className="dropdown__header">
-          <button type="button" className="dropdown__back" aria-label="Geri" onClick={goBack}>
+          <button type="button" className="dropdown__back" aria-label="Back" onClick={goBack}>
             <Icon name="chevron-left" size={14} />
           </button>
           <span>{activeItem.label}</span>

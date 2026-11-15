@@ -12,7 +12,7 @@ export function ProjectSelector({ controller, onCreate }: { controller: ProjectC
   const [query, setQuery] = useState('');
   const { projects, selected, selectedId, select, loading, error } = controller;
   const matches = projects.filter((project) =>
-    `${project.name} ${project.folders.join(' ')}`.toLocaleLowerCase('tr').includes(query.trim().toLocaleLowerCase('tr')),
+    `${project.name} ${project.folders.join(' ')}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
   );
   const items: DropdownItem[] = matches.map((project) => {
     const folder = project.folders[0]?.split(/[\\/]/).filter(Boolean).at(-1);
@@ -122,7 +122,7 @@ export function ProjectContextBar({
         <ProjectSelector controller={controller} onCreate={onCreate} />
         <span className="project-context__machine">
           <Icon name="laptop" size={16} />
-          Bu bilgisayar
+          This computer
         </span>
         <IconButton icon="settings" label="Project and app settings" className="project-context__settings" onClick={onSettings} />
       </div>

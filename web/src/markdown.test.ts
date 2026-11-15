@@ -89,7 +89,7 @@ describe('shared Markdown renderer', () => {
   });
 
   it('renders the LaTeX delimiters models emit as math', () => {
-    const html = render('Çözüm: \\(x^2 - 4 = 0\\) ve \\(y = mx + c\\).\n\n\\[E = mc^2\\]');
+    const html = render('Solution: \\(x^2 - 4 = 0\\) and \\(y = mx + c\\).\n\n\\[E = mc^2\\]');
     expect(html).toContain('class="katex"');
     expect(html).toContain('katex-display');
     expect(html).not.toContain('\\(x^2');

@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from 'react';
 import './context-meter.css';
 
-const tokenNumber = new Intl.NumberFormat('tr-TR', { maximumFractionDigits: 1 });
+const tokenNumber = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 function compactTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${tokenNumber.format(tokens / 1_000_000)}m`;
   if (tokens >= 1000) return `${tokenNumber.format(tokens / 1000)}k`;

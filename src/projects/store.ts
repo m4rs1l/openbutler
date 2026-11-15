@@ -109,8 +109,8 @@ function projectFolders(value: unknown): string[] {
 }
 
 function assertNameFree(projects: readonly StoredProject[], name: string, exceptId?: string): void {
-  const wanted = name.toLocaleLowerCase('tr');
-  if (projects.some((project) => project.id !== exceptId && project.name.toLocaleLowerCase('tr') === wanted))
+  const wanted = name.toLowerCase();
+  if (projects.some((project) => project.id !== exceptId && project.name.toLowerCase() === wanted))
     throw new ProjectInputError('A project with this name already exists.');
 }
 

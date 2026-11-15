@@ -32,7 +32,7 @@ export function useDictation(onText: (text: string) => void, onError: (error: st
     if (!constructor) return;
     const instance = new constructor();
     recognition.current = instance;
-    instance.lang = 'tr-TR';
+    instance.lang = navigator.language;
     instance.continuous = false;
     instance.interimResults = false;
     instance.onresult = (event) =>

@@ -58,3 +58,4 @@ Thumbs.db
 
 # Local Modal credentials file - never commit
 modal.key.env
+tests/repo-language.test.ts
