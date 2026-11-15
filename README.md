@@ -36,13 +36,13 @@ next command for the composition it installed.
 Linux (x64/arm64) and Windows users in Git Bash:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --daemon
+curl -fsSL https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.sh | bash -s -- --daemon
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 -OutFile $env:TEMP\openbutler-install.ps1
+irm https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.ps1 -OutFile $env:TEMP\openbutler-install.ps1
 & $env:TEMP\openbutler-install.ps1 -Daemon
 ```
 

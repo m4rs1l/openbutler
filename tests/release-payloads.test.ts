@@ -333,7 +333,7 @@ describeLive('install.sh live flag behavior (no network)', () => {
     );
     try {
       const result = run([scriptArg, '--daemon', '--web'], {
-        OPENBUTLER_GITHUB_REPO: 'zxsmind/openbutler',
+        OPENBUTLER_GITHUB_REPO: 'm4rs1l/openbutler',
         OPENBUTLER_INSTALL_DIR: installDir,
         BASH_ENV: envFile,
       });

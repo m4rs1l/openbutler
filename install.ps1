@@ -12,7 +12,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $App = 'openbutler'
-if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = 'zxsmind/openbutler' }
+if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = 'm4rs1l/openbutler' }
 if ($Daemon -and $Client) { throw 'Error: -Daemon and -Client cannot be combined.' }
 if (-not $Daemon -and -not $Client) {
   if ($Web) { throw 'Error: -Web needs -Daemon or -Client.' }

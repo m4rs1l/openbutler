@@ -48,11 +48,11 @@ published for that OS.
 Public installer entry points execute downloaded installer code:
 
 ```powershell
-irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.ps1 | iex
 ```
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.sh | bash
 ```
 
 For an inspected copy, download the installer first, then invoke that file. Shell

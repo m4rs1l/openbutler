@@ -1,12 +1,12 @@
 #!/bin/sh
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --daemon --web
-#   curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --client
+#   curl -fsSL https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.sh | bash -s -- --daemon --web
+#   curl -fsSL https://raw.githubusercontent.com/m4rs1l/openbutler/main/install.sh | bash -s -- --client
 #   ./install.sh (--daemon|--client) [--web] [--version <x.y.z>] [--binary <file>] [--no-modify-path]
 set -eu
 
 APP="openbutler"
-REPO="${OPENBUTLER_GITHUB_REPO:-zxsmind/openbutler}"
+REPO="${OPENBUTLER_GITHUB_REPO:-m4rs1l/openbutler}"
 INSTALL_DIR="${OPENBUTLER_INSTALL_DIR:-$HOME/.openbutler}"
 BIN_DIR="$INSTALL_DIR/bin"
 
