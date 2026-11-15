@@ -104,13 +104,14 @@ async function waitFor(probe: () => unknown, timeoutMs = 10_000): Promise<void> 
 }
 
 /** A raw protocol client: send frames by hand, read every frame the host returns. */
-async function openRaw(port: number): Promise<{
+async function openRaw(target: number | string): Promise<{
   socket: Socket;
   frames: string[];
   send: (frame: unknown) => void;
   untilClosed: Promise<void>;
 }> {
-  const socket = createConnection(port, '127.0.0.1');
+  // number = TCP port (remote listener), string = named-pipe endpoint (local host).
+  const socket = typeof target === 'number' ? createConnection(target, '127.0.0.1') : createConnection(target);
   const frames: string[] = [];
   const decoder = new DaemonFrameDecoder(MAX_DAEMON_FRAME_BYTES);
   const untilClosed = new Promise<void>((done) => socket.once('close', () => done()));

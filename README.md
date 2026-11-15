@@ -13,26 +13,53 @@ Pick the installer for your system. It downloads a self-contained package
 with its own Node.js runtime — no Node.js, npm, or admin rights needed — and
 sets up the `openbutler` command:
 
+Select one role — the installer never guesses:
+
+- `--daemon` / `-Daemon`: the background host payload for a server or desktop
+  that hosts the agent (pairing, remote API, model runtime; no browser bundle).
+- `--client` / `-Client`: a client seat that only pairs with a backend over
+  the network (runs the CLI; no browser bundle either).
+
+Add `--web` to either role to fetch the second archive and install it on top:
+the browser bundle. The two archives stay flat and separate, so no payload
+ships what it does not run:
+
+- `--daemon --web`: the host can serve the UI — `openbutler daemon start --web`
+  runs host and web together, so phones and browsers reach the UI straight from
+  the server with no client installed anywhere.
+- `--client --web`: after pairing, the seat also opens its own UI with
+  `openbutler web --backend <name>`.
+
+`--web` on its own and `--binary --web` are refused; every run ends with the
+next command for the composition it installed.
+
 Linux (x64/arm64) and macOS (bash, zsh, fish; Windows users in Git Bash too):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --daemon
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zxsmind/openbutler/main/install.ps1 -OutFile $env:TEMP\openbutler-install.ps1
+& $env:TEMP\openbutler-install.ps1 -Daemon
 ```
 
-A specific release: `bash -s -- --version 0.6.1` for the shell installer, or
-download `install.ps1` first and run `.\install.ps1 -Version 0.6.1`.
+A specific release: `bash -s -- --daemon --version 0.6.1` for the shell
+installer, or run the downloaded script as `.\install.ps1 -Daemon -Version 0.6.1`.
 `--no-modify-path` (shell) and `-NoModifyPath` (PowerShell) skip PATH changes.
 Both installers verify the result with `openbutler --version`; restart the
-terminal afterwards so the updated PATH takes effect.
+terminal afterwards so the updated PATH takes effect. The installed
+composition is recorded as a marker: an identical run reports "already
+installed" and stops, while a changed one acts — switching roles reinstalls,
+and adding `--web` over a same-version base install downloads only the web
+overlay instead of the base archive again.
 
-Published builds: Windows x64, Linux x64 and Linux arm64 in the same release;
-macOS follows in a later release.
+Published builds: Windows x64, Linux x64 and Linux arm64 in the same release,
+each carrying two flat archives — `openbutler-daemon-<version>-<target>` for
+the base payload and `openbutler-web-<version>-<target>` for the browser
+bundle; macOS follows in a later release.
 
 Configure a provider and model once:
 

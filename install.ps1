@@ -3,6 +3,9 @@ param(
   [string]$Version = '',
   [string]$Binary = '',
   [switch]$NoModifyPath,
+  [switch]$Daemon,
+  [switch]$Client,
+  [switch]$Web,
   [string]$InstallDir = (Join-Path $HOME '.openbutler'),
   [string]$Repo = $env:OPENBUTLER_GITHUB_REPO
 )
@@ -10,8 +13,17 @@ param(
 $ErrorActionPreference = 'Stop'
 $App = 'openbutler'
 if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = 'zxsmind/openbutler' }
+if ($Daemon -and $Client) { throw 'Error: -Daemon and -Client cannot be combined.' }
+if (-not $Daemon -and -not $Client) {
+  if ($Web) { throw 'Error: -Web needs -Daemon or -Client.' }
+  throw 'Error: choose what to install: pass -Daemon (background host) or -Client (client-only machine), each with -Web to also install the browser UI overlay.'
+}
+if ($Web -and -not [string]::IsNullOrWhiteSpace($Binary)) { throw 'Error: -Binary cannot be combined with -Web.' }
+$Flavor = if ($Daemon) { 'daemon' } else { 'client' }
+$Config = if ($Web) { "$Flavor+web" } else { $Flavor }
 $BinDir = Join-Path $InstallDir 'bin'
 $Launcher = Join-Path $BinDir "$App.cmd"
+$FlavorFile = Join-Path $InstallDir '.openbutler-flavor'
 
 # One cumulative bar across download, extract, and install, drawn by hand so it
 # matches the shell installer and does not depend on the host's own progress UI.
@@ -235,11 +247,18 @@ if ([string]::IsNullOrWhiteSpace($Binary)) {
       throw "Release v$specific not found. Available releases: https://github.com/$Repo/releases"
     }
   }
-  $fileName = "$App-$specific-$target.zip"
+  $fileName = "$App-daemon-$specific-$target.zip"
+  $webFileName = "$App-web-$specific-$target.zip"
   if ([string]::IsNullOrWhiteSpace($Version)) {
     $url = "https://github.com/$Repo/releases/latest/download/$fileName"
+    $webUrl = "https://github.com/$Repo/releases/latest/download/$webFileName"
   } else {
     $url = "https://github.com/$Repo/releases/download/v$specific/$fileName"
+    $webUrl = "https://github.com/$Repo/releases/download/v$specific/$webFileName"
+    if ($Web) {
+      try { Invoke-WebRequest -Uri $webUrl -Method Head -UseBasicParsing | Out-Null }
+      catch { throw "Release v$specific does not carry $webFileName. Available releases: https://github.com/$Repo/releases" }
+    }
   }
 } else {
   if (-not (Test-Path -LiteralPath $Binary)) { throw "Binary archive not found at $Binary" }
@@ -247,10 +266,14 @@ if ([string]::IsNullOrWhiteSpace($Binary)) {
 }
 
 $current = Installed-Version
-if ($current -ne '' -and $current -eq $specific) {
+$installedConfig = if (Test-Path -LiteralPath $FlavorFile) { ((Get-Content -LiteralPath $FlavorFile -Raw -ErrorAction SilentlyContinue) -replace '\s', '') } else { '' }
+if ($current -ne '' -and $current -eq $specific -and $installedConfig -eq $Config) {
   Write-Host "openbutler $current is already installed at $InstallDir."
   return
 }
+# An installed base at the same version with only the overlay missing fetches
+# the overlay alone; the exact match above already covered the full repeat.
+$skipBase = $Web -and $current -ne '' -and $current -eq $specific -and $installedConfig -eq $Flavor
 
 $isUpdate = $false
 if ([string]::IsNullOrWhiteSpace($Binary) -and $current -ne '' -and $current -ne $specific) {
@@ -264,27 +287,54 @@ try {
   if ([string]::IsNullOrWhiteSpace($Binary)) {
     if ($isUpdate) { Write-Host "Updating openbutler $current -> $specific ($target)" }
     else { Write-Host "Downloading openbutler $specific ($target)" }
-    $archive = Join-Path $tmp $fileName
-    $meta = Get-RemoteMeta $url
-    if ($meta -ne $null) {
-      $BarTotal = $meta.D + $meta.U + $meta.U
-      Download-WithProgress -Url $url -OutFile $archive -Total $BarTotal -Base 0
-      $baseD = (Get-Item -LiteralPath $archive).Length
-    } else {
-      Download-WithProgress -Url $url -OutFile $archive -Total 0 -Base 0
-      $baseD = (Get-Item -LiteralPath $archive).Length
-      $BarTotal = [long]0
+    $jobs = @()
+    if (-not $skipBase) { $jobs += @{ File = $fileName; Url = $url } }
+    else { Write-Host 'Base already installed at this version; fetching only the web overlay.' }
+    if ($Web) { $jobs += @{ File = $webFileName; Url = $webUrl } }
+    # One bar spans every archive: measure all metas first, then download all
+    # and extract all into one tree for the single merge copy below. A missing
+    # meta drops every job to the plain, unmeasured path - the archives must
+    # not mix measured and blind progress.
+    $measured = $true
+    foreach ($job in $jobs) {
+      $job.Meta = Get-RemoteMeta $job.Url
+      if ($job.Meta -eq $null) { $measured = $false }
     }
+    $BarTotal = [long]0
+    if ($measured) { foreach ($job in $jobs) { $BarTotal += $job.Meta.D + $job.Meta.U + $job.Meta.U } }
+    $downloadDone = [long]0
+    foreach ($job in $jobs) {
+      $out = Join-Path $tmp $job.File
+      if ($measured) {
+        Download-WithProgress -Url $job.Url -OutFile $out -Total $BarTotal -Base $downloadDone
+        $downloadDone += $job.Meta.D
+      } else {
+        Download-WithProgress -Url $job.Url -OutFile $out -Total 0 -Base 0
+      }
+      $job.Archive = $out
+    }
+    $extract = Join-Path $tmp 'extract'
+    New-Item -ItemType Directory -Path $extract | Out-Null
+    $extractDone = [long]0
+    foreach ($job in $jobs) {
+      if ($measured) {
+        Extract-WithProgress -Archive $job.Archive -Destination $extract -Total $BarTotal -Base ($downloadDone + $extractDone)
+        $extractDone += $job.Meta.U
+      } else {
+        Extract-WithProgress -Archive $job.Archive -Destination $extract -Total 0 -Base 0
+      }
+    }
+    # The copy block below keeps walking the same bar from the end of extracts.
+    $baseD = $downloadDone + $extractDone
   } else {
     Write-Host "Installing openbutler from $Binary"
     $archive = Join-Path $tmp ([IO.Path]::GetFileName($Binary))
     Copy-Item -LiteralPath $Binary -Destination $archive
     $BarTotal = [long]0
+    $extract = Join-Path $tmp 'extract'
+    New-Item -ItemType Directory -Path $extract | Out-Null
+    Extract-WithProgress -Archive $archive -Destination $extract -Total 0 -Base 0
   }
-  $extract = Join-Path $tmp 'extract'
-  New-Item -ItemType Directory -Path $extract | Out-Null
-  if ($BarTotal -gt 0) { Extract-WithProgress -Archive $archive -Destination $extract -Total $BarTotal -Base $baseD }
-  else { Extract-WithProgress -Archive $archive -Destination $extract -Total 0 -Base 0 }
   if (-not (Test-Path -LiteralPath (Join-Path $extract $App))) { throw "Archive does not contain a '$App' directory." }
   $hostWasRunning = Stop-RunningHost
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -318,9 +368,20 @@ try {
 
 $installed = Installed-Version
 if ([string]::IsNullOrWhiteSpace($installed)) { throw 'Installation finished but `openbutler --version` does not run.' }
+[IO.File]::WriteAllText($FlavorFile, $Config)
 if ($isUpdate) { Write-Host "Updated openbutler $current -> $installed." }
 else { Write-Host "Installed openbutler $installed to $InstallDir." }
 if ($hostWasRunning) { Start-RunningHost }
+if ($Config -eq 'daemon') {
+  Write-Host "Next: start the host with openbutler daemon start (add --listen <addr:port> for remote clients) and pair them with openbutler pair"
+} elseif ($Config -eq 'daemon+web') {
+  Write-Host "Next: start host and UI together with openbutler daemon start --web (add --listen <addr:port> for CLI clients and --hostname <address> for phones and browsers)"
+  Write-Host 'Pair a CLI or desktop against this host with openbutler pair'
+} elseif ($Config -eq 'client') {
+  Write-Host 'Next: pair a backend with openbutler connect <host:port> --code <code>'
+} else {
+  Write-Host 'Next: pair a backend with openbutler connect <host:port> --code <code> then open the UI with openbutler web --backend <name>'
+}
 
 if ($NoModifyPath) {
   Write-Host "Skipped PATH setup. Add $BinDir to PATH manually."

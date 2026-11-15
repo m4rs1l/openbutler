@@ -226,10 +226,11 @@ const CONTENT_TYPES: Record<string, string> = {
 /**
  * The browser bundle is built next to the compiled server (`dist/client`). The
  * lookup walks up from this module so a dev run from `src/` and a packaged run
- * from `dist/` both find the same folder.
+ * from `dist/` both find the same folder. `startFrom` exists for tests, which
+ * must be able to point the walk at a fixture instead of this repository.
  */
-function defaultAssetsDir(): string | null {
-  let directory = dirname(fileURLToPath(import.meta.url));
+function locateAssetsDir(startFrom?: string): string | null {
+  let directory = startFrom ?? dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 6; depth += 1) {
     const candidate = join(directory, 'dist', 'client');
     if (existsSync(join(candidate, 'index.html'))) return candidate;
@@ -238,6 +239,23 @@ function defaultAssetsDir(): string | null {
     directory = parent;
   }
   return null;
+}
+
+/**
+ * The split payloads make the browser bundle optional on disk: a base install
+ * without the `web` overlay has no dist/client at all. Serving an empty shell
+ * page would hide that, so the server refuses to start with one actionable
+ * message instead - the installed remedy (re-run the installer with --web)
+ * and the source remedy (npm run build:web) cover both audiences. Callers that
+ * pass an explicit assetsDir (tests, development servers) skip this gate.
+ */
+export function requireDefaultAssetsDir(startFrom?: string): string {
+  const directory = locateAssetsDir(startFrom);
+  if (directory === null)
+    throw new Error(
+      'The browser client bundle (dist/client) is missing. Re-run the installer with --web, or build it with npm run build:web.',
+    );
+  return directory;
 }
 
 /**
@@ -304,7 +322,9 @@ function persistentSessionToken(): string {
 export async function startWebServer(options: WebServerOptions): Promise<WebServer> {
   const host = options.host ?? DEFAULT_WEB_HOST;
   let port = options.port ?? DEFAULT_WEB_PORT;
-  const assetsDir = options.assetsDir ?? defaultAssetsDir() ?? undefined;
+  // No explicit bundle means the default lookup; without dist/client this
+  // throws before the port opens, so a base install never serves an empty shell.
+  const assetsDir = options.assetsDir ?? requireDefaultAssetsDir();
   // An open tab keeps the bundle it loaded, so a rebuild would only reach the
   // reader after a manual reload. The build id lets the client notice and reload
   // itself once it is idle; it is asked for per answer because this server keeps

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash
-#   ./install.sh [--version <x.y.z>] [--binary <file>] [--no-modify-path]
+#   curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --daemon --web
+#   curl -fsSL https://raw.githubusercontent.com/zxsmind/openbutler/main/install.sh | bash -s -- --client
+#   ./install.sh (--daemon|--client) [--web] [--version <x.y.z>] [--binary <file>] [--no-modify-path]
 set -eu
 
 APP="openbutler"
@@ -12,6 +13,8 @@ BIN_DIR="$INSTALL_DIR/bin"
 requested_version=""
 binary_path=""
 no_modify_path="false"
+role=""
+web="false"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,9 +34,19 @@ while [ $# -gt 0 ]; do
       fi
       shift 2
       ;;
+    --daemon | --client)
+      requested_role="${1#--}"
+      if [ -n "$role" ] && [ "$role" != "$requested_role" ]; then
+        echo "Error: --daemon and --client cannot be combined." >&2
+        exit 1
+      fi
+      role="$requested_role"
+      shift
+      ;;
+    --web) web="true"; shift ;;
     --no-modify-path) no_modify_path="true"; shift ;;
     --help | -h)
-      sed -n '2,4p' "$0"
+      sed -n '2,5p' "$0"
       exit 0
       ;;
     *)
@@ -42,6 +55,25 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -z "$role" ]; then
+  if [ "$web" = "true" ]; then
+    echo "Error: --web needs --daemon or --client." >&2
+  else
+    echo "Error: choose what to install:" >&2
+    echo "  --daemon        background host for a server or desktop (agent, pairing, remote API)" >&2
+    echo "  --client        client-only machine (CLI connects to a paired backend)" >&2
+    echo "  --web           with either role: also install the web UI overlay" >&2
+  fi
+  exit 1
+fi
+if [ "$web" = "true" ] && [ -n "$binary_path" ]; then
+  echo "Error: --binary cannot be combined with --web." >&2
+  exit 1
+fi
+# The marker records this composition; only exact equality may short-circuit.
+config="$role"
+if [ "$web" = "true" ]; then config="${role}+web"; fi
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -320,26 +352,48 @@ else
       echo "Error: could not determine the latest release version." >&2
       exit 1
     fi
-    filename="$APP-$specific_version-$target$archive_ext"
+    filename="$APP-daemon-$specific_version-$target$archive_ext"
+    filename_web="$APP-web-$specific_version-$target$archive_ext"
     url="https://github.com/$REPO/releases/latest/download/$filename"
+    url_web="https://github.com/$REPO/releases/latest/download/$filename_web"
   else
     requested_version="${requested_version#v}"
     specific_version="$requested_version"
-    filename="$APP-$specific_version-$target$archive_ext"
+    filename="$APP-daemon-$specific_version-$target$archive_ext"
+    filename_web="$APP-web-$specific_version-$target$archive_ext"
     url="https://github.com/$REPO/releases/download/v${specific_version}/$filename"
+    url_web="https://github.com/$REPO/releases/download/v${specific_version}/$filename_web"
     status="$(curl -fsSL -o /dev/null -w "%{http_code}" "https://github.com/$REPO/releases/tag/v${specific_version}" || true)"
     if [ "$status" = "404" ]; then
       echo "Error: release v${specific_version} not found." >&2
       echo "Available releases: https://github.com/$REPO/releases" >&2
       exit 1
     fi
+    if [ "$web" = "true" ]; then
+      web_status="$(curl -fsSL -o /dev/null -w "%{http_code}" "$url_web" || true)"
+      if [ "$web_status" = "404" ]; then
+        echo "Error: release v${specific_version} does not carry $filename_web." >&2
+        echo "Available releases: https://github.com/$REPO/releases" >&2
+        exit 1
+      fi
+    fi
   fi
 fi
 
 current="$(installed_version)"
-if [ -n "$current" ] && [ "$current" = "$specific_version" ]; then
+marker_config=""
+if [ -f "$INSTALL_DIR/.openbutler-flavor" ]; then
+  marker_config="$(cat "$INSTALL_DIR/.openbutler-flavor" 2>/dev/null || true)"
+fi
+if [ -n "$current" ] && [ "$current" = "$specific_version" ] && [ "$marker_config" = "$config" ]; then
   say "openbutler $current is already installed at $INSTALL_DIR."
   exit 0
+fi
+# An installed base at the same version with only the overlay missing fetches
+# the overlay alone; the exact match above already covered the full repeat.
+skip_base="false"
+if [ "$web" = "true" ] && [ -n "$current" ] && [ "$current" = "$specific_version" ] && [ "$marker_config" = "$role" ]; then
+  skip_base="true"
 fi
 
 is_update=0
@@ -368,40 +422,108 @@ else
   else
     say "Downloading openbutler $specific_version ($target)"
   fi
+  fetch_base="true"
+  if [ "$skip_base" = "true" ]; then
+    fetch_base="false"
+    say "Base already installed at this version; fetching only the web overlay."
+  fi
+
+  mkdir -p "$tmp_dir/extract"
   archive="$tmp_dir/$filename"
-  fetch_meta "$url" "$tmp_dir/meta"
-  if [ -n "$BAR_TTY" ] && [ -n "$META_D_KB" ] && [ -n "$META_U_KB" ]; then
-    BAR_TOTAL=$(( META_D_KB + META_U_KB + META_U_KB ))
+  archive_web="$tmp_dir/$filename_web"
+
+  # One bar spans both archives: every download first, then every extraction,
+  # then a single copy of the merged tree. Fancy progress needs both .meta
+  # files; a missing one falls back to the plain path, which downloads and
+  # extracts per archive and leaves the copy to the common merge below.
+  FANCY=0
+  BASE_D_KB=0
+  BASE_U_KB=0
+  WEB_D_KB=0
+  WEB_U_KB=0
+  if [ -n "$BAR_TTY" ]; then
+    FANCY=1
+    if [ "$fetch_base" = "true" ]; then
+      fetch_meta "$url" "$tmp_dir/meta-base"
+      if [ -z "$META_D_KB" ] || [ -z "$META_U_KB" ]; then
+        FANCY=0
+      else
+        BASE_D_KB="$META_D_KB"
+        BASE_U_KB="$META_U_KB"
+      fi
+    fi
+    if [ "$web" = "true" ] && [ "$FANCY" = 1 ]; then
+      fetch_meta "$url_web" "$tmp_dir/meta-web"
+      if [ -z "$META_D_KB" ] || [ -z "$META_U_KB" ]; then
+        FANCY=0
+      else
+        WEB_D_KB="$META_D_KB"
+        WEB_U_KB="$META_U_KB"
+      fi
+    fi
+  fi
+
+  if [ "$FANCY" = 1 ]; then
+    BAR_TOTAL=$(( BASE_D_KB + WEB_D_KB + BASE_U_KB + WEB_U_KB + BASE_U_KB + WEB_U_KB ))
     hide_cursor
-    download_to "$url" "$archive" "$BAR_TOTAL" 0
-    BASE_D="$(file_kb "$archive")"
-    mkdir -p "$tmp_dir/extract"
-    extract_to "$archive" "$tmp_dir/extract" "$BAR_TOTAL" "$BASE_D"
-    BASE_DU=$(( BASE_D + $(dir_kb "$tmp_dir/extract") ))
+    if [ "$fetch_base" = "true" ]; then
+      download_to "$url" "$archive" "$BAR_TOTAL" 0
+      BASE_D="$(file_kb "$archive")"
+    else
+      BASE_D=0
+    fi
+    if [ "$web" = "true" ]; then
+      download_to "$url_web" "$archive_web" "$BAR_TOTAL" "$BASE_D"
+      WEB_D="$(file_kb "$archive_web")"
+    else
+      WEB_D=0
+    fi
+    EX_OFF=$(( BASE_D + WEB_D ))
+    if [ "$fetch_base" = "true" ]; then
+      EX_BEFORE="$(dir_kb "$tmp_dir/extract")"
+      extract_to "$archive" "$tmp_dir/extract" "$BAR_TOTAL" "$EX_OFF"
+      EX_AFTER="$(dir_kb "$tmp_dir/extract")"
+      EX_OFF=$(( EX_OFF + EX_AFTER - EX_BEFORE ))
+    fi
+    if [ "$web" = "true" ]; then
+      EX_BEFORE="$(dir_kb "$tmp_dir/extract")"
+      extract_to "$archive_web" "$tmp_dir/extract" "$BAR_TOTAL" "$EX_OFF"
+      EX_AFTER="$(dir_kb "$tmp_dir/extract")"
+      EX_OFF=$(( EX_OFF + EX_AFTER - EX_BEFORE ))
+    fi
     mkdir -p "$INSTALL_DIR"
-    BASE_INST="$(dir_kb "$INSTALL_DIR")"
-    copy_to "$tmp_dir/extract/$APP" "$INSTALL_DIR" "$BAR_TOTAL" "$BASE_DU"
-    FIN_NOW="$(dir_kb "$INSTALL_DIR")"
-    FIN_GROWN=$(( FIN_NOW - BASE_INST ))
-    if [ "$FIN_GROWN" -lt 0 ]; then FIN_GROWN=0; fi
-    FIN_DONE=$(( BASE_DU + FIN_GROWN ))
-    render_single "$FIN_DONE" "$FIN_DONE" Done
+    copy_to "$tmp_dir/extract/$APP" "$INSTALL_DIR" "$BAR_TOTAL" "$EX_OFF"
+    render_single "$BAR_TOTAL" "$BAR_TOTAL" Done
     printf '\n' >&2
     show_cursor
     DO_COPY=0
   else
-    DL_KNOWN=""
-    if [ -n "$BAR_TTY" ]; then
-      DL_BYTES="$(head_bytes "$url")"
-      case "$DL_BYTES" in
-        '' | *[!0-9]* | 0) ;;
-        *) DL_KNOWN=$(( (DL_BYTES + 1023) / 1024 )) ;;
-      esac
+    if [ "$fetch_base" = "true" ]; then
+      DL_KNOWN=""
+      if [ -n "$BAR_TTY" ]; then
+        DL_BYTES="$(head_bytes "$url")"
+        case "$DL_BYTES" in
+          '' | *[!0-9]* | 0) ;;
+          *) DL_KNOWN=$(( (DL_BYTES + 1023) / 1024 )) ;;
+        esac
+      fi
+      download_to "$url" "$archive" "$DL_KNOWN" 0
+      extract_to "$archive" "$tmp_dir/extract" "" 0
+      if [ -n "$BAR_TTY" ]; then printf '\n' >&2; fi
     fi
-    download_to "$url" "$archive" "$DL_KNOWN" 0
-    mkdir -p "$tmp_dir/extract"
-    extract_to "$archive" "$tmp_dir/extract" "" 0
-    if [ -n "$BAR_TTY" ]; then printf '\n' >&2; fi
+    if [ "$web" = "true" ]; then
+      DL_KNOWN=""
+      if [ -n "$BAR_TTY" ]; then
+        DL_BYTES="$(head_bytes "$url_web")"
+        case "$DL_BYTES" in
+          '' | *[!0-9]* | 0) ;;
+          *) DL_KNOWN=$(( (DL_BYTES + 1023) / 1024 )) ;;
+        esac
+      fi
+      download_to "$url_web" "$archive_web" "$DL_KNOWN" 0
+      extract_to "$archive_web" "$tmp_dir/extract" "" 0
+      if [ -n "$BAR_TTY" ]; then printf '\n' >&2; fi
+    fi
   fi
 fi
 
@@ -432,12 +554,29 @@ if [ -z "$installed" ]; then
   echo "Error: installation finished but \`openbutler --version\` does not run." >&2
   exit 1
 fi
+printf '%s\n' "$config" > "$INSTALL_DIR/.openbutler-flavor"
 if [ "$is_update" = "1" ]; then
   say "Updated openbutler $current -> $installed."
 else
   say "Installed openbutler $installed to $INSTALL_DIR."
 fi
 if [ "$host_was_running" = "1" ]; then start_running_host; fi
+
+case "$config" in
+  daemon)
+    say "Next: start the host with  openbutler daemon start  (add --listen <addr:port> for remote clients) and pair them with  openbutler pair"
+    ;;
+  daemon+web)
+    say "Next: start host and UI together with  openbutler daemon start --web  (add  --listen <addr:port>  for CLI clients and  --hostname <address>  for phones and browsers)"
+    say "Pair a CLI or desktop against this host with  openbutler pair"
+    ;;
+  client)
+    say "Next: pair a backend with  openbutler connect <host:port> --code <code>"
+    ;;
+  client+web)
+    say "Next: pair a backend with  openbutler connect <host:port> --code <code>  then open the UI with  openbutler web --backend <name>"
+    ;;
+esac
 
 if [ "$no_modify_path" = "true" ]; then
   say "Skipped PATH setup (--no-modify-path). Add $BIN_DIR to PATH manually."
