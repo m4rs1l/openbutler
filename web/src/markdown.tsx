@@ -1,4 +1,4 @@
-import { createContext, memo, useContext, useId, useMemo, type ComponentProps } from 'react';
+import { createContext, memo, useContext, useId, useLayoutEffect, useMemo, useRef, type ComponentProps } from 'react';
 import type { Root } from 'hast';
 import { visit } from 'unist-util-visit';
 import ReactMarkdown, { defaultUrlTransform, type Components, type ExtraProps } from 'react-markdown';
@@ -8,6 +8,7 @@ import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import rehypeKatex from 'rehype-katex';
 import { CodeBlock } from './markdown-code.js';
+import { bindScrollFade } from './components/scroll-area.js';
 import { openFileRequest } from './file-links.js';
 import { FileBadge } from './apps/file-badge.js';
 import { parseHref } from '../../src/web/link-protocol.js';
@@ -123,15 +124,24 @@ function MarkdownPre({ node, children, ...props }: ComponentProps<'pre'> & Extra
   );
 }
 
+/** Wide tables scroll horizontally with the shared soft edge shadow: the
+ * region binds the one fade updater, and the component identity stays stable
+ * while the message streams. */
+const MarkdownTableRegion = ({ node: _node, ...props }: ComponentProps<'table'> & ExtraProps) => {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => bindScrollFade(ref.current), []);
+  return (
+    <div ref={ref} className="markdown-table-scroll scroll-fade-x" role="region" aria-label="Table" tabIndex={0} data-scroll-viewport>
+      <table {...props} />
+    </div>
+  );
+};
+
 // Stable component identities preserve code controls while the message streams.
 const components: Components = {
   span: StreamSpan,
   pre: MarkdownPre,
-  table: ({ node: _node, ...props }) => (
-    <div className="markdown-table-scroll" role="region" aria-label="Table" tabIndex={0} data-scroll-viewport>
-      <table {...props} />
-    </div>
-  ),
+  table: MarkdownTableRegion,
   a: ({ node: _node, href, children, ...props }) => {
     const target = href ? parseHref(href) : null;
     if (target?.kind === 'file') {
